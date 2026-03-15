@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist gettext-domain="stage-manager">
+    <schema id="org.gnome.shell.extensions.stage-manager"
+            path="/org/gnome/shell/extensions/stage-manager/">
+
+        <key name="enable-maximize-to-workspace" type="b">
+            <default>true</default>
+            <summary>Enable Maximize to Workspace</summary>
+            <description>When a window is maximized, automatically move it to a new workspace. When unmaximized, return it to the previous workspace.</description>
+        </key>
+
+        <key name="enable-stage-sidebar" type="b">
+            <default>true</default>
+            <summary>Enable Stage Manager Sidebar</summary>
+            <description>Show a sidebar with inactive window thumbnails on the left side of the screen.</description>
+        </key>
+
+        <key name="sidebar-width" type="i">
+            <default>220</default>
+            <range min="120" max="400"/>
+            <summary>Sidebar Width</summary>
+            <description>Width of the stage manager sidebar in pixels.</description>
+        </key>
+
+        <key name="animation-duration" type="i">
+            <default>250</default>
+            <range min="0" max="1000"/>
+            <summary>Animation Duration</summary>
+            <description>Duration of sidebar show/hide animations in milliseconds.</description>
+        </key>
+
+        <key name="sidebar-auto-hide" type="b">
+            <default>true</default>
+            <summary>Auto-hide Sidebar</summary>
+            <description>Automatically hide the sidebar when not hovering over it.</description>
+        </key>
+
+        <key name="auto-hide-delay" type="i">
+            <default>800</default>
+            <range min="100" max="5000"/>
+            <summary>Auto-hide Delay</summary>
+            <description>Delay in milliseconds before hiding the sidebar after the pointer leaves.</description>
+        </key>
+
+        <key name="edge-trigger-width" type="i">
+            <default>4</default>
+            <range min="1" max="20"/>
+            <summary>Edge Trigger Width</summary>
+            <description>Width of the invisible hot zone at the screen edge to trigger the sidebar.</description>
+        </key>
+
+        <key name="show-app-icons" type="b">
+            <default>true</default>
+            <summary>Show Application Icons</summary>
+            <description>Show application icons below window thumbnails in the sidebar.</description>
+        </key>
+
+    </schema>
+</schemalist>

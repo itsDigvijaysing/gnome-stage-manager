@@ -1,0 +1,9 @@
+gnome-shell-extension-stage-manager (1.0.0) unstable; urgency=medium
+
+  * Initial release.
+  * Maximize-to-workspace: maximized windows move to new workspaces.
+  * Stage Manager sidebar with live window thumbnails.
+  * Configurable settings via GNOME Extensions preferences.
+  * Supports GNOME 45-48, Wayland and X11.
+
+ -- Stage Manager Contributors <stage-manager@example.com>  Sun, 15 Mar 2026 12:00:00 +0000

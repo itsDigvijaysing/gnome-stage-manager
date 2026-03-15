@@ -1,0 +1,10 @@
+{
+    "name": "Stage Manager",
+    "description": "macOS Stage Manager-like window management for GNOME. Inactive windows appear as stacked thumbnail cards in a left-side strip. Switch stages with smooth animations.",
+    "uuid": "stage-manager@gnome-stage-manager",
+    "url": "https://github.com/gnome-stage-manager/gnome-stage-manager",
+    "shell-version": ["45", "46", "47", "48"],
+    "version": 1,
+    "session-modes": ["user"],
+    "settings-schema": "org.gnome.shell.extensions.stage-manager"
+}

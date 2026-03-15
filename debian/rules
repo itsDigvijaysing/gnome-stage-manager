@@ -1,0 +1,14 @@
+#!/usr/bin/make -f
+
+UUID = stage-manager@gnome-stage-manager
+EXTENSION_DIR = /usr/share/gnome-shell/extensions/$(UUID)
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	glib-compile-schemas src/schemas/
+
+override_dh_auto_install:
+	install -d $(CURDIR)/debian/gnome-shell-extension-stage-manager$(EXTENSION_DIR)
+	cp -r src/* $(CURDIR)/debian/gnome-shell-extension-stage-manager$(EXTENSION_DIR)/

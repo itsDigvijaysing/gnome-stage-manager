@@ -1,0 +1,6 @@
+dist/
+src/schemas/*.compiled
+*.zip
+.builddir/
+node_modules/
+.eslintcache
