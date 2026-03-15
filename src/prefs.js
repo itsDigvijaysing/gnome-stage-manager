@@ -1,13 +1,11 @@
 /**
  * Stage Manager - Preferences UI
- *
- * Settings panel for the Stage Manager extension.
- * Uses Adw (libadwaita) widgets for GNOME 45+ preferences.
  */
 
 import Adw from 'gi://Adw';
 import Gio from 'gi://Gio';
 import Gtk from 'gi://Gtk';
+import GLib from 'gi://GLib';
 
 import { ExtensionPreferences } from 'resource:///org/gnome/Shell/Extensions/js/extensions/prefs.js';
 
@@ -16,155 +14,194 @@ export default class StageManagerPreferences extends ExtensionPreferences {
     fillPreferencesWindow(window) {
         const settings = this.getSettings();
 
-        // --- General Page ---
-        const generalPage = new Adw.PreferencesPage({
-            title: 'General',
+        // ── Behavior Page ──
+        const behaviorPage = new Adw.PreferencesPage({
+            title: 'Behavior',
             icon_name: 'preferences-system-symbolic',
         });
-        window.add(generalPage);
+        window.add(behaviorPage);
 
-        // Maximize to Workspace group
+        // Maximize to Workspace
         const maxGroup = new Adw.PreferencesGroup({
             title: 'Maximize to Workspace',
-            description: 'Automatically move maximized windows to their own workspace',
+            description: 'Move maximized windows to their own workspace',
         });
-        generalPage.add(maxGroup);
+        behaviorPage.add(maxGroup);
 
         const maxSwitch = new Adw.SwitchRow({
             title: 'Enable Maximize to Workspace',
-            subtitle: 'Maximized windows get their own workspace',
+            subtitle: 'When maximized, window moves to a new empty workspace',
         });
-        settings.bind('enable-maximize-to-workspace', maxSwitch, 'active',
-            Gio.SettingsBindFlags.DEFAULT);
+        settings.bind('enable-maximize-to-workspace', maxSwitch, 'active', Gio.SettingsBindFlags.DEFAULT);
         maxGroup.add(maxSwitch);
 
-        // Stage Sidebar group
-        const sidebarGroup = new Adw.PreferencesGroup({
+        // Stage Sidebar
+        const sideGroup = new Adw.PreferencesGroup({
             title: 'Stage Manager Sidebar',
-            description: 'Sidebar showing inactive window thumbnails',
+            description: 'Left sidebar showing inactive app thumbnails',
         });
-        generalPage.add(sidebarGroup);
+        behaviorPage.add(sideGroup);
 
-        const sidebarSwitch = new Adw.SwitchRow({
+        const sideSwitch = new Adw.SwitchRow({
             title: 'Enable Stage Sidebar',
-            subtitle: 'Show inactive windows in a left-side panel',
+            subtitle: 'Show inactive apps as thumbnail cards on the left',
         });
-        settings.bind('enable-stage-sidebar', sidebarSwitch, 'active',
-            Gio.SettingsBindFlags.DEFAULT);
-        sidebarGroup.add(sidebarSwitch);
+        settings.bind('enable-stage-sidebar', sideSwitch, 'active', Gio.SettingsBindFlags.DEFAULT);
+        sideGroup.add(sideSwitch);
 
         const autoHideSwitch = new Adw.SwitchRow({
             title: 'Auto-hide Sidebar',
-            subtitle: 'Hide sidebar when not hovering',
+            subtitle: 'Off = always visible (macOS default). On = hover to reveal.',
         });
-        settings.bind('sidebar-auto-hide', autoHideSwitch, 'active',
-            Gio.SettingsBindFlags.DEFAULT);
-        sidebarGroup.add(autoHideSwitch);
+        settings.bind('sidebar-auto-hide', autoHideSwitch, 'active', Gio.SettingsBindFlags.DEFAULT);
+        sideGroup.add(autoHideSwitch);
 
-        const showIconsSwitch = new Adw.SwitchRow({
-            title: 'Show Application Icons',
-            subtitle: 'Display app icons below thumbnails',
+        const iconSwitch = new Adw.SwitchRow({
+            title: 'Show App Icons',
+            subtitle: 'Display app icon below each thumbnail',
         });
-        settings.bind('show-app-icons', showIconsSwitch, 'active',
-            Gio.SettingsBindFlags.DEFAULT);
-        sidebarGroup.add(showIconsSwitch);
+        settings.bind('show-app-icons', iconSwitch, 'active', Gio.SettingsBindFlags.DEFAULT);
+        sideGroup.add(iconSwitch);
 
-        // --- Appearance Page ---
-        const appearancePage = new Adw.PreferencesPage({
+        // ── Appearance Page ──
+        const lookPage = new Adw.PreferencesPage({
             title: 'Appearance',
             icon_name: 'applications-graphics-symbolic',
         });
-        window.add(appearancePage);
+        window.add(lookPage);
 
-        const sizeGroup = new Adw.PreferencesGroup({
-            title: 'Dimensions',
-        });
-        appearancePage.add(sizeGroup);
+        const sizeGroup = new Adw.PreferencesGroup({ title: 'Dimensions' });
+        lookPage.add(sizeGroup);
 
-        // Sidebar width
-        const widthRow = new Adw.ActionRow({
-            title: 'Sidebar Width',
-            subtitle: 'Width of the sidebar in pixels',
+        this._addSpinRow(sizeGroup, settings, 'sidebar-width',
+            'Sidebar Width', 'Width in pixels', 120, 400, 10);
+        this._addSpinRow(sizeGroup, settings, 'edge-trigger-width',
+            'Edge Trigger Width', 'Hot zone at screen edge (pixels)', 1, 20, 1);
+
+        const animGroup = new Adw.PreferencesGroup({ title: 'Animation' });
+        lookPage.add(animGroup);
+
+        this._addSpinRow(animGroup, settings, 'animation-duration',
+            'Animation Duration', 'Slide speed in milliseconds', 0, 1000, 25);
+        this._addSpinRow(animGroup, settings, 'auto-hide-delay',
+            'Hide Delay', 'Delay before hiding after mouse leaves (ms)', 100, 5000, 100);
+
+        // ── About & Logs Page ──
+        const aboutPage = new Adw.PreferencesPage({
+            title: 'About',
+            icon_name: 'dialog-information-symbolic',
         });
-        const widthAdj = new Gtk.Adjustment({
-            lower: 120,
-            upper: 400,
-            step_increment: 10,
-            page_increment: 50,
+        window.add(aboutPage);
+
+        const infoGroup = new Adw.PreferencesGroup({ title: 'Stage Manager' });
+        aboutPage.add(infoGroup);
+
+        const versionRow = new Adw.ActionRow({
+            title: 'Version',
+            subtitle: '1.0.0',
         });
-        const widthSpin = new Gtk.SpinButton({
-            adjustment: widthAdj,
+        infoGroup.add(versionRow);
+
+        const gnomeRow = new Adw.ActionRow({
+            title: 'GNOME Shell',
+            subtitle: this._getGnomeVersion(),
+        });
+        infoGroup.add(gnomeRow);
+
+        const sessionRow = new Adw.ActionRow({
+            title: 'Session Type',
+            subtitle: GLib.getenv('XDG_SESSION_TYPE') || 'unknown',
+        });
+        infoGroup.add(sessionRow);
+
+        // Logs section
+        const logGroup = new Adw.PreferencesGroup({
+            title: 'Extension Logs',
+            description: 'Recent errors from this extension (for bug reports)',
+        });
+        aboutPage.add(logGroup);
+
+        const logView = new Gtk.TextView({
+            editable: false,
+            monospace: true,
+            wrap_mode: Gtk.WrapMode.WORD_CHAR,
+            vexpand: true,
+        });
+        logView.set_size_request(-1, 200);
+
+        const scrollWin = new Gtk.ScrolledWindow({
+            hscrollbar_policy: Gtk.PolicyType.AUTOMATIC,
+            vscrollbar_policy: Gtk.PolicyType.AUTOMATIC,
+            min_content_height: 200,
+        });
+        scrollWin.set_child(logView);
+
+        const logRow = new Adw.PreferencesRow();
+        logRow.set_child(scrollWin);
+        logGroup.add(logRow);
+
+        // Load logs
+        this._loadLogs(logView);
+
+        // Refresh button
+        const refreshRow = new Adw.ActionRow({ title: 'Refresh Logs' });
+        const refreshBtn = new Gtk.Button({
+            label: 'Refresh',
             valign: Gtk.Align.CENTER,
         });
-        settings.bind('sidebar-width', widthSpin, 'value',
-            Gio.SettingsBindFlags.DEFAULT);
-        widthRow.add_suffix(widthSpin);
-        sizeGroup.add(widthRow);
+        refreshBtn.connect('clicked', () => this._loadLogs(logView));
+        refreshRow.add_suffix(refreshBtn);
+        logGroup.add(refreshRow);
 
-        // Edge trigger width
-        const edgeRow = new Adw.ActionRow({
-            title: 'Edge Trigger Width',
-            subtitle: 'Width of the hot zone at screen edge (pixels)',
-        });
-        const edgeAdj = new Gtk.Adjustment({
-            lower: 1,
-            upper: 20,
-            step_increment: 1,
-            page_increment: 5,
-        });
-        const edgeSpin = new Gtk.SpinButton({
-            adjustment: edgeAdj,
+        // Copy button
+        const copyRow = new Adw.ActionRow({ title: 'Copy Logs' });
+        const copyBtn = new Gtk.Button({
+            label: 'Copy to Clipboard',
             valign: Gtk.Align.CENTER,
         });
-        settings.bind('edge-trigger-width', edgeSpin, 'value',
-            Gio.SettingsBindFlags.DEFAULT);
-        edgeRow.add_suffix(edgeSpin);
-        sizeGroup.add(edgeRow);
+        copyBtn.connect('clicked', () => {
+            const buf = logView.get_buffer();
+            const [start, end] = [buf.get_start_iter(), buf.get_end_iter()];
+            const text = buf.get_text(start, end, false);
+            const clipboard = logView.get_clipboard();
+            if (clipboard)
+                clipboard.set(text);
+        });
+        copyRow.add_suffix(copyBtn);
+        logGroup.add(copyRow);
+    }
 
-        // Animation group
-        const animGroup = new Adw.PreferencesGroup({
-            title: 'Animation',
+    _addSpinRow(group, settings, key, title, subtitle, min, max, step) {
+        const row = new Adw.ActionRow({ title, subtitle });
+        const adj = new Gtk.Adjustment({
+            lower: min, upper: max,
+            step_increment: step, page_increment: step * 5,
         });
-        appearancePage.add(animGroup);
+        const spin = new Gtk.SpinButton({ adjustment: adj, valign: Gtk.Align.CENTER });
+        settings.bind(key, spin, 'value', Gio.SettingsBindFlags.DEFAULT);
+        row.add_suffix(spin);
+        group.add(row);
+    }
 
-        // Animation duration
-        const animRow = new Adw.ActionRow({
-            title: 'Animation Duration',
-            subtitle: 'Slide animation speed (milliseconds)',
-        });
-        const animAdj = new Gtk.Adjustment({
-            lower: 0,
-            upper: 1000,
-            step_increment: 25,
-            page_increment: 100,
-        });
-        const animSpin = new Gtk.SpinButton({
-            adjustment: animAdj,
-            valign: Gtk.Align.CENTER,
-        });
-        settings.bind('animation-duration', animSpin, 'value',
-            Gio.SettingsBindFlags.DEFAULT);
-        animRow.add_suffix(animSpin);
-        animGroup.add(animRow);
+    _getGnomeVersion() {
+        try {
+            const [ok, out] = GLib.spawn_command_line_sync('gnome-shell --version');
+            if (ok) return new TextDecoder().decode(out).trim().replace('GNOME Shell ', '');
+        } catch (_) { /* */ }
+        return 'unknown';
+    }
 
-        // Auto-hide delay
-        const delayRow = new Adw.ActionRow({
-            title: 'Auto-hide Delay',
-            subtitle: 'Delay before hiding sidebar (milliseconds)',
-        });
-        const delayAdj = new Gtk.Adjustment({
-            lower: 100,
-            upper: 5000,
-            step_increment: 100,
-            page_increment: 500,
-        });
-        const delaySpin = new Gtk.SpinButton({
-            adjustment: delayAdj,
-            valign: Gtk.Align.CENTER,
-        });
-        settings.bind('auto-hide-delay', delaySpin, 'value',
-            Gio.SettingsBindFlags.DEFAULT);
-        delayRow.add_suffix(delaySpin);
-        animGroup.add(delayRow);
+    _loadLogs(textView) {
+        try {
+            const [ok, out, err] = GLib.spawn_command_line_sync(
+                'journalctl --user -b --no-pager -n 50 -g stage-manager 2>/dev/null'
+            );
+            const text = ok ? new TextDecoder().decode(out).trim() : '';
+            const buf = textView.get_buffer();
+            buf.set_text(text || 'No recent logs found.', -1);
+        } catch (_e) {
+            const buf = textView.get_buffer();
+            buf.set_text('Could not load logs. Run manually:\njournalctl --user -b -g stage-manager', -1);
+        }
     }
 }

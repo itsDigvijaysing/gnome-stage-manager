@@ -1,24 +1,16 @@
 /**
  * Stage Manager - GNOME Shell Extension
  *
- * macOS Stage Manager-like window management for GNOME.
+ * macOS Stage Manager for GNOME. Simple, stable, no over-engineering.
  *
- * Behavior (matching macOS Stage Manager):
- * - PER-WORKSPACE: sidebar shows inactive apps on the CURRENT workspace
- * - The focused/active app stays centered on screen
- * - Other recently used apps appear as thumbnail stacks on the LEFT side
- * - Clicking a thumbnail brings that app to focus
- * - Apps are grouped by application
- * - Thumbnails are live Clutter clones with rounded corners
+ * Design:
+ * - PER-WORKSPACE: shows inactive apps on current workspace
+ * - Edge-trigger to reveal, leave to hide
+ * - Minimized windows shown via app icon (no compositor actor needed)
+ * - Safe clone lifecycle: null sources before any container destruction
+ * - Centered vertical distribution of cards
  *
- * Visual design (matching reference: magoness/Stage-Manager-Gnome):
- * - All card styling done via inline styles (not CSS classes) for reliability
- * - Transparent panel, floating rounded cards with shadows
- * - 220ms EASE_OUT_QUAD slide animations
- * - Hover: scale 1.08 up, dim other cards
- * - App icons overlapping bottom of thumbnail
- *
- * Compatible with GNOME 45+ (ESM modules), Wayland and X11.
+ * Compatible with GNOME 45+ (ESM), Wayland and X11.
  */
 
 import Meta from 'gi://Meta';
@@ -31,109 +23,51 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
 
 
-// Layout constants (matching reference extension)
-const PANEL_WIDTH = 260;
-const THUMB_W = 200;
-const THUMB_H = 120;
-const ICON_SIZE = 30;
-const ICON_OVERLAP = 10;
-const MAX_GROUPS = 6;
-const MAX_STACKED = 3;
-const STACK_OFFSET_X = 4;
-const STACK_OFFSET_Y = 4;
-
-// Animation constants
-const SLIDE_DURATION = 220;
-const HIDE_DELAY = 350;
-const HOVER_SCALE = 1.08;
-const HOVER_DIM_OPACITY = 120;
-
-// Edge trigger
-const EDGE_WIDTH = 4;
-const EDGE_HEIGHT = 300;
+const THUMB_W = 160;
+const THUMB_H = 100;
+const ICON_SIZE = 28;
+const MAX_GROUPS = 8;
 
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
-function _isNormalWindow(win) {
-    if (!win)
-        return false;
-    if (win.get_window_type() !== Meta.WindowType.NORMAL)
-        return false;
-    if (win.skip_taskbar || win.is_attached_dialog())
-        return false;
-    if (win.is_always_on_all_workspaces())
-        return false;
+function _isNormal(win) {
+    if (!win) return false;
+    if (win.get_window_type() !== Meta.WindowType.NORMAL) return false;
+    if (win.skip_taskbar || win.is_attached_dialog()) return false;
+    if (win.is_always_on_all_workspaces()) return false;
     return true;
 }
 
-function _getWorkspaceWindows(ws) {
-    if (!ws)
-        return [];
-    return ws.list_windows().filter(w =>
-        _isNormalWindow(w) && w.get_compositor_private()
-    );
-}
-
-function _safeDisconnect(obj, id) {
-    try {
-        if (obj && id) obj.disconnect(id);
-    } catch (_e) { /* */ }
-}
-
 /**
- * Check if a Clutter actor is still alive (not destroyed/disposed).
+ * Recursively null all Clutter.Clone sources in an actor tree.
+ * MUST be called before destroy_all_children() to prevent
+ * "already disposed" crashes when source actors are gone.
  */
-function _isActorAlive(actor) {
+function _nullCloneSources(actor) {
     try {
-        if (!actor)
-            return false;
-        // Accessing any property will throw if disposed
-        void actor.visible;
-        return true;
-    } catch (_e) {
-        return false;
-    }
-}
-
-/**
- * Safely destroy a Clutter.Clone — handles already-disposed source actors.
- */
-function _safeDestroyClone(clone) {
-    if (!clone)
-        return;
-    try {
-        // First null the source to break the reference
-        // Check if clone is still alive before touching it
-        if (_isActorAlive(clone)) {
-            clone.set_source(null);
-            clone.destroy();
+        if (actor instanceof Clutter.Clone) {
+            try { actor.set_source(null); } catch (_e) { /* */ }
         }
-    } catch (_e) {
-        // Already disposed — nothing to do
-    }
+        const children = actor.get_children ? actor.get_children() : [];
+        for (const child of children)
+            _nullCloneSources(child);
+    } catch (_e) { /* actor already gone */ }
 }
 
 /**
- * Group windows by application.
- * Returns { activeGroup, inactiveGroups[] } sorted by most recently focused.
+ * Group windows by app. Returns inactive groups sorted by recency.
+ * Includes minimized windows — they may lack compositor actors.
  */
-function _groupByApp(windows, focusedWindow) {
+function _groupByApp(workspace, focusedWindow) {
     const tracker = Shell.WindowTracker.get_default();
     const appMap = new Map();
 
-    const sorted = [...windows].sort((a, b) =>
+    // Get ALL normal windows on this workspace (including minimized)
+    const allWins = workspace.list_windows().filter(w => _isNormal(w));
+    const sorted = allWins.sort((a, b) =>
         (b.get_user_time() || 0) - (a.get_user_time() || 0)
     );
-
-    for (const win of sorted) {
-        const app = tracker.get_window_app(win);
-        if (!app) continue;
-        const id = app.get_id();
-        if (!appMap.has(id))
-            appMap.set(id, { app, windows: [] });
-        appMap.get(id).windows.push(win);
-    }
 
     let activeAppId = null;
     if (focusedWindow) {
@@ -141,13 +75,18 @@ function _groupByApp(windows, focusedWindow) {
         if (fa) activeAppId = fa.get_id();
     }
 
-    const inactiveGroups = [];
-    for (const [appId, group] of appMap) {
-        if (appId !== activeAppId)
-            inactiveGroups.push(group);
+    for (const win of sorted) {
+        const app = tracker.get_window_app(win);
+        if (!app) continue;
+        const id = app.get_id();
+        if (id === activeAppId) continue; // Skip focused app
+
+        if (!appMap.has(id))
+            appMap.set(id, { app, windows: [] });
+        appMap.get(id).windows.push(win);
     }
 
-    return { activeGroup: activeAppId ? appMap.get(activeAppId) : null, inactiveGroups };
+    return [...appMap.values()];
 }
 
 
@@ -156,62 +95,45 @@ function _groupByApp(windows, focusedWindow) {
 class MaximizeToWorkspace {
     constructor(settings) {
         this._settings = settings;
-        this._signals = [];
-        this._timeouts = [];
-        this._movedWindows = new Set();
+        this._sigs = [];
+        this._timers = [];
+        this._moved = new Set();
     }
 
     enable() {
-        this._connect(global.window_manager, 'size-change', this._onSizeChange.bind(this));
-        this._connect(global.window_manager, 'destroy', this._onDestroy.bind(this));
+        this._sig(global.window_manager, 'size-change', this._onSize.bind(this));
+        this._sig(global.window_manager, 'destroy', (_wm, actor) => {
+            try { if (actor.meta_window) this._moved.delete(actor.meta_window); } catch (_) { /* */ }
+        });
     }
 
     disable() {
-        this._signals.splice(0).forEach(s => _safeDisconnect(s.obj, s.id));
-        this._timeouts.splice(0).forEach(id => GLib.source_remove(id));
-        this._movedWindows.clear();
+        this._sigs.splice(0).forEach(s => { try { s.o.disconnect(s.i); } catch (_) { /* */ } });
+        this._timers.splice(0).forEach(id => GLib.source_remove(id));
+        this._moved.clear();
     }
 
-    _connect(obj, sig, cb) {
-        this._signals.push({ obj, id: obj.connect(sig, cb) });
-    }
+    _sig(o, s, cb) { this._sigs.push({ o, i: o.connect(s, cb) }); }
 
-    _later(ms, fn) {
-        const id = GLib.timeout_add(GLib.PRIORITY_DEFAULT, ms, () => {
-            this._timeouts.splice(this._timeouts.indexOf(id), 1);
-            fn();
-            return GLib.SOURCE_REMOVE;
-        });
-        this._timeouts.push(id);
-    }
-
-    _onSizeChange(_wm, actor, change) {
-        if (!this._settings.get_boolean('enable-maximize-to-workspace'))
-            return;
+    _onSize(_wm, actor, change) {
+        if (!this._settings.get_boolean('enable-maximize-to-workspace')) return;
+        if (change !== Meta.SizeChange.MAXIMIZE) return;
         const win = actor.meta_window;
-        if (!win || !_isNormalWindow(win))
-            return;
-        if (change === Meta.SizeChange.MAXIMIZE)
-            this._handleMaximize(win);
-    }
-
-    _handleMaximize(win) {
-        if (this._movedWindows.has(win))
-            return;
+        if (!win || !_isNormal(win) || this._moved.has(win)) return;
 
         const wsm = global.workspace_manager;
         const ci = wsm.get_active_workspace_index();
         const cws = wsm.get_workspace_by_index(ci);
-        const siblings = _getWorkspaceWindows(cws).filter(w => w !== win);
+        // Only move if sharing workspace with other windows
+        const siblings = cws.list_windows().filter(w => w !== win && _isNormal(w) && !w.minimized);
         if (siblings.length === 0) return;
 
+        // Find or create empty workspace
         let ti = -1;
         for (let i = 0; i < wsm.get_n_workspaces(); i++) {
             if (i === ci) continue;
-            const ws = wsm.get_workspace_by_index(i);
-            if (ws.list_windows().filter(w => w !== win && _isNormalWindow(w)).length === 0) {
-                ti = i;
-                break;
+            if (wsm.get_workspace_by_index(i).list_windows().filter(w => w !== win && _isNormal(w)).length === 0) {
+                ti = i; break;
             }
         }
         if (ti === -1) {
@@ -220,208 +142,192 @@ class MaximizeToWorkspace {
         }
         if (ti === ci) return;
 
-        this._movedWindows.add(win);
+        this._moved.add(win);
         win.change_workspace_by_index(ti, false);
-        this._later(50, () => {
+        const id = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 50, () => {
+            this._timers.splice(this._timers.indexOf(id), 1);
             const ws = wsm.get_workspace_by_index(ti);
-            if (ws) {
-                ws.activate(global.get_current_time());
-                win.activate(global.get_current_time());
-            }
+            if (ws) { ws.activate(global.get_current_time()); win.activate(global.get_current_time()); }
+            return GLib.SOURCE_REMOVE;
         });
-    }
-
-    _onDestroy(_wm, actor) {
-        try {
-            const win = actor.meta_window;
-            if (win) this._movedWindows.delete(win);
-        } catch (_e) { /* */ }
+        this._timers.push(id);
     }
 }
 
 
 // ─── StageSidebar ───────────────────────────────────────────────────────────
 
-/**
- * macOS Stage Manager sidebar using inline styles (matching reference).
- */
 class StageSidebar {
     constructor(settings) {
         this._settings = settings;
-        this._signals = [];
-        this._settingsSignals = [];
-        this._clones = [];
-        this._cardContainers = []; // For hover dim effects
+        this._sigs = [];
+        this._setSigs = [];
+        this._cards = [];
         this._panel = null;
-        this._edgeZone = null;
-        this._contentBox = null;
-        this._scrollView = null;
-        this._hoverPreview = null;
-        this._hoverTimeout = null;
-        this._refreshTimeout = null;
-        this._hideTimeout = null;
+        this._edge = null;
+        this._box = null;
+        this._preview = null;
+        this._hoverTimer = null;
+        this._refreshTimer = null;
+        this._hideTimer = null;
         this._visible = false;
         this._hovered = false;
         this._animating = false;
     }
 
     enable() {
-        this._buildUI();
-        this._connectSignals();
-        this._refresh();
+        this._build();
+        this._wire();
+        // If not auto-hide mode, show sidebar immediately
+        if (!this._settings.get_boolean('sidebar-auto-hide'))
+            this._show();
+        else if (this._visible)
+            this._refresh();
     }
 
     disable() {
-        this._clearTimer('_refreshTimeout');
-        this._clearTimer('_hideTimeout');
-        this._clearTimer('_hoverTimeout');
-        this._signals.splice(0).forEach(s => _safeDisconnect(s.obj, s.id));
-        this._settingsSignals.splice(0).forEach(id => {
-            try { this._settings.disconnect(id); } catch (_e) { /* */ }
-        });
+        this._kill('_refreshTimer');
+        this._kill('_hideTimer');
+        this._kill('_hoverTimer');
+        this._sigs.splice(0).forEach(s => { try { s.o.disconnect(s.i); } catch (_) { /* */ } });
+        this._setSigs.splice(0).forEach(id => { try { this._settings.disconnect(id); } catch (_) { /* */ } });
         this._destroyPreview();
-        this._destroyClones();
-        this._cardContainers = [];
+        this._safeDestroyContent();
+        this._cards = [];
+        this._box = null;
+        this._scroll = null;
         if (this._panel) {
             Main.layoutManager.removeChrome(this._panel);
             this._panel.destroy();
             this._panel = null;
         }
-        if (this._edgeZone) {
-            Main.layoutManager.removeChrome(this._edgeZone);
-            this._edgeZone.destroy();
-            this._edgeZone = null;
+        if (this._edge) {
+            Main.layoutManager.removeChrome(this._edge);
+            this._edge.destroy();
+            this._edge = null;
         }
     }
 
-    _buildUI() {
+    // Read dynamic settings values
+    get _PANEL_W() { return this._settings.get_int('sidebar-width'); }
+    get _SLIDE_MS() { return this._settings.get_int('animation-duration'); }
+    get _HIDE_DELAY_MS() { return this._settings.get_int('auto-hide-delay'); }
+    get _EDGE_W() { return this._settings.get_int('edge-trigger-width'); }
+
+    _build() {
         const mon = Main.layoutManager.primaryMonitor;
-        const panelH = Main.panel ? Main.panel.height : 0;
+        const topH = Main.panel ? Main.panel.height : 0;
+        const panelW = this._PANEL_W;
+        const edgeW = this._EDGE_W;
+        const panelH = mon.height - topH;
 
-        // Edge trigger — thin invisible zone at left edge, vertically centered
-        this._edgeZone = new St.Widget({
-            reactive: true,
-            track_hover: true,
-            style: 'background-color: rgba(255,255,255,0.01);',
-        });
-        this._edgeZone.set_size(EDGE_WIDTH, EDGE_HEIGHT);
-        this._edgeZone.set_position(
-            mon.x,
-            mon.y + panelH + (mon.height - panelH - EDGE_HEIGHT) / 2
-        );
-        Main.layoutManager.addChrome(this._edgeZone, {
-            affectsInputRegion: true,
-            trackFullscreen: false,
-        });
-        this._edgeZone.connect('enter-event', () => {
-            if (!this._isFullscreen())
-                this._show();
-        });
-
-        // Main panel — transparent background, full height
-        this._panel = new St.Widget({
-            reactive: true,
-            track_hover: true,
+        // Edge trigger — full height strip at left edge
+        this._edge = new St.Widget({
+            reactive: true, track_hover: true,
             style: 'background-color: transparent;',
         });
-        this._panel.set_size(PANEL_WIDTH, mon.height - panelH);
-        this._panel.set_position(mon.x - PANEL_WIDTH, mon.y + panelH);
+        this._edge.set_size(edgeW, mon.height - topH);
+        this._edge.set_position(mon.x, mon.y + topH);
+        Main.layoutManager.addChrome(this._edge, { affectsInputRegion: true, trackFullscreen: false });
+        this._edge.connect('enter-event', () => {
+            if (!this._fullscreen()) this._show();
+        });
 
-        Main.layoutManager.addChrome(this._panel, {
-            affectsInputRegion: true,
-            trackFullscreen: false,
+        // Panel = plain St.Widget container (matches reference architecture)
+        this._panel = new St.Widget({
+            reactive: true, track_hover: true,
+            style: 'background-color: transparent;',
+        });
+        this._panel.set_size(panelW, panelH);
+        this._panel.set_position(mon.x - panelW, mon.y + topH);
+        this._visible = false;
+
+        Main.layoutManager.addChrome(this._panel, { affectsInputRegion: true, trackFullscreen: false });
+
+        // ScrollView inside panel — this is the key layer that makes BoxLayout work
+        this._scroll = new St.ScrollView({
+            overlay_scrollbars: true,
+            hscrollbar_policy: St.PolicyType.NEVER,
+            vscrollbar_policy: St.PolicyType.NEVER,
+            clip_to_allocation: true,
+        });
+        this._scroll.set_size(panelW, panelH);
+        this._panel.add_child(this._scroll);
+
+        // Content box inside ScrollView — vertical BoxLayout where cards go
+        this._box = new St.BoxLayout({
+            vertical: true,
+            x_align: Clutter.ActorAlign.CENTER,
+            y_align: Clutter.ActorAlign.START,
+            style: 'padding: 60px 0px; spacing: 16px;',
+        });
+        this._scroll.set_child(this._box);
+
+        // Mouse wheel scroll support
+        this._scroll.connect('scroll-event', (_actor, event) => {
+            const adj = this._scroll.vadjustment;
+            const [, dy] = event.get_scroll_delta();
+            adj.value = Math.max(0, Math.min(adj.upper - adj.page_size, adj.value + dy * 55));
+            return Clutter.EVENT_STOP;
         });
 
         this._panel.connect('enter-event', () => {
             this._hovered = true;
-            this._clearTimer('_hideTimeout');
+            this._kill('_hideTimer');
         });
         this._panel.connect('leave-event', () => {
             this._hovered = false;
             this._destroyPreview();
-            this._scheduleHide();
-        });
-
-        // Scroll view inside panel
-        this._scrollView = new St.ScrollView({
-            style: 'padding: 0; margin: 0;',
-            hscrollbar_policy: St.PolicyType.NEVER,
-            vscrollbar_policy: St.PolicyType.AUTOMATIC,
-            overlay_scrollbars: true,
-            clip_to_allocation: true,
-        });
-        this._scrollView.set_size(PANEL_WIDTH, mon.height - panelH);
-        this._panel.add_child(this._scrollView);
-
-        // Vertical content box
-        this._contentBox = new St.BoxLayout({
-            vertical: true,
-            style: 'padding: 60px 0px; spacing: 16px;',
-            x_align: Clutter.ActorAlign.CENTER,
-        });
-        if (this._scrollView.set_child)
-            this._scrollView.set_child(this._contentBox);
-        else
-            this._scrollView.add_child(this._contentBox);
-
-        // Custom scroll speed (matching reference: delta * 55)
-        this._scrollView.connect('scroll-event', (_actor, event) => {
-            const [, dy] = event.get_scroll_delta();
-            const adj = this._scrollView.get_vscroll_bar().get_adjustment();
-            adj.set_value(adj.get_value() + dy * 55);
-            return Clutter.EVENT_STOP;
+            if (this._settings.get_boolean('sidebar-auto-hide'))
+                this._scheduleHide();
         });
     }
 
-    _connectSignals() {
-        const connect = (obj, sig, cb) => {
-            this._signals.push({ obj, id: obj.connect(sig, cb) });
-        };
+    _wire() {
+        const sig = (o, s, cb) => { this._sigs.push({ o, i: o.connect(s, cb) }); };
+        sig(global.display, 'notify::focus-window', () => this._scheduleRefresh());
+        sig(global.window_manager, 'map', () => this._scheduleRefresh());
+        sig(global.window_manager, 'destroy', () => this._scheduleRefresh());
+        sig(global.window_manager, 'minimize', () => this._scheduleRefresh());
+        sig(global.window_manager, 'unminimize', () => this._scheduleRefresh());
+        sig(global.workspace_manager, 'active-workspace-changed', () => this._scheduleRefresh());
+        sig(global.display, 'in-fullscreen-changed', () => this._onFullscreen());
 
-        connect(global.display, 'notify::focus-window', () => this._scheduleRefresh());
-        connect(global.window_manager, 'map', () => this._scheduleRefresh());
-        connect(global.window_manager, 'destroy', () => this._scheduleRefresh());
-        connect(global.window_manager, 'minimize', () => this._scheduleRefresh());
-        connect(global.window_manager, 'unminimize', () => this._scheduleRefresh());
-        connect(global.window_manager, 'size-change', () => this._scheduleRefresh());
-        connect(global.workspace_manager, 'active-workspace-changed', () => this._scheduleRefresh());
-        connect(global.display, 'in-fullscreen-changed', () => this._onFullscreenChanged());
-
-        this._settingsSignals.push(
-            this._settings.connect('changed::enable-stage-sidebar', () => {
-                if (!this._settings.get_boolean('enable-stage-sidebar'))
-                    this._hide();
-            })
-        );
+        this._setSigs.push(this._settings.connect('changed::enable-stage-sidebar', () => {
+            if (!this._settings.get_boolean('enable-stage-sidebar') && this._visible) this._hide();
+        }));
+        this._setSigs.push(this._settings.connect('changed::sidebar-auto-hide', () => {
+            if (this._settings.get_boolean('sidebar-auto-hide')) {
+                // Switched to auto-hide: hide if mouse not hovering
+                if (!this._hovered) this._scheduleHide();
+            } else {
+                // Switched to always-visible: show immediately
+                this._show();
+            }
+        }));
     }
 
     // ── Fullscreen ──
 
-    _isFullscreen() {
-        try {
-            return global.display.get_monitor_in_fullscreen(
-                Main.layoutManager.primaryMonitor.index
-            );
-        } catch (_e) {
-            return false;
-        }
+    _fullscreen() {
+        try { return global.display.get_monitor_in_fullscreen(Main.layoutManager.primaryMonitor.index); }
+        catch (_) { return false; }
     }
 
-    _onFullscreenChanged() {
-        if (this._isFullscreen()) {
-            // Instant hide — no animation prevents flicker
+    _onFullscreen() {
+        if (this._fullscreen()) {
+            // Instant hide — no animation, no flicker
+            this._destroyPreview();
             if (this._visible) {
                 this._visible = false;
-                this._panel.set_position(
-                    Main.layoutManager.primaryMonitor.x - PANEL_WIDTH,
-                    this._panel.y
-                );
+                this._animating = false;
+                this._panel.remove_all_transitions();
+                this._panel.set_position(Main.layoutManager.primaryMonitor.x - this._PANEL_W, this._panel.y);
             }
-            this._edgeZone?.hide();
-            this._destroyPreview();
+            this._edge?.hide();
         } else {
             if (this._settings.get_boolean('enable-stage-sidebar'))
-                this._edgeZone?.show();
+                this._edge?.show();
         }
     }
 
@@ -429,19 +335,23 @@ class StageSidebar {
 
     _show() {
         if (this._visible || this._animating) return;
-        if (!this._settings.get_boolean('enable-stage-sidebar')) return;
-        if (this._isFullscreen()) return;
+        if (!this._settings.get_boolean('enable-stage-sidebar') || this._fullscreen()) return;
 
         this._visible = true;
         this._animating = true;
-        this._clearTimer('_hideTimeout');
+        this._kill('_hideTimer');
+
+        // Refresh content BEFORE animating in so cards are visible during slide
         this._refresh();
 
+        this._panel.remove_all_transitions();
         this._panel.ease({
             x: Main.layoutManager.primaryMonitor.x,
-            duration: SLIDE_DURATION,
+            duration: this._SLIDE_MS,
             mode: Clutter.AnimationMode.EASE_OUT_QUAD,
-            onComplete: () => { this._animating = false; },
+            onComplete: () => {
+                this._animating = false;
+            },
         });
     }
 
@@ -452,27 +362,28 @@ class StageSidebar {
         this._animating = true;
         this._destroyPreview();
 
+        this._panel.remove_all_transitions();
         this._panel.ease({
-            x: Main.layoutManager.primaryMonitor.x - PANEL_WIDTH,
-            duration: SLIDE_DURATION,
+            x: Main.layoutManager.primaryMonitor.x - this._PANEL_W,
+            duration: this._SLIDE_MS,
             mode: Clutter.AnimationMode.EASE_OUT_QUAD,
             onComplete: () => { this._animating = false; },
         });
     }
 
     _scheduleHide() {
-        this._clearTimer('_hideTimeout');
-        this._hideTimeout = GLib.timeout_add(GLib.PRIORITY_DEFAULT, HIDE_DELAY, () => {
-            this._hideTimeout = null;
+        this._kill('_hideTimer');
+        this._hideTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, this._HIDE_DELAY_MS, () => {
+            this._hideTimer = null;
             if (!this._hovered) this._hide();
             return GLib.SOURCE_REMOVE;
         });
     }
 
     _scheduleRefresh() {
-        if (this._refreshTimeout) return;
-        this._refreshTimeout = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 100, () => {
-            this._refreshTimeout = null;
+        if (this._refreshTimer) return;
+        this._refreshTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 150, () => {
+            this._refreshTimer = null;
             if (this._visible) this._refresh();
             return GLib.SOURCE_REMOVE;
         });
@@ -483,447 +394,218 @@ class StageSidebar {
     _refresh() {
         if (!this._settings.get_boolean('enable-stage-sidebar')) return;
 
-        this._destroyClones();
-        this._cardContainers = [];
-        this._contentBox.destroy_all_children();
+        this._cards = [];
+        this._safeDestroyContent();
 
         const activeWs = global.workspace_manager.get_active_workspace();
-        const allWindows = _getWorkspaceWindows(activeWs);
         const focusedWin = global.display.get_focus_window();
 
-        // Also include minimized windows
-        const minimized = activeWs.list_windows().filter(w =>
-            _isNormalWindow(w) && w.minimized && w.get_compositor_private()
-        );
-        const unique = [...new Set([...allWindows, ...minimized])];
+        const groups = _groupByApp(activeWs, focusedWin).slice(0, MAX_GROUPS);
 
-        const { inactiveGroups } = _groupByApp(unique, focusedWin);
-        const groups = inactiveGroups.slice(0, MAX_GROUPS);
+        console.log(`[StageManager] refresh: ${groups.length} groups, focused=${focusedWin ? 'yes' : 'no'}`);
 
         if (groups.length === 0) return;
 
+        // Build cards
         for (const group of groups) {
-            const container = this._createCard(group);
-            if (container) {
-                this._contentBox.add_child(container);
-                this._cardContainers.push(container);
+            try {
+                const card = this._makeCard(group);
+                if (card) {
+                    this._box.add_child(card);
+                    this._cards.push(card);
+                }
+            } catch (e) {
+                console.error(`[StageManager] card error: ${e.message}`);
             }
         }
+
+        console.log(`[StageManager] built ${this._cards.length} cards, box children=${this._box.get_n_children()}`);
     }
 
     /**
-     * Create a single app card matching the reference design:
-     * - Rounded thumbnail (border-radius: 16px) with live clone
-     * - App icon centered below, overlapping the thumbnail slightly
-     * - Hover: scale 1.08, dim other cards
-     * - Click: activate that app group
+     * Safely destroy all content in the box.
+     * Nulls clone sources BEFORE destroying to prevent GJS crashes.
      */
-    _createCard(group) {
+    _safeDestroyContent() {
+        if (!this._box) return;
+        try {
+            _nullCloneSources(this._box);
+            this._box.destroy_all_children();
+        } catch (_e) { /* */ }
+    }
+
+    /**
+     * Create a card for one app group.
+     * Uses live clone if compositor actor available, app icon if not (minimized).
+     */
+    _makeCard(group) {
         const { app, windows } = group;
 
-        // Outer container — holds thumbnail + icon, transparent
-        const container = new St.BoxLayout({
-            vertical: true,
-            reactive: true,
-            track_hover: true,
-            can_focus: true,
-            style: 'padding: 0px;',
+        // Card container — vertical box, same pattern as reference
+        const card = new St.BoxLayout({
+            vertical: true, reactive: true,
             x_align: Clutter.ActorAlign.CENTER,
+            style: 'padding: 16px;',
         });
 
-        // Thumbnail wrapper — rounded corners, clipping, shadow
-        const thumbWrapper = new St.Widget({
-            style: `
-                border-radius: 16px;
-                background-color: rgba(30, 30, 30, 0.6);
-            `,
-            clip_to_allocation: true,
+        // Thumbnail wrapper — plain St.Widget, clone inside drives sizing
+        const thumb = new St.Widget({
+            reactive: true,
+            style: 'border-radius: 16px;',
         });
 
-        const previewWins = windows.slice(0, MAX_STACKED);
-
-        if (previewWins.length === 1) {
-            // Single window — simple centered clone
-            thumbWrapper.set_size(THUMB_W, THUMB_H);
-            const clone = this._createClone(previewWins[0], THUMB_W, THUMB_H);
-            if (clone) {
-                thumbWrapper.add_child(clone);
-            }
-        } else {
-            // Multiple windows — stacked with offset
-            const stackH = THUMB_H + (previewWins.length - 1) * STACK_OFFSET_Y;
-            thumbWrapper.set_size(THUMB_W, stackH);
-
-            for (let i = previewWins.length - 1; i >= 0; i--) {
-                const innerW = THUMB_W - (MAX_STACKED - 1) * STACK_OFFSET_X * 2;
-                const clone = this._createClone(previewWins[i], innerW, THUMB_H);
-                if (!clone) continue;
-
-                const ox = i * STACK_OFFSET_X + (THUMB_W - innerW) / 2 -
-                    ((previewWins.length - 1) * STACK_OFFSET_X) / 2;
-                const oy = i * STACK_OFFSET_Y;
-                clone.set_position(Math.max(0, ox), oy);
-
-                if (i > 0)
-                    clone.set_opacity(200 - i * 30);
-
-                thumbWrapper.add_child(clone);
+        // Try to create live clone from first visible (non-minimized) window
+        let hasClone = false;
+        const visibleWin = windows.find(w => !w.minimized && w.get_compositor_private());
+        if (visibleWin) {
+            const actor = visibleWin.get_compositor_private();
+            if (actor) {
+                try {
+                    const clone = new Clutter.Clone({
+                        source: actor,
+                        width: THUMB_W,
+                        height: THUMB_H,
+                    });
+                    thumb.add_child(clone);
+                    hasClone = true;
+                } catch (_e) { /* disposed actor */ }
             }
         }
 
-        container.add_child(thumbWrapper);
+        // Fallback: show app icon centered in a fixed-size box
+        if (!hasClone && app) {
+            const iconFallback = app.create_icon_texture(64);
+            iconFallback.set_position((THUMB_W - 64) / 2, (THUMB_H - 64) / 2);
+            thumb.add_child(iconFallback);
+            // Need explicit size when no clone drives it
+            thumb.set_size(THUMB_W, THUMB_H);
+        }
 
-        // Dim overlay — for hover dimming of non-hovered cards
-        const dimOverlay = new St.Widget({
-            style: 'background-color: rgba(0,0,0,0.45); border-radius: 16px;',
-        });
-        dimOverlay.set_size(THUMB_W, thumbWrapper.height);
-        dimOverlay.set_position(0, 0);
-        dimOverlay.set_opacity(0);
-        thumbWrapper.add_child(dimOverlay);
-        container._dimOverlay = dimOverlay;
+        card.add_child(thumb);
 
-        // App icon below thumbnail (centered, slightly overlapping)
+        // App icon below thumbnail
         if (app) {
             const iconBox = new St.BoxLayout({
                 x_align: Clutter.ActorAlign.CENTER,
-                style: `margin-top: -${ICON_OVERLAP}px; padding: 0;`,
+                style: 'margin-top: 12px;',
             });
-
-            const iconBin = new St.Bin({
-                style: `
-                    background-color: rgba(40, 40, 42, 0.9);
-                    border-radius: ${ICON_SIZE / 2 + 4}px;
-                    padding: 4px;
-                    border: 1px solid rgba(255,255,255,0.1);
-                `,
-            });
-            const icon = app.create_icon_texture(ICON_SIZE);
-            iconBin.set_child(icon);
-            iconBox.add_child(iconBin);
-            container.add_child(iconBox);
+            iconBox.add_child(app.create_icon_texture(ICON_SIZE));
+            card.add_child(iconBox);
         }
 
-        // ── Hover effects (matching reference) ──
-
-        container.connect('enter-event', () => {
-            // Scale up hovered card
-            container.ease({
-                scale_x: HOVER_SCALE,
-                scale_y: HOVER_SCALE,
-                duration: 180,
-                mode: Clutter.AnimationMode.EASE_OUT_QUAD,
-            });
-            // Dim other cards
-            for (const c of this._cardContainers) {
-                if (c === container) {
-                    c._dimOverlay?.ease({ opacity: 0, duration: 180, mode: Clutter.AnimationMode.EASE_OUT_QUAD });
-                } else {
-                    c.ease({
-                        scale_x: 0.95,
-                        scale_y: 0.95,
-                        duration: 180,
-                        mode: Clutter.AnimationMode.EASE_OUT_QUAD,
-                    });
-                    c._dimOverlay?.ease({
-                        opacity: HOVER_DIM_OPACITY,
-                        duration: 180,
-                        mode: Clutter.AnimationMode.EASE_OUT_QUAD,
-                    });
-                }
-            }
-
-            // Schedule hover preview
-            this._clearTimer('_hoverTimeout');
-            this._hoverTimeout = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 350, () => {
-                this._hoverTimeout = null;
-                this._showPreview(container, windows);
-                return GLib.SOURCE_REMOVE;
-            });
+        // ── Hover ──
+        card.connect('enter-event', () => {
+            card.ease({ scale_x: 1.06, scale_y: 1.06, duration: 150, mode: Clutter.AnimationMode.EASE_OUT_QUAD });
+            // Show focus ring
+            thumb.set_style('border-radius: 16px; box-shadow: 0 0 0 3px rgba(255,255,255,0.5);');
         });
-
-        container.connect('leave-event', () => {
-            this._clearTimer('_hoverTimeout');
-            this._destroyPreview();
-
-            // Reset all cards
-            for (const c of this._cardContainers) {
-                c.ease({
-                    scale_x: 1.0,
-                    scale_y: 1.0,
-                    duration: 180,
-                    mode: Clutter.AnimationMode.EASE_OUT_QUAD,
-                });
-                c._dimOverlay?.ease({ opacity: 0, duration: 180, mode: Clutter.AnimationMode.EASE_OUT_QUAD });
-            }
+        card.connect('leave-event', () => {
+            card.ease({ scale_x: 1.0, scale_y: 1.0, duration: 150, mode: Clutter.AnimationMode.EASE_OUT_QUAD });
+            thumb.set_style('border-radius: 16px;');
         });
 
         // ── Click ──
-
-        container.connect('button-release-event', (_a, event) => {
-            if (event.get_button() === 1) {
-                this._destroyPreview();
-                this._switchTo(group);
-            }
+        card.connect('button-release-event', () => {
+            this._activate(group);
             return Clutter.EVENT_STOP;
         });
 
-        container.connect('key-press-event', (_a, event) => {
-            const s = event.get_key_symbol();
-            if (s === Clutter.KEY_Return || s === Clutter.KEY_space) {
-                this._destroyPreview();
-                this._switchTo(group);
-                return Clutter.EVENT_STOP;
-            }
-            return Clutter.EVENT_PROPAGATE;
-        });
-
-        return container;
+        return card;
     }
 
-    /**
-     * Create a safely-managed Clutter.Clone for a window.
-     * Returns null if the actor is unavailable.
-     */
-    _createClone(win, width, height) {
-        const actor = win.get_compositor_private();
-        if (!_isActorAlive(actor))
-            return null;
-
-        const rect = win.get_frame_rect();
-        if (rect.width === 0 || rect.height === 0)
-            return null;
-
-        const sx = width / rect.width;
-        const sy = height / rect.height;
-        const scale = Math.min(sx, sy, 1.0);
-        const cw = rect.width * scale;
-        const ch = rect.height * scale;
-
-        let clone;
-        try {
-            clone = new Clutter.Clone({
-                source: actor,
-                width: cw,
-                height: ch,
-            });
-        } catch (_e) {
-            return null;
-        }
-
-        // Center within the given area
-        clone.set_position(
-            Math.max(0, (width - cw) / 2),
-            Math.max(0, (height - ch) / 2)
-        );
-
-        this._clones.push(clone);
-
-        // Watch for source actor destruction — disconnect clone before it crashes
-        const destroyId = actor.connect('destroy', () => {
-            try {
-                if (_isActorAlive(clone)) {
-                    clone.set_source(null);
-                }
-            } catch (_e) { /* */ }
-        });
-
-        // Store so we can disconnect later
-        clone._sourceDestroyId = destroyId;
-        clone._sourceActor = actor;
-
-        return clone;
-    }
-
-    // ── Hover preview ──
+    // ── Preview ──
 
     _showPreview(card, windows) {
         this._destroyPreview();
-        if (windows.length === 0) return;
+        const win = windows.find(w => !w.minimized && w.get_compositor_private());
+        if (!win) return;
 
-        const win = windows[0];
         const actor = win.get_compositor_private();
-        if (!_isActorAlive(actor)) return;
-
+        if (!actor) return;
         const rect = win.get_frame_rect();
-        if (rect.width === 0 || rect.height === 0) return;
+        if (rect.width === 0) return;
 
         const mon = Main.layoutManager.primaryMonitor;
-        const maxW = Math.min(mon.width * 0.35, 520);
-        const maxH = Math.min(mon.height * 0.4, 400);
+        const maxW = Math.min(mon.width * 0.3, 480);
+        const maxH = Math.min(mon.height * 0.35, 360);
         const s = Math.min(maxW / rect.width, maxH / rect.height, 1.0);
-        const pw = rect.width * s;
-        const ph = rect.height * s;
+        const pw = rect.width * s, ph = rect.height * s;
 
         let clone;
-        try {
-            clone = new Clutter.Clone({ source: actor, width: pw, height: ph });
-        } catch (_e) {
-            return;
-        }
+        try { clone = new Clutter.Clone({ source: actor, width: pw, height: ph }); } catch (_) { return; }
 
-        const panelH = Main.panel ? Main.panel.height : 0;
-        const [, cardY] = card.get_transformed_position();
-        const previewX = mon.x + PANEL_WIDTH + 12;
-        let previewY = cardY;
-        if (previewY + ph + 30 > mon.y + mon.height)
-            previewY = mon.y + mon.height - ph - 30;
-        if (previewY < mon.y + panelH + 8)
-            previewY = mon.y + panelH + 8;
+        const topH = Main.panel ? Main.panel.height : 0;
+        let [, cardY] = [0, 0];
+        try { [, cardY] = card.get_transformed_position(); } catch (_) { return; }
+        let py = Math.max(mon.y + topH + 8, Math.min(cardY, mon.y + mon.height - ph - 20));
 
-        this._hoverPreview = new St.Widget({
-            style: `
-                background-color: rgba(25, 25, 28, 0.92);
-                border-radius: 16px;
-                border: 1px solid rgba(255,255,255,0.08);
-                box-shadow: 0 10px 40px rgba(0,0,0,0.55);
-            `,
+        this._preview = new St.Widget({
+            style: 'background-color: rgba(25,25,28,0.92); border-radius: 14px; border: 1px solid rgba(255,255,255,0.08); box-shadow: 0 8px 32px rgba(0,0,0,0.5);',
             reactive: false,
         });
-        this._hoverPreview.set_size(pw + 16, ph + 16);
-        this._hoverPreview.set_position(previewX, previewY);
+        this._preview.set_size(pw + 12, ph + 12);
+        this._preview.set_position(mon.x + this._PANEL_W + 8, py);
+        clone.set_position(6, 6);
+        this._preview.add_child(clone);
 
-        clone.set_position(8, 8);
-        this._hoverPreview.add_child(clone);
-        this._clones.push(clone);
-
-        // Watch for source destruction
-        const did = actor.connect('destroy', () => {
-            try {
-                if (_isActorAlive(clone))
-                    clone.set_source(null);
-            } catch (_e) { /* */ }
-        });
-        clone._sourceDestroyId = did;
-        clone._sourceActor = actor;
-
-        Main.layoutManager.addChrome(this._hoverPreview, {
-            affectsInputRegion: false,
-            trackFullscreen: false,
-        });
-
-        // Animate in
-        this._hoverPreview.set_opacity(0);
-        this._hoverPreview.set_scale(0.92, 0.92);
-        this._hoverPreview.set_pivot_point(0, 0.5);
-        this._hoverPreview.ease({
-            opacity: 255,
-            scale_x: 1.0,
-            scale_y: 1.0,
-            duration: 180,
-            mode: Clutter.AnimationMode.EASE_OUT_QUAD,
-        });
+        Main.layoutManager.addChrome(this._preview, { affectsInputRegion: false, trackFullscreen: false });
+        this._preview.set_opacity(0);
+        this._preview.ease({ opacity: 255, duration: 150, mode: Clutter.AnimationMode.EASE_OUT_QUAD });
     }
 
     _destroyPreview() {
-        if (this._hoverPreview) {
+        if (this._preview) {
             try {
-                Main.layoutManager.removeChrome(this._hoverPreview);
-                this._hoverPreview.destroy();
-            } catch (_e) { /* */ }
-            this._hoverPreview = null;
+                _nullCloneSources(this._preview);
+                Main.layoutManager.removeChrome(this._preview);
+                this._preview.destroy();
+            } catch (_) { /* */ }
+            this._preview = null;
         }
     }
 
-    // ── Stage switching ──
+    // ── Activate ──
 
-    _switchTo(group) {
+    _activate(group) {
         if (this._animating) return;
-
         const { windows } = group;
         if (windows.length === 0) return;
 
-        this._animating = true;
-        const mon = Main.layoutManager.primaryMonitor;
-
-        // Activate windows with slide-in animation
-        for (let i = windows.length - 1; i >= 0; i--) {
-            const win = windows[i];
+        for (const win of windows) {
             if (win.minimized) win.unminimize();
-
-            const actor = win.get_compositor_private();
-            if (!_isActorAlive(actor)) continue;
-
-            const targetX = actor.x;
-
-            // Start from left / scaled down
-            try {
-                actor.set({
-                    x: mon.x - actor.width * 0.3,
-                    scale_x: 0.75,
-                    scale_y: 0.75,
-                    opacity: 60,
-                    pivot_point: new Clutter.Point({ x: 0.0, y: 0.5 }),
-                });
-
-                const delay = (windows.length - 1 - i) * 35;
-                GLib.timeout_add(GLib.PRIORITY_DEFAULT, delay, () => {
-                    if (!_isActorAlive(actor)) return GLib.SOURCE_REMOVE;
-                    actor.ease({
-                        x: targetX,
-                        scale_x: 1.0,
-                        scale_y: 1.0,
-                        opacity: 255,
-                        duration: SLIDE_DURATION * 1.3,
-                        mode: Clutter.AnimationMode.EASE_OUT_QUAD,
-                    });
-                    return GLib.SOURCE_REMOVE;
-                });
-            } catch (_e) { /* */ }
         }
-
+        // Activate the most recent window
         windows[0].activate(global.get_current_time());
-        this._scheduleHide();
 
-        GLib.timeout_add(GLib.PRIORITY_DEFAULT, SLIDE_DURATION * 1.5, () => {
-            this._animating = false;
-            this._scheduleRefresh();
-            return GLib.SOURCE_REMOVE;
-        });
+        if (this._settings.get_boolean('sidebar-auto-hide'))
+            this._scheduleHide();
+        this._scheduleRefresh();
     }
 
-    // ── Cleanup ──
+    // ── Util ──
 
-    _destroyClones() {
-        for (const clone of this._clones) {
-            // Disconnect source actor destroy signal first
-            if (clone._sourceActor && clone._sourceDestroyId) {
-                try {
-                    clone._sourceActor.disconnect(clone._sourceDestroyId);
-                } catch (_e) { /* */ }
-                clone._sourceActor = null;
-                clone._sourceDestroyId = null;
-            }
-            _safeDestroyClone(clone);
-        }
-        this._clones = [];
-    }
-
-    _clearTimer(name) {
-        if (this[name]) {
-            GLib.source_remove(this[name]);
-            this[name] = null;
-        }
+    _kill(name) {
+        if (this[name]) { GLib.source_remove(this[name]); this[name] = null; }
     }
 }
 
 
-// ─── Main Extension ─────────────────────────────────────────────────────────
+// ─── Main ───────────────────────────────────────────────────────────────────
 
 export default class StageManagerExtension extends Extension {
     enable() {
         this._settings = this.getSettings();
-        this._maximizer = new MaximizeToWorkspace(this._settings);
-        this._sidebar = new StageSidebar(this._settings);
-        this._maximizer.enable();
-        this._sidebar.enable();
+        this._max = new MaximizeToWorkspace(this._settings);
+        this._side = new StageSidebar(this._settings);
+        this._max.enable();
+        this._side.enable();
     }
 
     disable() {
-        this._sidebar.disable();
-        this._maximizer.disable();
-        this._sidebar = null;
-        this._maximizer = null;
+        this._side.disable();
+        this._max.disable();
+        this._side = null;
+        this._max = null;
         this._settings = null;
     }
 }

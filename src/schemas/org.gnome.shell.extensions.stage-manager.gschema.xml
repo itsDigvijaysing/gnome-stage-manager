@@ -30,9 +30,9 @@
         </key>
 
         <key name="sidebar-auto-hide" type="b">
-            <default>true</default>
+            <default>false</default>
             <summary>Auto-hide Sidebar</summary>
-            <description>Automatically hide the sidebar when not hovering over it.</description>
+            <description>When off (default): sidebar is always visible and hides only when windows overlap it (macOS behavior). When on: sidebar uses hover-to-reveal.</description>
         </key>
 
         <key name="auto-hide-delay" type="i">
