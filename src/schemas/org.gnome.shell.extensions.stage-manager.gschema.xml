@@ -55,5 +55,11 @@
             <description>Show application icons below window thumbnails in the sidebar.</description>
         </key>
 
+        <key name="sidebar-mode" type="s">
+            <default>'apps'</default>
+            <summary>Sidebar Mode</summary>
+            <description>What to show in sidebar cards. 'apps' = inactive apps on current workspace. 'workspaces' = other workspaces.</description>
+        </key>
+
     </schema>
 </schemalist>

@@ -27,6 +27,7 @@ const THUMB_W = 160;
 const THUMB_H = 100;
 const ICON_SIZE = 28;
 const MAX_GROUPS = 8;
+const PERSPECTIVE_ANGLE = 22; // degrees Y-axis rotation for depth effect
 
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -296,6 +297,9 @@ class StageSidebar {
         this._setSigs.push(this._settings.connect('changed::enable-stage-sidebar', () => {
             if (!this._settings.get_boolean('enable-stage-sidebar') && this._visible) this._hide();
         }));
+        this._setSigs.push(this._settings.connect('changed::sidebar-mode', () => {
+            if (this._visible) this._refresh();
+        }));
         this._setSigs.push(this._settings.connect('changed::sidebar-auto-hide', () => {
             if (this._settings.get_boolean('sidebar-auto-hide')) {
                 // Switched to auto-hide: hide if mouse not hovering
@@ -382,9 +386,10 @@ class StageSidebar {
 
     _scheduleRefresh() {
         if (this._refreshTimer) return;
-        this._refreshTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 150, () => {
+        this._refreshTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 200, () => {
             this._refreshTimer = null;
-            if (this._visible) this._refresh();
+            // Skip refresh while hovering to prevent flicker/clone disposal crashes
+            if (this._visible && !this._hovered) this._refresh();
             return GLib.SOURCE_REMOVE;
         });
     }
@@ -397,19 +402,24 @@ class StageSidebar {
         this._cards = [];
         this._safeDestroyContent();
 
+        const mode = this._settings.get_string('sidebar-mode');
+
+        if (mode === 'workspaces')
+            this._refreshWorkspaces();
+        else
+            this._refreshApps();
+    }
+
+    _refreshApps() {
         const activeWs = global.workspace_manager.get_active_workspace();
         const focusedWin = global.display.get_focus_window();
-
         const groups = _groupByApp(activeWs, focusedWin).slice(0, MAX_GROUPS);
-
-        console.log(`[StageManager] refresh: ${groups.length} groups, focused=${focusedWin ? 'yes' : 'no'}`);
 
         if (groups.length === 0) return;
 
-        // Build cards
         for (const group of groups) {
             try {
-                const card = this._makeCard(group);
+                const card = this._makeAppCard(group);
                 if (card) {
                     this._box.add_child(card);
                     this._cards.push(card);
@@ -418,8 +428,29 @@ class StageSidebar {
                 console.error(`[StageManager] card error: ${e.message}`);
             }
         }
+    }
 
-        console.log(`[StageManager] built ${this._cards.length} cards, box children=${this._box.get_n_children()}`);
+    _refreshWorkspaces() {
+        const wsm = global.workspace_manager;
+        const activeIdx = wsm.get_active_workspace_index();
+        const n = wsm.get_n_workspaces();
+
+        for (let i = 0; i < n; i++) {
+            if (i === activeIdx) continue;
+            const ws = wsm.get_workspace_by_index(i);
+            const wins = ws.list_windows().filter(w => _isNormal(w));
+            if (wins.length === 0) continue;
+
+            try {
+                const card = this._makeWorkspaceCard(ws, wins, i);
+                if (card) {
+                    this._box.add_child(card);
+                    this._cards.push(card);
+                }
+            } catch (e) {
+                console.error(`[StageManager] ws card error: ${e.message}`);
+            }
+        }
     }
 
     /**
@@ -435,26 +466,98 @@ class StageSidebar {
     }
 
     /**
-     * Create a card for one app group.
-     * Uses live clone if compositor actor available, app icon if not (minimized).
+     * Create a card for one app group (apps mode).
      */
-    _makeCard(group) {
+    _makeAppCard(group) {
         const { app, windows } = group;
 
-        // Card container — vertical box, same pattern as reference
         const card = new St.BoxLayout({
             vertical: true, reactive: true,
             x_align: Clutter.ActorAlign.CENTER,
-            style: 'padding: 16px;',
+            style: 'padding: 10px 16px;',
         });
 
-        // Thumbnail wrapper — plain St.Widget, clone inside drives sizing
+        const thumb = this._makeThumb(windows);
+        card.add_child(thumb);
+
+        // App icon below thumbnail
+        if (app && this._settings.get_boolean('show-app-icons')) {
+            const iconBox = new St.BoxLayout({
+                x_align: Clutter.ActorAlign.CENTER,
+                style: 'margin-top: 8px;',
+            });
+            iconBox.add_child(app.create_icon_texture(ICON_SIZE));
+            card.add_child(iconBox);
+        }
+
+        this._applyPerspective(card, thumb);
+        this._wireCardHover(card, thumb, windows);
+
+        card.connect('button-release-event', () => {
+            this._destroyPreview();
+            this._activate(group);
+            return Clutter.EVENT_STOP;
+        });
+
+        return card;
+    }
+
+    /**
+     * Create a card for a workspace (workspaces mode).
+     */
+    _makeWorkspaceCard(ws, wins, wsIndex) {
+        const card = new St.BoxLayout({
+            vertical: true, reactive: true,
+            x_align: Clutter.ActorAlign.CENTER,
+            style: 'padding: 10px 16px;',
+        });
+
+        // Show first visible window as thumbnail
+        const thumb = this._makeThumb(wins);
+        card.add_child(thumb);
+
+        // Workspace label
+        const label = new St.Label({
+            text: `Workspace ${wsIndex + 1}`,
+            x_align: Clutter.ActorAlign.CENTER,
+            style: 'margin-top: 8px; color: rgba(255,255,255,0.7); font-size: 11px;',
+        });
+        card.add_child(label);
+
+        // Window count
+        if (wins.length > 1) {
+            const count = new St.Label({
+                text: `${wins.length} windows`,
+                x_align: Clutter.ActorAlign.CENTER,
+                style: 'color: rgba(255,255,255,0.4); font-size: 10px;',
+            });
+            card.add_child(count);
+        }
+
+        this._applyPerspective(card, thumb);
+        this._wireCardHover(card, thumb, wins);
+
+        card.connect('button-release-event', () => {
+            this._destroyPreview();
+            ws.activate(global.get_current_time());
+            if (this._settings.get_boolean('sidebar-auto-hide'))
+                this._scheduleHide();
+            this._scheduleRefresh();
+            return Clutter.EVENT_STOP;
+        });
+
+        return card;
+    }
+
+    /**
+     * Create a thumbnail widget from a window list.
+     */
+    _makeThumb(windows) {
         const thumb = new St.Widget({
             reactive: true,
-            style: 'border-radius: 16px;',
+            style: 'border-radius: 14px; background-color: rgba(30,30,34,0.6);',
         });
 
-        // Try to create live clone from first visible (non-minimized) window
         let hasClone = false;
         const visibleWin = windows.find(w => !w.minimized && w.get_compositor_private());
         if (visibleWin) {
@@ -472,45 +575,70 @@ class StageSidebar {
             }
         }
 
-        // Fallback: show app icon centered in a fixed-size box
-        if (!hasClone && app) {
-            const iconFallback = app.create_icon_texture(64);
-            iconFallback.set_position((THUMB_W - 64) / 2, (THUMB_H - 64) / 2);
-            thumb.add_child(iconFallback);
-            // Need explicit size when no clone drives it
+        if (!hasClone) {
+            // Try to get app icon for fallback
+            const tracker = Shell.WindowTracker.get_default();
+            const win = windows[0];
+            const app = win ? tracker.get_window_app(win) : null;
+            if (app) {
+                const icon = app.create_icon_texture(64);
+                icon.set_position((THUMB_W - 64) / 2, (THUMB_H - 64) / 2);
+                thumb.add_child(icon);
+            }
             thumb.set_size(THUMB_W, THUMB_H);
         }
 
-        card.add_child(thumb);
+        return thumb;
+    }
 
-        // App icon below thumbnail
-        if (app) {
-            const iconBox = new St.BoxLayout({
-                x_align: Clutter.ActorAlign.CENTER,
-                style: 'margin-top: 12px;',
-            });
-            iconBox.add_child(app.create_icon_texture(ICON_SIZE));
-            card.add_child(iconBox);
-        }
+    /**
+     * Apply perspective transform to a card.
+     */
+    _applyPerspective(card, _thumb) {
+        card.set_pivot_point(0.0, 0.5);
+        card.rotation_angle_y = PERSPECTIVE_ANGLE;
+        // Slight transparency when in perspective
+        card.set_opacity(210);
+    }
 
-        // ── Hover ──
+    /**
+     * Wire hover effects: flatten perspective, glow, show preview.
+     */
+    _wireCardHover(card, thumb, windows) {
         card.connect('enter-event', () => {
-            card.ease({ scale_x: 1.06, scale_y: 1.06, duration: 150, mode: Clutter.AnimationMode.EASE_OUT_QUAD });
-            // Show focus ring
-            thumb.set_style('border-radius: 16px; box-shadow: 0 0 0 3px rgba(255,255,255,0.5);');
+            this._hovered = true;
+            this._kill('_hideTimer');
+            // Flatten + brighten
+            card.ease({
+                rotation_angle_y: 0,
+                opacity: 255,
+                scale_x: 1.04, scale_y: 1.04,
+                duration: 200,
+                mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+            });
+            // Soft glow instead of hard border
+            thumb.set_style('border-radius: 14px; background-color: rgba(50,50,58,0.8); box-shadow: 0 4px 20px rgba(120,130,255,0.2);');
+            // Show preview
+            this._kill('_hoverTimer');
+            this._hoverTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 250, () => {
+                this._hoverTimer = null;
+                this._showPreview(card, windows);
+                return GLib.SOURCE_REMOVE;
+            });
         });
         card.connect('leave-event', () => {
-            card.ease({ scale_x: 1.0, scale_y: 1.0, duration: 150, mode: Clutter.AnimationMode.EASE_OUT_QUAD });
-            thumb.set_style('border-radius: 16px;');
+            // Restore perspective + dim
+            card.ease({
+                rotation_angle_y: PERSPECTIVE_ANGLE,
+                opacity: 210,
+                scale_x: 1.0, scale_y: 1.0,
+                duration: 200,
+                mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+            });
+            thumb.set_style('border-radius: 14px; background-color: rgba(30,30,34,0.6);');
+            this._kill('_hoverTimer');
+            this._destroyPreview();
         });
-
-        // ── Click ──
-        card.connect('button-release-event', () => {
-            this._activate(group);
-            return Clutter.EVENT_STOP;
-        });
-
-        return card;
     }
 
     // ── Preview ──

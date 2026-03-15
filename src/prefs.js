@@ -49,6 +49,26 @@ export default class StageManagerPreferences extends ExtensionPreferences {
         settings.bind('enable-stage-sidebar', sideSwitch, 'active', Gio.SettingsBindFlags.DEFAULT);
         sideGroup.add(sideSwitch);
 
+        // Sidebar mode
+        const modeRow = new Adw.ActionRow({
+            title: 'Sidebar Content',
+            subtitle: 'What to show in the sidebar cards',
+        });
+        const modeDropdown = new Gtk.DropDown({
+            model: Gtk.StringList.new(['Apps (current workspace)', 'Workspaces']),
+            valign: Gtk.Align.CENTER,
+        });
+        // Sync setting → dropdown
+        const modeVal = settings.get_string('sidebar-mode');
+        modeDropdown.set_selected(modeVal === 'workspaces' ? 1 : 0);
+        // Sync dropdown → setting
+        modeDropdown.connect('notify::selected', () => {
+            const sel = modeDropdown.get_selected();
+            settings.set_string('sidebar-mode', sel === 1 ? 'workspaces' : 'apps');
+        });
+        modeRow.add_suffix(modeDropdown);
+        sideGroup.add(modeRow);
+
         const autoHideSwitch = new Adw.SwitchRow({
             title: 'Auto-hide Sidebar',
             subtitle: 'Off = always visible (macOS default). On = hover to reveal.',
