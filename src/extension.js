@@ -3,10 +3,20 @@
  *
  * macOS Stage Manager-like window management for GNOME.
  *
- * Core concept: each GNOME workspace is a "stage". The active stage's windows
- * are visible and centered. Inactive stages appear as stacked thumbnail cards
- * in a left-side strip. Switching stages animates windows in/out with
- * smooth macOS-like transitions.
+ * Behavior (matching macOS Stage Manager):
+ * - PER-WORKSPACE: sidebar shows inactive apps on the CURRENT workspace
+ * - The focused/active app stays centered on screen
+ * - Other recently used apps appear as thumbnail stacks on the LEFT side
+ * - Clicking a thumbnail brings that app to focus
+ * - Apps are grouped by application
+ * - Thumbnails are live Clutter clones with rounded corners
+ *
+ * Visual design (matching reference: magoness/Stage-Manager-Gnome):
+ * - All card styling done via inline styles (not CSS classes) for reliability
+ * - Transparent panel, floating rounded cards with shadows
+ * - 220ms EASE_OUT_QUAD slide animations
+ * - Hover: scale 1.08 up, dim other cards
+ * - App icons overlapping bottom of thumbnail
  *
  * Compatible with GNOME 45+ (ESM modules), Wayland and X11.
  */
@@ -16,32 +26,50 @@ import St from 'gi://St';
 import Clutter from 'gi://Clutter';
 import GLib from 'gi://GLib';
 import Shell from 'gi://Shell';
-import Pango from 'gi://Pango';
 
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
 
 
-const MAX_STRIP_ENTRIES = 6;
-const STRIP_THUMBNAIL_MAX_HEIGHT = 130;
+// Layout constants (matching reference extension)
+const PANEL_WIDTH = 260;
+const THUMB_W = 200;
+const THUMB_H = 120;
+const ICON_SIZE = 30;
+const ICON_OVERLAP = 10;
+const MAX_GROUPS = 6;
+const MAX_STACKED = 3;
 const STACK_OFFSET_X = 4;
-const STACK_OFFSET_Y = 3;
-const MAX_STACKED_PREVIEWS = 3;
-const HOVER_PREVIEW_SCALE = 1.8;
-const HOVER_PREVIEW_DELAY = 350;
+const STACK_OFFSET_Y = 4;
+
+// Animation constants
+const SLIDE_DURATION = 220;
+const HIDE_DELAY = 350;
+const HOVER_SCALE = 1.08;
+const HOVER_DIM_OPACITY = 120;
+
+// Edge trigger
+const EDGE_WIDTH = 4;
+const EDGE_HEIGHT = 300;
 
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 function _isNormalWindow(win) {
-    return win &&
-        !win.skip_taskbar &&
-        !win.is_attached_dialog() &&
-        !win.is_always_on_all_workspaces() &&
-        !win.minimized;
+    if (!win)
+        return false;
+    if (win.get_window_type() !== Meta.WindowType.NORMAL)
+        return false;
+    if (win.skip_taskbar || win.is_attached_dialog())
+        return false;
+    if (win.is_always_on_all_workspaces())
+        return false;
+    return true;
 }
 
-function _getVisibleWindows(ws) {
+function _getWorkspaceWindows(ws) {
+    if (!ws)
+        return [];
     return ws.list_windows().filter(w =>
         _isNormalWindow(w) && w.get_compositor_private()
     );
@@ -49,98 +77,153 @@ function _getVisibleWindows(ws) {
 
 function _safeDisconnect(obj, id) {
     try {
-        if (obj && id)
-            obj.disconnect(id);
+        if (obj && id) obj.disconnect(id);
+    } catch (_e) { /* */ }
+}
+
+/**
+ * Check if a Clutter actor is still alive (not destroyed/disposed).
+ */
+function _isActorAlive(actor) {
+    try {
+        if (!actor)
+            return false;
+        // Accessing any property will throw if disposed
+        void actor.visible;
+        return true;
     } catch (_e) {
-        // Already disconnected or destroyed
+        return false;
     }
+}
+
+/**
+ * Safely destroy a Clutter.Clone — handles already-disposed source actors.
+ */
+function _safeDestroyClone(clone) {
+    if (!clone)
+        return;
+    try {
+        // First null the source to break the reference
+        // Check if clone is still alive before touching it
+        if (_isActorAlive(clone)) {
+            clone.set_source(null);
+            clone.destroy();
+        }
+    } catch (_e) {
+        // Already disposed — nothing to do
+    }
+}
+
+/**
+ * Group windows by application.
+ * Returns { activeGroup, inactiveGroups[] } sorted by most recently focused.
+ */
+function _groupByApp(windows, focusedWindow) {
+    const tracker = Shell.WindowTracker.get_default();
+    const appMap = new Map();
+
+    const sorted = [...windows].sort((a, b) =>
+        (b.get_user_time() || 0) - (a.get_user_time() || 0)
+    );
+
+    for (const win of sorted) {
+        const app = tracker.get_window_app(win);
+        if (!app) continue;
+        const id = app.get_id();
+        if (!appMap.has(id))
+            appMap.set(id, { app, windows: [] });
+        appMap.get(id).windows.push(win);
+    }
+
+    let activeAppId = null;
+    if (focusedWindow) {
+        const fa = tracker.get_window_app(focusedWindow);
+        if (fa) activeAppId = fa.get_id();
+    }
+
+    const inactiveGroups = [];
+    for (const [appId, group] of appMap) {
+        if (appId !== activeAppId)
+            inactiveGroups.push(group);
+    }
+
+    return { activeGroup: activeAppId ? appMap.get(activeAppId) : null, inactiveGroups };
 }
 
 
 // ─── MaximizeToWorkspace ────────────────────────────────────────────────────
 
-/**
- * Moves maximized windows to dedicated workspaces.
- * Each maximized window becomes its own "stage".
- *
- * When unmaximized, the window STAYS on its current workspace (macOS behavior).
- */
 class MaximizeToWorkspace {
     constructor(settings) {
         this._settings = settings;
         this._signals = [];
-        this._pendingTimeouts = [];
+        this._timeouts = [];
         this._movedWindows = new Set();
     }
 
     enable() {
-        this._connectSignal(global.window_manager, 'size-change',
-            this._onSizeChange.bind(this));
-        this._connectSignal(global.window_manager, 'destroy',
-            this._onWindowDestroyed.bind(this));
+        this._connect(global.window_manager, 'size-change', this._onSizeChange.bind(this));
+        this._connect(global.window_manager, 'destroy', this._onDestroy.bind(this));
     }
 
     disable() {
-        this._signals.splice(0).forEach(({ obj, id }) => _safeDisconnect(obj, id));
-        this._pendingTimeouts.splice(0).forEach(id => GLib.source_remove(id));
+        this._signals.splice(0).forEach(s => _safeDisconnect(s.obj, s.id));
+        this._timeouts.splice(0).forEach(id => GLib.source_remove(id));
         this._movedWindows.clear();
     }
 
-    _connectSignal(obj, signal, callback) {
-        const id = obj.connect(signal, callback);
-        this._signals.push({ obj, id });
+    _connect(obj, sig, cb) {
+        this._signals.push({ obj, id: obj.connect(sig, cb) });
     }
 
-    _addTimeout(delayMs, callback) {
-        const id = GLib.timeout_add(GLib.PRIORITY_DEFAULT, delayMs, () => {
-            const idx = this._pendingTimeouts.indexOf(id);
-            if (idx !== -1)
-                this._pendingTimeouts.splice(idx, 1);
-            callback();
+    _later(ms, fn) {
+        const id = GLib.timeout_add(GLib.PRIORITY_DEFAULT, ms, () => {
+            this._timeouts.splice(this._timeouts.indexOf(id), 1);
+            fn();
             return GLib.SOURCE_REMOVE;
         });
-        this._pendingTimeouts.push(id);
+        this._timeouts.push(id);
     }
 
-    _onSizeChange(_manager, actor, change, _oldRect) {
+    _onSizeChange(_wm, actor, change) {
         if (!this._settings.get_boolean('enable-maximize-to-workspace'))
             return;
-
         const win = actor.meta_window;
-        if (!win || win.skip_taskbar || win.is_attached_dialog())
+        if (!win || !_isNormalWindow(win))
             return;
-
         if (change === Meta.SizeChange.MAXIMIZE)
             this._handleMaximize(win);
-        // No unmaximize handler — window stays on its workspace (user request)
     }
 
     _handleMaximize(win) {
         if (this._movedWindows.has(win))
             return;
 
-        const wsManager = global.workspace_manager;
-        const currentIndex = wsManager.get_active_workspace_index();
+        const wsm = global.workspace_manager;
+        const ci = wsm.get_active_workspace_index();
+        const cws = wsm.get_workspace_by_index(ci);
+        const siblings = _getWorkspaceWindows(cws).filter(w => w !== win);
+        if (siblings.length === 0) return;
 
-        // Check if this window is already alone on its workspace
-        const currentWs = wsManager.get_workspace_by_index(currentIndex);
-        const siblings = _getVisibleWindows(currentWs).filter(w => w !== win);
-        if (siblings.length === 0)
-            return; // Already alone, no need to move
-
-        let targetIndex = this._findEmptyWorkspace(win);
-        if (targetIndex === -1) {
-            wsManager.append_new_workspace(false, global.get_current_time());
-            targetIndex = wsManager.get_n_workspaces() - 1;
+        let ti = -1;
+        for (let i = 0; i < wsm.get_n_workspaces(); i++) {
+            if (i === ci) continue;
+            const ws = wsm.get_workspace_by_index(i);
+            if (ws.list_windows().filter(w => w !== win && _isNormalWindow(w)).length === 0) {
+                ti = i;
+                break;
+            }
         }
-
-        if (targetIndex === currentIndex)
-            return;
+        if (ti === -1) {
+            wsm.append_new_workspace(false, global.get_current_time());
+            ti = wsm.get_n_workspaces() - 1;
+        }
+        if (ti === ci) return;
 
         this._movedWindows.add(win);
-        win.change_workspace_by_index(targetIndex, false);
-        this._addTimeout(50, () => {
-            const ws = wsManager.get_workspace_by_index(targetIndex);
+        win.change_workspace_by_index(ti, false);
+        this._later(50, () => {
+            const ws = wsm.get_workspace_by_index(ti);
             if (ws) {
                 ws.activate(global.get_current_time());
                 win.activate(global.get_current_time());
@@ -148,88 +231,57 @@ class MaximizeToWorkspace {
         });
     }
 
-    _findEmptyWorkspace(excludeWin) {
-        const wsManager = global.workspace_manager;
-        const n = wsManager.get_n_workspaces();
-        const currentIndex = wsManager.get_active_workspace_index();
-
-        for (let i = 0; i < n; i++) {
-            if (i === currentIndex)
-                continue;
-            const ws = wsManager.get_workspace_by_index(i);
-            const windows = ws.list_windows().filter(w =>
-                w !== excludeWin && _isNormalWindow(w)
-            );
-            if (windows.length === 0)
-                return i;
-        }
-        return -1;
-    }
-
-    _onWindowDestroyed(_manager, actor) {
+    _onDestroy(_wm, actor) {
         try {
             const win = actor.meta_window;
-            if (win)
-                this._movedWindows.delete(win);
-        } catch (_e) {
-            // Already destroyed
-        }
+            if (win) this._movedWindows.delete(win);
+        } catch (_e) { /* */ }
     }
 }
 
 
-// ─── StageStrip ─────────────────────────────────────────────────────────────
+// ─── StageSidebar ───────────────────────────────────────────────────────────
 
 /**
- * The left-side strip showing inactive stage thumbnails.
- *
- * Visual design modeled after macOS Stage Manager:
- * - Stacked, overlapping live thumbnails per workspace
- * - Hover shows enlarged preview
- * - Click switches workspace with smooth animation
- * - Auto-hides when not in use
+ * macOS Stage Manager sidebar using inline styles (matching reference).
  */
-class StageStrip {
+class StageSidebar {
     constructor(settings) {
         this._settings = settings;
         this._signals = [];
+        this._settingsSignals = [];
         this._clones = [];
+        this._cardContainers = []; // For hover dim effects
         this._panel = null;
         this._edgeZone = null;
-        this._container = null;
+        this._contentBox = null;
         this._scrollView = null;
+        this._hoverPreview = null;
+        this._hoverTimeout = null;
         this._refreshTimeout = null;
         this._hideTimeout = null;
-        this._hoverPreview = null;
-        this._hoverPreviewTimeout = null;
         this._visible = false;
         this._hovered = false;
-        this._settingsSignals = [];
-        this._mruWorkspaces = [];
-        this._lastActiveWsIndex = -1;
-        this._isAnimating = false;
+        this._animating = false;
     }
 
     enable() {
         this._buildUI();
         this._connectSignals();
-        this._lastActiveWsIndex = global.workspace_manager.get_active_workspace_index();
-        this._updateSidebarVisibility();
-        this._refreshStrip();
+        this._refresh();
     }
 
     disable() {
-        this._clearTimeout('_refreshTimeout');
-        this._clearTimeout('_hideTimeout');
-        this._clearTimeout('_hoverPreviewTimeout');
-        this._signals.splice(0).forEach(({ obj, id }) => _safeDisconnect(obj, id));
+        this._clearTimer('_refreshTimeout');
+        this._clearTimer('_hideTimeout');
+        this._clearTimer('_hoverTimeout');
+        this._signals.splice(0).forEach(s => _safeDisconnect(s.obj, s.id));
         this._settingsSignals.splice(0).forEach(id => {
             try { this._settings.disconnect(id); } catch (_e) { /* */ }
         });
-
-        this._destroyHoverPreview();
+        this._destroyPreview();
         this._destroyClones();
-
+        this._cardContainers = [];
         if (this._panel) {
             Main.layoutManager.removeChrome(this._panel);
             this._panel.destroy();
@@ -243,38 +295,38 @@ class StageStrip {
     }
 
     _buildUI() {
-        const monitor = Main.layoutManager.primaryMonitor;
-        const sidebarWidth = this._settings.get_int('sidebar-width');
-        const panelHeight = Main.panel ? Main.panel.height : 0;
+        const mon = Main.layoutManager.primaryMonitor;
+        const panelH = Main.panel ? Main.panel.height : 0;
 
-        // Edge trigger zone — invisible hot strip at the left edge
-        const edgeWidth = this._settings.get_int('edge-trigger-width');
+        // Edge trigger — thin invisible zone at left edge, vertically centered
         this._edgeZone = new St.Widget({
             reactive: true,
             track_hover: true,
-            style_class: 'stage-manager-edge-zone',
+            style: 'background-color: rgba(255,255,255,0.01);',
         });
-        this._edgeZone.set_size(edgeWidth, monitor.height - panelHeight);
-        this._edgeZone.set_position(monitor.x, monitor.y + panelHeight);
-        // Do NOT use trackFullscreen — we handle it ourselves to avoid flicker
+        this._edgeZone.set_size(EDGE_WIDTH, EDGE_HEIGHT);
+        this._edgeZone.set_position(
+            mon.x,
+            mon.y + panelH + (mon.height - panelH - EDGE_HEIGHT) / 2
+        );
         Main.layoutManager.addChrome(this._edgeZone, {
             affectsInputRegion: true,
             trackFullscreen: false,
         });
         this._edgeZone.connect('enter-event', () => {
             if (!this._isFullscreen())
-                this._showPanel();
+                this._show();
         });
 
-        // Main panel — starts hidden off-screen to the left
+        // Main panel — transparent background, full height
         this._panel = new St.Widget({
             reactive: true,
             track_hover: true,
-            style_class: 'stage-manager-panel',
-            clip_to_allocation: true,
+            style: 'background-color: transparent;',
         });
-        this._panel.set_size(sidebarWidth, monitor.height - panelHeight);
-        this._panel.set_position(monitor.x - sidebarWidth, monitor.y + panelHeight);
+        this._panel.set_size(PANEL_WIDTH, mon.height - panelH);
+        this._panel.set_position(mon.x - PANEL_WIDTH, mon.y + panelH);
+
         Main.layoutManager.addChrome(this._panel, {
             affectsInputRegion: true,
             trackFullscreen: false,
@@ -282,78 +334,74 @@ class StageStrip {
 
         this._panel.connect('enter-event', () => {
             this._hovered = true;
-            this._clearTimeout('_hideTimeout');
+            this._clearTimer('_hideTimeout');
         });
         this._panel.connect('leave-event', () => {
             this._hovered = false;
-            this._destroyHoverPreview();
-            if (this._settings.get_boolean('sidebar-auto-hide'))
-                this._scheduleHide();
+            this._destroyPreview();
+            this._scheduleHide();
         });
 
-        // Scroll view
+        // Scroll view inside panel
         this._scrollView = new St.ScrollView({
-            style_class: 'stage-manager-scroll',
+            style: 'padding: 0; margin: 0;',
             hscrollbar_policy: St.PolicyType.NEVER,
             vscrollbar_policy: St.PolicyType.AUTOMATIC,
             overlay_scrollbars: true,
+            clip_to_allocation: true,
         });
-        this._scrollView.set_size(sidebarWidth - 16, monitor.height - panelHeight - 24);
+        this._scrollView.set_size(PANEL_WIDTH, mon.height - panelH);
         this._panel.add_child(this._scrollView);
 
-        // Vertical container for stage entries
-        this._container = new St.BoxLayout({
+        // Vertical content box
+        this._contentBox = new St.BoxLayout({
             vertical: true,
-            style_class: 'stage-manager-container',
+            style: 'padding: 60px 0px; spacing: 16px;',
+            x_align: Clutter.ActorAlign.CENTER,
         });
         if (this._scrollView.set_child)
-            this._scrollView.set_child(this._container);
+            this._scrollView.set_child(this._contentBox);
         else
-            this._scrollView.add_child(this._container);
+            this._scrollView.add_child(this._contentBox);
+
+        // Custom scroll speed (matching reference: delta * 55)
+        this._scrollView.connect('scroll-event', (_actor, event) => {
+            const [, dy] = event.get_scroll_delta();
+            const adj = this._scrollView.get_vscroll_bar().get_adjustment();
+            adj.set_value(adj.get_value() + dy * 55);
+            return Clutter.EVENT_STOP;
+        });
     }
 
     _connectSignals() {
-        this._connectSignal(global.display, 'notify::focus-window',
-            () => this._scheduleRefresh());
-        this._connectSignal(global.window_manager, 'map',
-            () => this._scheduleRefresh());
-        this._connectSignal(global.window_manager, 'destroy',
-            () => this._scheduleRefresh());
-        this._connectSignal(global.window_manager, 'minimize',
-            () => this._scheduleRefresh());
-        this._connectSignal(global.window_manager, 'unminimize',
-            () => this._scheduleRefresh());
-        this._connectSignal(global.window_manager, 'size-change',
-            () => this._scheduleRefresh());
+        const connect = (obj, sig, cb) => {
+            this._signals.push({ obj, id: obj.connect(sig, cb) });
+        };
 
-        this._connectSignal(global.workspace_manager, 'active-workspace-changed',
-            () => this._onWorkspaceSwitched());
-        this._connectSignal(global.workspace_manager, 'workspace-added',
-            () => this._scheduleRefresh());
-        this._connectSignal(global.workspace_manager, 'workspace-removed',
-            () => this._scheduleRefresh());
+        connect(global.display, 'notify::focus-window', () => this._scheduleRefresh());
+        connect(global.window_manager, 'map', () => this._scheduleRefresh());
+        connect(global.window_manager, 'destroy', () => this._scheduleRefresh());
+        connect(global.window_manager, 'minimize', () => this._scheduleRefresh());
+        connect(global.window_manager, 'unminimize', () => this._scheduleRefresh());
+        connect(global.window_manager, 'size-change', () => this._scheduleRefresh());
+        connect(global.workspace_manager, 'active-workspace-changed', () => this._scheduleRefresh());
+        connect(global.display, 'in-fullscreen-changed', () => this._onFullscreenChanged());
 
-        // Fullscreen changes
-        this._connectSignal(global.display, 'in-fullscreen-changed',
-            () => this._onFullscreenChanged());
-
-        // Settings changes
-        const sid1 = this._settings.connect('changed::enable-stage-sidebar',
-            () => this._updateSidebarVisibility());
-        this._settingsSignals.push(sid1);
+        this._settingsSignals.push(
+            this._settings.connect('changed::enable-stage-sidebar', () => {
+                if (!this._settings.get_boolean('enable-stage-sidebar'))
+                    this._hide();
+            })
+        );
     }
 
-    _connectSignal(obj, signal, callback) {
-        const id = obj.connect(signal, callback);
-        this._signals.push({ obj, id });
-    }
-
-    // --- Fullscreen handling (no flickering) ---
+    // ── Fullscreen ──
 
     _isFullscreen() {
         try {
-            const monitor = Main.layoutManager.primaryMonitor;
-            return global.display.get_monitor_in_fullscreen(monitor.index);
+            return global.display.get_monitor_in_fullscreen(
+                Main.layoutManager.primaryMonitor.index
+            );
         } catch (_e) {
             return false;
         }
@@ -361,619 +409,497 @@ class StageStrip {
 
     _onFullscreenChanged() {
         if (this._isFullscreen()) {
-            // Instantly hide — no animation to prevent flicker
+            // Instant hide — no animation prevents flicker
             if (this._visible) {
                 this._visible = false;
-                const sidebarWidth = this._settings.get_int('sidebar-width');
-                const monitor = Main.layoutManager.primaryMonitor;
-                this._panel.set_position(monitor.x - sidebarWidth, this._panel.y);
+                this._panel.set_position(
+                    Main.layoutManager.primaryMonitor.x - PANEL_WIDTH,
+                    this._panel.y
+                );
             }
-            if (this._edgeZone)
-                this._edgeZone.hide();
+            this._edgeZone?.hide();
+            this._destroyPreview();
         } else {
-            // Restore edge zone after leaving fullscreen
-            if (this._edgeZone && this._settings.get_boolean('enable-stage-sidebar'))
-                this._edgeZone.show();
+            if (this._settings.get_boolean('enable-stage-sidebar'))
+                this._edgeZone?.show();
         }
     }
 
-    // --- MRU tracking ---
+    // ── Show / Hide ──
 
-    _onWorkspaceSwitched() {
-        const newIndex = global.workspace_manager.get_active_workspace_index();
-        if (this._lastActiveWsIndex >= 0 && this._lastActiveWsIndex !== newIndex) {
-            this._mruWorkspaces = this._mruWorkspaces.filter(i => i !== this._lastActiveWsIndex);
-            this._mruWorkspaces.unshift(this._lastActiveWsIndex);
-        }
-        this._lastActiveWsIndex = newIndex;
-        this._mruWorkspaces = this._mruWorkspaces.filter(i => i !== newIndex);
-        this._scheduleRefresh();
-    }
-
-    // --- Visibility ---
-
-    _updateSidebarVisibility() {
-        const enabled = this._settings.get_boolean('enable-stage-sidebar');
-        if (this._edgeZone) {
-            if (enabled && !this._isFullscreen())
-                this._edgeZone.show();
-            else
-                this._edgeZone.hide();
-        }
-        if (!enabled && this._visible)
-            this._hidePanel();
-    }
-
-    _showPanel() {
-        if (this._visible || this._isAnimating)
-            return;
-        if (!this._settings.get_boolean('enable-stage-sidebar'))
-            return;
-        if (this._isFullscreen())
-            return;
+    _show() {
+        if (this._visible || this._animating) return;
+        if (!this._settings.get_boolean('enable-stage-sidebar')) return;
+        if (this._isFullscreen()) return;
 
         this._visible = true;
-        this._isAnimating = true;
-        this._clearTimeout('_hideTimeout');
-        this._refreshStrip();
-
-        const monitor = Main.layoutManager.primaryMonitor;
-        const duration = this._settings.get_int('animation-duration');
+        this._animating = true;
+        this._clearTimer('_hideTimeout');
+        this._refresh();
 
         this._panel.ease({
-            x: monitor.x,
-            duration: duration,
-            mode: Clutter.AnimationMode.EASE_OUT_CUBIC,
-            onComplete: () => {
-                this._isAnimating = false;
-            },
+            x: Main.layoutManager.primaryMonitor.x,
+            duration: SLIDE_DURATION,
+            mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+            onComplete: () => { this._animating = false; },
         });
     }
 
-    _hidePanel() {
-        if (!this._visible || this._isAnimating)
-            return;
+    _hide() {
+        if (!this._visible || this._animating) return;
 
         this._visible = false;
-        this._isAnimating = true;
-        this._destroyHoverPreview();
-        const sidebarWidth = this._settings.get_int('sidebar-width');
-        const monitor = Main.layoutManager.primaryMonitor;
-        const duration = this._settings.get_int('animation-duration');
+        this._animating = true;
+        this._destroyPreview();
 
         this._panel.ease({
-            x: monitor.x - sidebarWidth,
-            duration: duration,
-            mode: Clutter.AnimationMode.EASE_IN_CUBIC,
-            onComplete: () => {
-                this._isAnimating = false;
-            },
+            x: Main.layoutManager.primaryMonitor.x - PANEL_WIDTH,
+            duration: SLIDE_DURATION,
+            mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+            onComplete: () => { this._animating = false; },
         });
     }
 
     _scheduleHide() {
-        this._clearTimeout('_hideTimeout');
-        const delay = this._settings.get_int('auto-hide-delay');
-        this._hideTimeout = GLib.timeout_add(GLib.PRIORITY_DEFAULT, delay, () => {
+        this._clearTimer('_hideTimeout');
+        this._hideTimeout = GLib.timeout_add(GLib.PRIORITY_DEFAULT, HIDE_DELAY, () => {
             this._hideTimeout = null;
-            if (!this._hovered && !this._isFullscreen())
-                this._hidePanel();
+            if (!this._hovered) this._hide();
             return GLib.SOURCE_REMOVE;
         });
     }
 
     _scheduleRefresh() {
-        if (this._refreshTimeout)
-            return;
+        if (this._refreshTimeout) return;
         this._refreshTimeout = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 100, () => {
             this._refreshTimeout = null;
-            if (this._visible)
-                this._refreshStrip();
+            if (this._visible) this._refresh();
             return GLib.SOURCE_REMOVE;
         });
     }
 
-    // --- Strip rendering ---
+    // ── Render ──
 
-    _refreshStrip() {
-        if (!this._settings.get_boolean('enable-stage-sidebar'))
-            return;
+    _refresh() {
+        if (!this._settings.get_boolean('enable-stage-sidebar')) return;
 
         this._destroyClones();
-        this._container.destroy_all_children();
+        this._cardContainers = [];
+        this._contentBox.destroy_all_children();
 
-        const activeWsIndex = global.workspace_manager.get_active_workspace_index();
-        const sidebarWidth = this._settings.get_int('sidebar-width');
-        const showIcons = this._settings.get_boolean('show-app-icons');
+        const activeWs = global.workspace_manager.get_active_workspace();
+        const allWindows = _getWorkspaceWindows(activeWs);
+        const focusedWin = global.display.get_focus_window();
 
-        const stages = this._getOrderedStages(activeWsIndex);
-        const visibleStages = stages.slice(0, MAX_STRIP_ENTRIES);
+        // Also include minimized windows
+        const minimized = activeWs.list_windows().filter(w =>
+            _isNormalWindow(w) && w.minimized && w.get_compositor_private()
+        );
+        const unique = [...new Set([...allWindows, ...minimized])];
 
-        if (visibleStages.length === 0) {
-            // Show empty state hint
-            const emptyLabel = new St.Label({
-                text: 'No other windows',
-                style_class: 'stage-manager-empty-label',
-                x_align: Clutter.ActorAlign.CENTER,
-                y_align: Clutter.ActorAlign.CENTER,
-            });
-            this._container.add_child(emptyLabel);
-            return;
-        }
+        const { inactiveGroups } = _groupByApp(unique, focusedWin);
+        const groups = inactiveGroups.slice(0, MAX_GROUPS);
 
-        for (const stage of visibleStages) {
-            const entry = this._createStageEntry(stage, sidebarWidth, showIcons);
-            if (entry)
-                this._container.add_child(entry);
-        }
-    }
+        if (groups.length === 0) return;
 
-    _getOrderedStages(activeWsIndex) {
-        const wsManager = global.workspace_manager;
-        const n = wsManager.get_n_workspaces();
-        const stageMap = new Map();
-
-        for (let i = 0; i < n; i++) {
-            if (i === activeWsIndex)
-                continue;
-
-            const ws = wsManager.get_workspace_by_index(i);
-            const windows = _getVisibleWindows(ws);
-
-            if (windows.length === 0)
-                continue;
-
-            stageMap.set(i, { wsIndex: i, windows });
-        }
-
-        const ordered = [];
-        for (const wsIdx of this._mruWorkspaces) {
-            if (stageMap.has(wsIdx)) {
-                ordered.push(stageMap.get(wsIdx));
-                stageMap.delete(wsIdx);
+        for (const group of groups) {
+            const container = this._createCard(group);
+            if (container) {
+                this._contentBox.add_child(container);
+                this._cardContainers.push(container);
             }
         }
-        for (const [_idx, stage] of stageMap)
-            ordered.push(stage);
-
-        return ordered;
     }
 
     /**
-     * Create a strip entry for one stage (workspace).
-     * Shows stacked/overlapping thumbnails like macOS Stage Manager.
+     * Create a single app card matching the reference design:
+     * - Rounded thumbnail (border-radius: 16px) with live clone
+     * - App icon centered below, overlapping the thumbnail slightly
+     * - Hover: scale 1.08, dim other cards
+     * - Click: activate that app group
      */
-    _createStageEntry(stage, sidebarWidth, showIcons) {
-        const { wsIndex, windows } = stage;
-        const tracker = Shell.WindowTracker.get_default();
-        const thumbWidth = sidebarWidth - 36;
+    _createCard(group) {
+        const { app, windows } = group;
 
-        // Item container
-        const item = new St.BoxLayout({
+        // Outer container — holds thumbnail + icon, transparent
+        const container = new St.BoxLayout({
             vertical: true,
             reactive: true,
             track_hover: true,
             can_focus: true,
-            style_class: 'stage-manager-item',
+            style: 'padding: 0px;',
+            x_align: Clutter.ActorAlign.CENTER,
         });
 
-        // Stacked thumbnail area
-        const stackHeight = STRIP_THUMBNAIL_MAX_HEIGHT;
-        const stackWidth = thumbWidth;
-        const stackContainer = new St.Widget({
-            style_class: 'stage-manager-thumbnail-stack',
+        // Thumbnail wrapper — rounded corners, clipping, shadow
+        const thumbWrapper = new St.Widget({
+            style: `
+                border-radius: 16px;
+                background-color: rgba(30, 30, 30, 0.6);
+            `,
             clip_to_allocation: true,
         });
-        stackContainer.set_size(stackWidth, stackHeight);
 
-        const previewWindows = windows.slice(0, MAX_STACKED_PREVIEWS);
+        const previewWins = windows.slice(0, MAX_STACKED);
 
-        // Render back-to-front (oldest first) so newest is on top
-        for (let i = previewWindows.length - 1; i >= 0; i--) {
-            const win = previewWindows[i];
-            const actor = win.get_compositor_private();
-            if (!actor)
-                continue;
-
-            const rect = win.get_frame_rect();
-            if (rect.width === 0 || rect.height === 0)
-                continue;
-
-            const scaleX = (stackWidth - (MAX_STACKED_PREVIEWS - 1) * STACK_OFFSET_X * 2) / rect.width;
-            const scaleY = (stackHeight - (MAX_STACKED_PREVIEWS - 1) * STACK_OFFSET_Y) / rect.height;
-            const scale = Math.min(scaleX, scaleY, 1.0);
-            const cloneW = rect.width * scale;
-            const cloneH = rect.height * scale;
-
-            let clone;
-            try {
-                clone = new Clutter.Clone({
-                    source: actor,
-                    width: cloneW,
-                    height: cloneH,
-                });
-            } catch (_e) {
-                continue;
+        if (previewWins.length === 1) {
+            // Single window — simple centered clone
+            thumbWrapper.set_size(THUMB_W, THUMB_H);
+            const clone = this._createClone(previewWins[0], THUMB_W, THUMB_H);
+            if (clone) {
+                thumbWrapper.add_child(clone);
             }
+        } else {
+            // Multiple windows — stacked with offset
+            const stackH = THUMB_H + (previewWins.length - 1) * STACK_OFFSET_Y;
+            thumbWrapper.set_size(THUMB_W, stackH);
 
-            // Center horizontally, offset each card slightly
-            const offsetX = i * STACK_OFFSET_X + (stackWidth - cloneW) / 2 - ((previewWindows.length - 1) * STACK_OFFSET_X) / 2;
-            const offsetY = i * STACK_OFFSET_Y;
-            clone.set_position(Math.max(0, offsetX), offsetY);
+            for (let i = previewWins.length - 1; i >= 0; i--) {
+                const innerW = THUMB_W - (MAX_STACKED - 1) * STACK_OFFSET_X * 2;
+                const clone = this._createClone(previewWins[i], innerW, THUMB_H);
+                if (!clone) continue;
 
-            // Slight opacity reduction for background cards
-            if (i > 0)
-                clone.set_opacity(200 - i * 30);
+                const ox = i * STACK_OFFSET_X + (THUMB_W - innerW) / 2 -
+                    ((previewWins.length - 1) * STACK_OFFSET_X) / 2;
+                const oy = i * STACK_OFFSET_Y;
+                clone.set_position(Math.max(0, ox), oy);
 
-            stackContainer.add_child(clone);
-            this._clones.push(clone);
+                if (i > 0)
+                    clone.set_opacity(200 - i * 30);
+
+                thumbWrapper.add_child(clone);
+            }
         }
 
-        item.add_child(stackContainer);
+        container.add_child(thumbWrapper);
 
-        // App icons row below thumbnails
-        if (showIcons) {
-            const iconRow = new St.BoxLayout({
-                style_class: 'stage-manager-icon-row',
+        // Dim overlay — for hover dimming of non-hovered cards
+        const dimOverlay = new St.Widget({
+            style: 'background-color: rgba(0,0,0,0.45); border-radius: 16px;',
+        });
+        dimOverlay.set_size(THUMB_W, thumbWrapper.height);
+        dimOverlay.set_position(0, 0);
+        dimOverlay.set_opacity(0);
+        thumbWrapper.add_child(dimOverlay);
+        container._dimOverlay = dimOverlay;
+
+        // App icon below thumbnail (centered, slightly overlapping)
+        if (app) {
+            const iconBox = new St.BoxLayout({
                 x_align: Clutter.ActorAlign.CENTER,
+                style: `margin-top: -${ICON_OVERLAP}px; padding: 0;`,
             });
 
-            const seenApps = new Set();
-            let labelText = '';
+            const iconBin = new St.Bin({
+                style: `
+                    background-color: rgba(40, 40, 42, 0.9);
+                    border-radius: ${ICON_SIZE / 2 + 4}px;
+                    padding: 4px;
+                    border: 1px solid rgba(255,255,255,0.1);
+                `,
+            });
+            const icon = app.create_icon_texture(ICON_SIZE);
+            iconBin.set_child(icon);
+            iconBox.add_child(iconBin);
+            container.add_child(iconBox);
+        }
 
-            for (const win of windows) {
-                const app = tracker.get_window_app(win);
-                if (!app)
-                    continue;
-                const appId = app.get_id();
+        // ── Hover effects (matching reference) ──
 
-                if (!seenApps.has(appId)) {
-                    seenApps.add(appId);
-                    if (seenApps.size <= 3) {
-                        const icon = app.create_icon_texture(18);
-                        iconRow.add_child(icon);
-                    }
-                    if (!labelText)
-                        labelText = app.get_name();
+        container.connect('enter-event', () => {
+            // Scale up hovered card
+            container.ease({
+                scale_x: HOVER_SCALE,
+                scale_y: HOVER_SCALE,
+                duration: 180,
+                mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+            });
+            // Dim other cards
+            for (const c of this._cardContainers) {
+                if (c === container) {
+                    c._dimOverlay?.ease({ opacity: 0, duration: 180, mode: Clutter.AnimationMode.EASE_OUT_QUAD });
+                } else {
+                    c.ease({
+                        scale_x: 0.95,
+                        scale_y: 0.95,
+                        duration: 180,
+                        mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+                    });
+                    c._dimOverlay?.ease({
+                        opacity: HOVER_DIM_OPACITY,
+                        duration: 180,
+                        mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+                    });
                 }
             }
 
-            if (labelText) {
-                if (windows.length > 1)
-                    labelText += ` +${windows.length - 1}`;
-
-                const label = new St.Label({
-                    text: labelText,
-                    style_class: 'stage-manager-app-label',
-                    x_expand: true,
-                });
-                label.clutter_text.set_ellipsize(Pango.EllipsizeMode.END);
-                label.set_style(`max-width: ${thumbWidth - 64}px;`);
-                iconRow.add_child(label);
-            }
-
-            item.add_child(iconRow);
-        }
-
-        // --- Hover preview ---
-        item.connect('enter-event', () => {
-            this._clearTimeout('_hoverPreviewTimeout');
-            this._hoverPreviewTimeout = GLib.timeout_add(GLib.PRIORITY_DEFAULT, HOVER_PREVIEW_DELAY, () => {
-                this._hoverPreviewTimeout = null;
-                this._showHoverPreview(item, windows);
+            // Schedule hover preview
+            this._clearTimer('_hoverTimeout');
+            this._hoverTimeout = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 350, () => {
+                this._hoverTimeout = null;
+                this._showPreview(container, windows);
                 return GLib.SOURCE_REMOVE;
             });
-
-            // Subtle scale-up on hover (macOS-like)
-            item.ease({
-                scale_x: 1.04,
-                scale_y: 1.04,
-                duration: 150,
-                mode: Clutter.AnimationMode.EASE_OUT_QUAD,
-            });
         });
 
-        item.connect('leave-event', () => {
-            this._clearTimeout('_hoverPreviewTimeout');
-            this._destroyHoverPreview();
+        container.connect('leave-event', () => {
+            this._clearTimer('_hoverTimeout');
+            this._destroyPreview();
 
-            item.ease({
-                scale_x: 1.0,
-                scale_y: 1.0,
-                duration: 150,
-                mode: Clutter.AnimationMode.EASE_OUT_QUAD,
-            });
+            // Reset all cards
+            for (const c of this._cardContainers) {
+                c.ease({
+                    scale_x: 1.0,
+                    scale_y: 1.0,
+                    duration: 180,
+                    mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+                });
+                c._dimOverlay?.ease({ opacity: 0, duration: 180, mode: Clutter.AnimationMode.EASE_OUT_QUAD });
+            }
         });
 
-        // Click to switch to this stage
-        item.connect('button-release-event', (_actor, event) => {
+        // ── Click ──
+
+        container.connect('button-release-event', (_a, event) => {
             if (event.get_button() === 1) {
-                this._destroyHoverPreview();
-                this._switchToStage(wsIndex);
+                this._destroyPreview();
+                this._switchTo(group);
             }
             return Clutter.EVENT_STOP;
         });
 
-        item.connect('key-press-event', (_actor, event) => {
-            const symbol = event.get_key_symbol();
-            if (symbol === Clutter.KEY_Return || symbol === Clutter.KEY_space) {
-                this._destroyHoverPreview();
-                this._switchToStage(wsIndex);
+        container.connect('key-press-event', (_a, event) => {
+            const s = event.get_key_symbol();
+            if (s === Clutter.KEY_Return || s === Clutter.KEY_space) {
+                this._destroyPreview();
+                this._switchTo(group);
                 return Clutter.EVENT_STOP;
             }
             return Clutter.EVENT_PROPAGATE;
         });
 
-        // Entry animation — fade in with slight slide
-        item.set_opacity(0);
-        item.translation_y = 8;
-        item.ease({
-            opacity: 255,
-            translation_y: 0,
-            duration: 200,
-            mode: Clutter.AnimationMode.EASE_OUT_QUAD,
-        });
-
-        return item;
+        return container;
     }
 
-    // --- Hover Preview ---
-
-    _showHoverPreview(item, windows) {
-        this._destroyHoverPreview();
-
-        if (windows.length === 0)
-            return;
-
-        const win = windows[0]; // Show the top/most-recent window
+    /**
+     * Create a safely-managed Clutter.Clone for a window.
+     * Returns null if the actor is unavailable.
+     */
+    _createClone(win, width, height) {
         const actor = win.get_compositor_private();
-        if (!actor)
-            return;
+        if (!_isActorAlive(actor))
+            return null;
 
         const rect = win.get_frame_rect();
         if (rect.width === 0 || rect.height === 0)
-            return;
+            return null;
 
-        const monitor = Main.layoutManager.primaryMonitor;
-        const sidebarWidth = this._settings.get_int('sidebar-width');
-
-        // Calculate preview size — larger than the thumbnail
-        const maxPreviewW = Math.min(monitor.width * 0.35, 500);
-        const maxPreviewH = Math.min(monitor.height * 0.35, 400);
-        const scaleX = maxPreviewW / rect.width;
-        const scaleY = maxPreviewH / rect.height;
-        const scale = Math.min(scaleX, scaleY, 1.0);
-        const previewW = rect.width * scale;
-        const previewH = rect.height * scale;
+        const sx = width / rect.width;
+        const sy = height / rect.height;
+        const scale = Math.min(sx, sy, 1.0);
+        const cw = rect.width * scale;
+        const ch = rect.height * scale;
 
         let clone;
         try {
             clone = new Clutter.Clone({
                 source: actor,
-                width: previewW,
-                height: previewH,
+                width: cw,
+                height: ch,
             });
+        } catch (_e) {
+            return null;
+        }
+
+        // Center within the given area
+        clone.set_position(
+            Math.max(0, (width - cw) / 2),
+            Math.max(0, (height - ch) / 2)
+        );
+
+        this._clones.push(clone);
+
+        // Watch for source actor destruction — disconnect clone before it crashes
+        const destroyId = actor.connect('destroy', () => {
+            try {
+                if (_isActorAlive(clone)) {
+                    clone.set_source(null);
+                }
+            } catch (_e) { /* */ }
+        });
+
+        // Store so we can disconnect later
+        clone._sourceDestroyId = destroyId;
+        clone._sourceActor = actor;
+
+        return clone;
+    }
+
+    // ── Hover preview ──
+
+    _showPreview(card, windows) {
+        this._destroyPreview();
+        if (windows.length === 0) return;
+
+        const win = windows[0];
+        const actor = win.get_compositor_private();
+        if (!_isActorAlive(actor)) return;
+
+        const rect = win.get_frame_rect();
+        if (rect.width === 0 || rect.height === 0) return;
+
+        const mon = Main.layoutManager.primaryMonitor;
+        const maxW = Math.min(mon.width * 0.35, 520);
+        const maxH = Math.min(mon.height * 0.4, 400);
+        const s = Math.min(maxW / rect.width, maxH / rect.height, 1.0);
+        const pw = rect.width * s;
+        const ph = rect.height * s;
+
+        let clone;
+        try {
+            clone = new Clutter.Clone({ source: actor, width: pw, height: ph });
         } catch (_e) {
             return;
         }
 
-        // Position to the right of the sidebar, vertically aligned with the item
-        const panelHeight = Main.panel ? Main.panel.height : 0;
-        const [, itemY] = item.get_transformed_position();
-        const previewX = monitor.x + sidebarWidth + 12;
-        let previewY = itemY;
+        const panelH = Main.panel ? Main.panel.height : 0;
+        const [, cardY] = card.get_transformed_position();
+        const previewX = mon.x + PANEL_WIDTH + 12;
+        let previewY = cardY;
+        if (previewY + ph + 30 > mon.y + mon.height)
+            previewY = mon.y + mon.height - ph - 30;
+        if (previewY < mon.y + panelH + 8)
+            previewY = mon.y + panelH + 8;
 
-        // Keep within screen bounds
-        if (previewY + previewH + 20 > monitor.y + monitor.height)
-            previewY = monitor.y + monitor.height - previewH - 20;
-        if (previewY < monitor.y + panelHeight + 8)
-            previewY = monitor.y + panelHeight + 8;
-
-        // Container with shadow and rounded corners
         this._hoverPreview = new St.Widget({
-            style_class: 'stage-manager-hover-preview',
+            style: `
+                background-color: rgba(25, 25, 28, 0.92);
+                border-radius: 16px;
+                border: 1px solid rgba(255,255,255,0.08);
+                box-shadow: 0 10px 40px rgba(0,0,0,0.55);
+            `,
             reactive: false,
         });
-        this._hoverPreview.set_size(previewW + 16, previewH + 16);
+        this._hoverPreview.set_size(pw + 16, ph + 16);
         this._hoverPreview.set_position(previewX, previewY);
 
         clone.set_position(8, 8);
         this._hoverPreview.add_child(clone);
         this._clones.push(clone);
 
-        // App name label on the preview
-        const tracker = Shell.WindowTracker.get_default();
-        const app = tracker.get_window_app(win);
-        if (app) {
-            const nameLabel = new St.Label({
-                text: app.get_name(),
-                style_class: 'stage-manager-preview-label',
-            });
-            nameLabel.set_position(12, previewH + 16 - 28);
-            this._hoverPreview.add_child(nameLabel);
-            // Increase container height for the label
-            this._hoverPreview.set_height(previewH + 40);
-        }
+        // Watch for source destruction
+        const did = actor.connect('destroy', () => {
+            try {
+                if (_isActorAlive(clone))
+                    clone.set_source(null);
+            } catch (_e) { /* */ }
+        });
+        clone._sourceDestroyId = did;
+        clone._sourceActor = actor;
 
         Main.layoutManager.addChrome(this._hoverPreview, {
             affectsInputRegion: false,
             trackFullscreen: false,
         });
 
-        // Fade in
+        // Animate in
         this._hoverPreview.set_opacity(0);
         this._hoverPreview.set_scale(0.92, 0.92);
+        this._hoverPreview.set_pivot_point(0, 0.5);
         this._hoverPreview.ease({
             opacity: 255,
             scale_x: 1.0,
             scale_y: 1.0,
             duration: 180,
-            mode: Clutter.AnimationMode.EASE_OUT_CUBIC,
+            mode: Clutter.AnimationMode.EASE_OUT_QUAD,
         });
     }
 
-    _destroyHoverPreview() {
+    _destroyPreview() {
         if (this._hoverPreview) {
             try {
                 Main.layoutManager.removeChrome(this._hoverPreview);
                 this._hoverPreview.destroy();
-            } catch (_e) {
-                // Already destroyed
-            }
+            } catch (_e) { /* */ }
             this._hoverPreview = null;
         }
     }
 
-    // --- Stage switching with macOS-like animation ---
+    // ── Stage switching ──
 
-    /**
-     * Switch to a different stage (workspace).
-     *
-     * macOS animation:
-     * - Current windows scale down + slide left into the sidebar strip
-     * - New windows scale up + slide in from the left
-     * - Smooth cubic easing with slight overshoot feel
-     */
-    _switchToStage(targetWsIndex) {
-        const wsManager = global.workspace_manager;
-        const currentWsIndex = wsManager.get_active_workspace_index();
+    _switchTo(group) {
+        if (this._animating) return;
 
-        if (targetWsIndex === currentWsIndex || this._isAnimating)
-            return;
+        const { windows } = group;
+        if (windows.length === 0) return;
 
-        this._isAnimating = true;
-        const animDuration = this._settings.get_int('animation-duration');
-        const monitor = Main.layoutManager.primaryMonitor;
-        const sidebarWidth = this._settings.get_int('sidebar-width');
+        this._animating = true;
+        const mon = Main.layoutManager.primaryMonitor;
 
-        // --- Animate current workspace's windows OUT ---
-        const currentWs = wsManager.get_workspace_by_index(currentWsIndex);
-        if (currentWs) {
-            const currentWindows = _getVisibleWindows(currentWs);
+        // Activate windows with slide-in animation
+        for (let i = windows.length - 1; i >= 0; i--) {
+            const win = windows[i];
+            if (win.minimized) win.unminimize();
 
-            for (let i = 0; i < currentWindows.length; i++) {
-                const win = currentWindows[i];
-                const actor = win.get_compositor_private();
-                if (!actor)
-                    continue;
+            const actor = win.get_compositor_private();
+            if (!_isActorAlive(actor)) continue;
 
-                // Stagger: each window starts slightly later
-                const stagger = i * 30;
+            const targetX = actor.x;
 
-                // Store original position for reset
-                const origX = actor.x;
+            // Start from left / scaled down
+            try {
+                actor.set({
+                    x: mon.x - actor.width * 0.3,
+                    scale_x: 0.75,
+                    scale_y: 0.75,
+                    opacity: 60,
+                    pivot_point: new Clutter.Point({ x: 0.0, y: 0.5 }),
+                });
 
-                // Slide left + scale down (into the sidebar)
-                GLib.timeout_add(GLib.PRIORITY_DEFAULT, stagger, () => {
+                const delay = (windows.length - 1 - i) * 35;
+                GLib.timeout_add(GLib.PRIORITY_DEFAULT, delay, () => {
+                    if (!_isActorAlive(actor)) return GLib.SOURCE_REMOVE;
                     actor.ease({
-                        x: monitor.x - actor.width * 0.5,
-                        scale_x: 0.55,
-                        scale_y: 0.55,
-                        opacity: 0,
-                        duration: animDuration,
-                        mode: Clutter.AnimationMode.EASE_IN_CUBIC,
-                        onComplete: () => {
-                            try {
-                                actor.set({
-                                    x: origX,
-                                    scale_x: 1.0,
-                                    scale_y: 1.0,
-                                    opacity: 255,
-                                });
-                            } catch (_e) {
-                                // Actor may be destroyed
-                            }
-                        },
+                        x: targetX,
+                        scale_x: 1.0,
+                        scale_y: 1.0,
+                        opacity: 255,
+                        duration: SLIDE_DURATION * 1.3,
+                        mode: Clutter.AnimationMode.EASE_OUT_QUAD,
                     });
                     return GLib.SOURCE_REMOVE;
                 });
-            }
+            } catch (_e) { /* */ }
         }
 
-        // --- Switch workspace after exit animation progresses ---
-        GLib.timeout_add(GLib.PRIORITY_DEFAULT, animDuration * 0.5, () => {
-            const ws = wsManager.get_workspace_by_index(targetWsIndex);
-            if (!ws) {
-                this._isAnimating = false;
-                return GLib.SOURCE_REMOVE;
-            }
+        windows[0].activate(global.get_current_time());
+        this._scheduleHide();
 
-            ws.activate(global.get_current_time());
-
-            // --- Animate incoming windows IN ---
-            GLib.timeout_add(GLib.PRIORITY_DEFAULT, 50, () => {
-                const targetWs = wsManager.get_workspace_by_index(targetWsIndex);
-                if (!targetWs) {
-                    this._isAnimating = false;
-                    return GLib.SOURCE_REMOVE;
-                }
-
-                const newWindows = _getVisibleWindows(targetWs);
-
-                for (let i = 0; i < newWindows.length; i++) {
-                    const win = newWindows[i];
-                    const actor = win.get_compositor_private();
-                    if (!actor)
-                        continue;
-
-                    const finalX = actor.x;
-                    const finalY = actor.y;
-                    const stagger = i * 40;
-
-                    // Start from sidebar area: scaled down, to the left
-                    actor.set({
-                        x: monitor.x + sidebarWidth * 0.3,
-                        scale_x: 0.6,
-                        scale_y: 0.6,
-                        opacity: 0,
-                        pivot_point: new Clutter.Point({ x: 0.0, y: 0.5 }),
-                    });
-
-                    GLib.timeout_add(GLib.PRIORITY_DEFAULT, stagger, () => {
-                        actor.ease({
-                            x: finalX,
-                            scale_x: 1.0,
-                            scale_y: 1.0,
-                            opacity: 255,
-                            duration: animDuration * 1.1,
-                            mode: Clutter.AnimationMode.EASE_OUT_CUBIC,
-                        });
-                        return GLib.SOURCE_REMOVE;
-                    });
-
-                    win.activate(global.get_current_time());
-                }
-
-                // Mark animation complete after all windows settle
-                GLib.timeout_add(GLib.PRIORITY_DEFAULT, animDuration * 1.2, () => {
-                    this._isAnimating = false;
-                    return GLib.SOURCE_REMOVE;
-                });
-
-                return GLib.SOURCE_REMOVE;
-            });
-
-            // Auto-hide sidebar after switching
-            if (this._settings.get_boolean('sidebar-auto-hide'))
-                this._scheduleHide();
-
+        GLib.timeout_add(GLib.PRIORITY_DEFAULT, SLIDE_DURATION * 1.5, () => {
+            this._animating = false;
+            this._scheduleRefresh();
             return GLib.SOURCE_REMOVE;
         });
     }
 
+    // ── Cleanup ──
+
     _destroyClones() {
         for (const clone of this._clones) {
-            try {
-                clone.set_source(null);
-                clone.destroy();
-            } catch (_e) {
-                // Already destroyed
+            // Disconnect source actor destroy signal first
+            if (clone._sourceActor && clone._sourceDestroyId) {
+                try {
+                    clone._sourceActor.disconnect(clone._sourceDestroyId);
+                } catch (_e) { /* */ }
+                clone._sourceActor = null;
+                clone._sourceDestroyId = null;
             }
+            _safeDestroyClone(clone);
         }
         this._clones = [];
     }
 
-    _clearTimeout(name) {
+    _clearTimer(name) {
         if (this[name]) {
             GLib.source_remove(this[name]);
             this[name] = null;
@@ -988,17 +914,15 @@ export default class StageManagerExtension extends Extension {
     enable() {
         this._settings = this.getSettings();
         this._maximizer = new MaximizeToWorkspace(this._settings);
-        this._strip = new StageStrip(this._settings);
-
+        this._sidebar = new StageSidebar(this._settings);
         this._maximizer.enable();
-        this._strip.enable();
+        this._sidebar.enable();
     }
 
     disable() {
-        this._strip.disable();
+        this._sidebar.disable();
         this._maximizer.disable();
-
-        this._strip = null;
+        this._sidebar = null;
         this._maximizer = null;
         this._settings = null;
     }
