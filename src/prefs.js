@@ -83,6 +83,13 @@ export default class StageManagerPreferences extends ExtensionPreferences {
         settings.bind('show-app-icons', iconSwitch, 'active', Gio.SettingsBindFlags.DEFAULT);
         sideGroup.add(iconSwitch);
 
+        const showCurrentWsSwitch = new Adw.SwitchRow({
+            title: 'Show Current Workspace',
+            subtitle: 'In workspace mode, also show the current workspace card',
+        });
+        settings.bind('show-workspace-current', showCurrentWsSwitch, 'active', Gio.SettingsBindFlags.DEFAULT);
+        sideGroup.add(showCurrentWsSwitch);
+
         // ── Appearance Page ──
         const lookPage = new Adw.PreferencesPage({
             title: 'Appearance',
@@ -97,6 +104,14 @@ export default class StageManagerPreferences extends ExtensionPreferences {
             'Sidebar Width', 'Width in pixels', 120, 400, 10);
         this._addSpinRow(sizeGroup, settings, 'edge-trigger-width',
             'Edge Trigger Width', 'Hot zone at screen edge (pixels)', 1, 20, 1);
+
+        const cardGroup = new Adw.PreferencesGroup({ title: 'Cards' });
+        lookPage.add(cardGroup);
+
+        this._addSpinRow(cardGroup, settings, 'card-base-scale',
+            'Card Base Scale', 'Default card size percentage (40-100)', 40, 100, 5);
+        this._addSpinRow(cardGroup, settings, 'perspective-angle',
+            'Perspective Angle', '3D rotation in degrees (0 = flat)', 0, 45, 1);
 
         const animGroup = new Adw.PreferencesGroup({ title: 'Animation' });
         lookPage.add(animGroup);
@@ -213,8 +228,8 @@ export default class StageManagerPreferences extends ExtensionPreferences {
 
     _loadLogs(textView) {
         try {
-            const [ok, out, err] = GLib.spawn_command_line_sync(
-                'journalctl --user -b --no-pager -n 50 -g stage-manager 2>/dev/null'
+            const [ok, out] = GLib.spawn_command_line_sync(
+                'bash -c "journalctl --user -b --no-pager -n 50 -g stage-manager 2>/dev/null"'
             );
             const text = ok ? new TextDecoder().decode(out).trim() : '';
             const buf = textView.get_buffer();

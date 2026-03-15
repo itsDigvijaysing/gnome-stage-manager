@@ -61,5 +61,25 @@
             <description>What to show in sidebar cards. 'apps' = inactive apps on current workspace. 'workspaces' = other workspaces.</description>
         </key>
 
+        <key name="card-base-scale" type="i">
+            <default>70</default>
+            <range min="40" max="100"/>
+            <summary>Card Base Scale</summary>
+            <description>Default card scale percentage (40-100). Cards grow on hover with a bell curve effect.</description>
+        </key>
+
+        <key name="perspective-angle" type="i">
+            <default>22</default>
+            <range min="0" max="45"/>
+            <summary>Perspective Angle</summary>
+            <description>Y-axis rotation in degrees for the 3D perspective effect on cards.</description>
+        </key>
+
+        <key name="show-workspace-current" type="b">
+            <default>true</default>
+            <summary>Show Current Workspace</summary>
+            <description>In workspace mode, also show the current workspace card in the sidebar.</description>
+        </key>
+
     </schema>
 </schemalist>

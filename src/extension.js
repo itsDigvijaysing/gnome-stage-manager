@@ -1,14 +1,7 @@
 /**
  * Stage Manager - GNOME Shell Extension
  *
- * macOS Stage Manager for GNOME. Simple, stable, no over-engineering.
- *
- * Design:
- * - PER-WORKSPACE: shows inactive apps on current workspace
- * - Edge-trigger to reveal, leave to hide
- * - Minimized windows shown via app icon (no compositor actor needed)
- * - Safe clone lifecycle: null sources before any container destruction
- * - Centered vertical distribution of cards
+ * macOS Stage Manager for GNOME.
  *
  * Compatible with GNOME 45+ (ESM), Wayland and X11.
  */
@@ -25,9 +18,9 @@ import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
 
 const THUMB_W = 160;
 const THUMB_H = 100;
-const ICON_SIZE = 28;
-const MAX_GROUPS = 8;
-const PERSPECTIVE_ANGLE = 22; // degrees Y-axis rotation for depth effect
+const ICON_SIZE = 24;
+const MAX_GROUPS = 10;
+const BELL_SIGMA = 1.4; // gaussian spread for bell curve scaling
 
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -40,11 +33,6 @@ function _isNormal(win) {
     return true;
 }
 
-/**
- * Recursively null all Clutter.Clone sources in an actor tree.
- * MUST be called before destroy_all_children() to prevent
- * "already disposed" crashes when source actors are gone.
- */
 function _nullCloneSources(actor) {
     try {
         if (actor instanceof Clutter.Clone) {
@@ -56,15 +44,10 @@ function _nullCloneSources(actor) {
     } catch (_e) { /* actor already gone */ }
 }
 
-/**
- * Group windows by app. Returns inactive groups sorted by recency.
- * Includes minimized windows — they may lack compositor actors.
- */
 function _groupByApp(workspace, focusedWindow) {
     const tracker = Shell.WindowTracker.get_default();
     const appMap = new Map();
 
-    // Get ALL normal windows on this workspace (including minimized)
     const allWins = workspace.list_windows().filter(w => _isNormal(w));
     const sorted = allWins.sort((a, b) =>
         (b.get_user_time() || 0) - (a.get_user_time() || 0)
@@ -80,7 +63,7 @@ function _groupByApp(workspace, focusedWindow) {
         const app = tracker.get_window_app(win);
         if (!app) continue;
         const id = app.get_id();
-        if (id === activeAppId) continue; // Skip focused app
+        if (id === activeAppId) continue;
 
         if (!appMap.has(id))
             appMap.set(id, { app, windows: [] });
@@ -88,6 +71,14 @@ function _groupByApp(workspace, focusedWindow) {
     }
 
     return [...appMap.values()];
+}
+
+/**
+ * Gaussian bell curve: returns a value between 0 and 1.
+ * Peak at dist=0, falls off with sigma.
+ */
+function _bellCurve(dist, sigma) {
+    return Math.exp(-(dist * dist) / (2 * sigma * sigma));
 }
 
 
@@ -125,11 +116,9 @@ class MaximizeToWorkspace {
         const wsm = global.workspace_manager;
         const ci = wsm.get_active_workspace_index();
         const cws = wsm.get_workspace_by_index(ci);
-        // Only move if sharing workspace with other windows
         const siblings = cws.list_windows().filter(w => w !== win && _isNormal(w) && !w.minimized);
         if (siblings.length === 0) return;
 
-        // Find or create empty workspace
         let ti = -1;
         for (let i = 0; i < wsm.get_n_workspaces(); i++) {
             if (i === ci) continue;
@@ -167,6 +156,7 @@ class StageSidebar {
         this._panel = null;
         this._edge = null;
         this._box = null;
+        this._scroll = null;
         this._preview = null;
         this._hoverTimer = null;
         this._refreshTimer = null;
@@ -174,12 +164,20 @@ class StageSidebar {
         this._visible = false;
         this._hovered = false;
         this._animating = false;
+        this._hoveredIdx = -1;
     }
+
+    // ── Settings getters ──
+    get _PANEL_W() { return this._settings.get_int('sidebar-width'); }
+    get _SLIDE_MS() { return this._settings.get_int('animation-duration'); }
+    get _HIDE_DELAY_MS() { return this._settings.get_int('auto-hide-delay'); }
+    get _EDGE_W() { return this._settings.get_int('edge-trigger-width'); }
+    get _BASE_SCALE() { return this._settings.get_int('card-base-scale') / 100.0; }
+    get _PERSP_ANGLE() { return this._settings.get_int('perspective-angle'); }
 
     enable() {
         this._build();
         this._wire();
-        // If not auto-hide mode, show sidebar immediately
         if (!this._settings.get_boolean('sidebar-auto-hide'))
             this._show();
         else if (this._visible)
@@ -209,12 +207,6 @@ class StageSidebar {
         }
     }
 
-    // Read dynamic settings values
-    get _PANEL_W() { return this._settings.get_int('sidebar-width'); }
-    get _SLIDE_MS() { return this._settings.get_int('animation-duration'); }
-    get _HIDE_DELAY_MS() { return this._settings.get_int('auto-hide-delay'); }
-    get _EDGE_W() { return this._settings.get_int('edge-trigger-width'); }
-
     _build() {
         const mon = Main.layoutManager.primaryMonitor;
         const topH = Main.panel ? Main.panel.height : 0;
@@ -222,19 +214,19 @@ class StageSidebar {
         const edgeW = this._EDGE_W;
         const panelH = mon.height - topH;
 
-        // Edge trigger — full height strip at left edge
+        // Edge trigger
         this._edge = new St.Widget({
             reactive: true, track_hover: true,
             style: 'background-color: transparent;',
         });
-        this._edge.set_size(edgeW, mon.height - topH);
+        this._edge.set_size(edgeW, panelH);
         this._edge.set_position(mon.x, mon.y + topH);
         Main.layoutManager.addChrome(this._edge, { affectsInputRegion: true, trackFullscreen: false });
         this._edge.connect('enter-event', () => {
             if (!this._fullscreen()) this._show();
         });
 
-        // Panel = plain St.Widget container (matches reference architecture)
+        // Panel
         this._panel = new St.Widget({
             reactive: true, track_hover: true,
             style: 'background-color: transparent;',
@@ -242,10 +234,9 @@ class StageSidebar {
         this._panel.set_size(panelW, panelH);
         this._panel.set_position(mon.x - panelW, mon.y + topH);
         this._visible = false;
-
         Main.layoutManager.addChrome(this._panel, { affectsInputRegion: true, trackFullscreen: false });
 
-        // ScrollView inside panel — this is the key layer that makes BoxLayout work
+        // ScrollView → BoxLayout
         this._scroll = new St.ScrollView({
             overlay_scrollbars: true,
             hscrollbar_policy: St.PolicyType.NEVER,
@@ -255,16 +246,14 @@ class StageSidebar {
         this._scroll.set_size(panelW, panelH);
         this._panel.add_child(this._scroll);
 
-        // Content box inside ScrollView — vertical BoxLayout where cards go
         this._box = new St.BoxLayout({
             vertical: true,
             x_align: Clutter.ActorAlign.CENTER,
             y_align: Clutter.ActorAlign.START,
-            style: 'padding: 60px 0px; spacing: 16px;',
+            style: 'padding: 50px 0px; spacing: 6px;',
         });
         this._scroll.set_child(this._box);
 
-        // Mouse wheel scroll support
         this._scroll.connect('scroll-event', (_actor, event) => {
             const adj = this._scroll.vadjustment;
             const [, dy] = event.get_scroll_delta();
@@ -278,6 +267,8 @@ class StageSidebar {
         });
         this._panel.connect('leave-event', () => {
             this._hovered = false;
+            this._hoveredIdx = -1;
+            this._resetAllCardScales();
             this._destroyPreview();
             if (this._settings.get_boolean('sidebar-auto-hide'))
                 this._scheduleHide();
@@ -292,6 +283,8 @@ class StageSidebar {
         sig(global.window_manager, 'minimize', () => this._scheduleRefresh());
         sig(global.window_manager, 'unminimize', () => this._scheduleRefresh());
         sig(global.workspace_manager, 'active-workspace-changed', () => this._scheduleRefresh());
+        sig(global.workspace_manager, 'workspace-added', () => this._scheduleRefresh());
+        sig(global.workspace_manager, 'workspace-removed', () => this._scheduleRefresh());
         sig(global.display, 'in-fullscreen-changed', () => this._onFullscreen());
 
         this._setSigs.push(this._settings.connect('changed::enable-stage-sidebar', () => {
@@ -302,12 +295,19 @@ class StageSidebar {
         }));
         this._setSigs.push(this._settings.connect('changed::sidebar-auto-hide', () => {
             if (this._settings.get_boolean('sidebar-auto-hide')) {
-                // Switched to auto-hide: hide if mouse not hovering
                 if (!this._hovered) this._scheduleHide();
             } else {
-                // Switched to always-visible: show immediately
                 this._show();
             }
+        }));
+        this._setSigs.push(this._settings.connect('changed::show-app-icons', () => {
+            if (this._visible) this._refresh();
+        }));
+        this._setSigs.push(this._settings.connect('changed::card-base-scale', () => {
+            if (this._visible) this._refresh();
+        }));
+        this._setSigs.push(this._settings.connect('changed::perspective-angle', () => {
+            if (this._visible) this._refresh();
         }));
     }
 
@@ -320,7 +320,6 @@ class StageSidebar {
 
     _onFullscreen() {
         if (this._fullscreen()) {
-            // Instant hide — no animation, no flicker
             this._destroyPreview();
             if (this._visible) {
                 this._visible = false;
@@ -344,8 +343,6 @@ class StageSidebar {
         this._visible = true;
         this._animating = true;
         this._kill('_hideTimer');
-
-        // Refresh content BEFORE animating in so cards are visible during slide
         this._refresh();
 
         this._panel.remove_all_transitions();
@@ -353,9 +350,7 @@ class StageSidebar {
             x: Main.layoutManager.primaryMonitor.x,
             duration: this._SLIDE_MS,
             mode: Clutter.AnimationMode.EASE_OUT_QUAD,
-            onComplete: () => {
-                this._animating = false;
-            },
+            onComplete: () => { this._animating = false; },
         });
     }
 
@@ -388,7 +383,6 @@ class StageSidebar {
         if (this._refreshTimer) return;
         this._refreshTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 200, () => {
             this._refreshTimer = null;
-            // Skip refresh while hovering to prevent flicker/clone disposal crashes
             if (this._visible && !this._hovered) this._refresh();
             return GLib.SOURCE_REMOVE;
         });
@@ -400,6 +394,7 @@ class StageSidebar {
         if (!this._settings.get_boolean('enable-stage-sidebar')) return;
 
         this._cards = [];
+        this._hoveredIdx = -1;
         this._safeDestroyContent();
 
         const mode = this._settings.get_string('sidebar-mode');
@@ -408,14 +403,15 @@ class StageSidebar {
             this._refreshWorkspaces();
         else
             this._refreshApps();
+
+        // Apply initial small scale + perspective to all cards
+        this._resetAllCardScales();
     }
 
     _refreshApps() {
         const activeWs = global.workspace_manager.get_active_workspace();
         const focusedWin = global.display.get_focus_window();
         const groups = _groupByApp(activeWs, focusedWin).slice(0, MAX_GROUPS);
-
-        if (groups.length === 0) return;
 
         for (const group of groups) {
             try {
@@ -434,15 +430,16 @@ class StageSidebar {
         const wsm = global.workspace_manager;
         const activeIdx = wsm.get_active_workspace_index();
         const n = wsm.get_n_workspaces();
+        const showCurrent = this._settings.get_boolean('show-workspace-current');
 
         for (let i = 0; i < n; i++) {
-            if (i === activeIdx) continue;
+            if (!showCurrent && i === activeIdx) continue;
             const ws = wsm.get_workspace_by_index(i);
             const wins = ws.list_windows().filter(w => _isNormal(w));
-            if (wins.length === 0) continue;
+            if (wins.length === 0 && i !== activeIdx) continue;
 
             try {
-                const card = this._makeWorkspaceCard(ws, wins, i);
+                const card = this._makeWorkspaceCard(ws, wins, i, i === activeIdx);
                 if (card) {
                     this._box.add_child(card);
                     this._cards.push(card);
@@ -453,10 +450,6 @@ class StageSidebar {
         }
     }
 
-    /**
-     * Safely destroy all content in the box.
-     * Nulls clone sources BEFORE destroying to prevent GJS crashes.
-     */
     _safeDestroyContent() {
         if (!this._box) return;
         try {
@@ -465,33 +458,35 @@ class StageSidebar {
         } catch (_e) { /* */ }
     }
 
-    /**
-     * Create a card for one app group (apps mode).
-     */
+    // ── Card builders ──
+
     _makeAppCard(group) {
         const { app, windows } = group;
 
         const card = new St.BoxLayout({
             vertical: true, reactive: true,
             x_align: Clutter.ActorAlign.CENTER,
-            style: 'padding: 10px 16px;',
+            style: 'padding: 6px 12px;',
         });
 
         const thumb = this._makeThumb(windows);
         card.add_child(thumb);
+        card._thumb = thumb;
 
-        // App icon below thumbnail
         if (app && this._settings.get_boolean('show-app-icons')) {
             const iconBox = new St.BoxLayout({
                 x_align: Clutter.ActorAlign.CENTER,
-                style: 'margin-top: 8px;',
+                style: 'margin-top: 6px;',
             });
             iconBox.add_child(app.create_icon_texture(ICON_SIZE));
             card.add_child(iconBox);
         }
 
-        this._applyPerspective(card, thumb);
-        this._wireCardHover(card, thumb, windows);
+        // Pivot + perspective applied by _resetAllCardScales
+        card.set_pivot_point(0.0, 0.5);
+
+        const idx = this._cards.length; // will be the index after push
+        this._wireCardEvents(card, thumb, windows, idx);
 
         card.connect('button-release-event', () => {
             this._destroyPreview();
@@ -502,44 +497,47 @@ class StageSidebar {
         return card;
     }
 
-    /**
-     * Create a card for a workspace (workspaces mode).
-     */
-    _makeWorkspaceCard(ws, wins, wsIndex) {
+    _makeWorkspaceCard(ws, wins, wsIndex, isCurrent) {
         const card = new St.BoxLayout({
             vertical: true, reactive: true,
             x_align: Clutter.ActorAlign.CENTER,
-            style: 'padding: 10px 16px;',
+            style: 'padding: 6px 12px;',
         });
 
-        // Show first visible window as thumbnail
         const thumb = this._makeThumb(wins);
         card.add_child(thumb);
+        card._thumb = thumb;
 
-        // Workspace label
+        // Label with highlight for current workspace
+        const labelStyle = isCurrent
+            ? 'margin-top: 6px; color: rgba(140,180,255,0.9); font-size: 11px; font-weight: bold;'
+            : 'margin-top: 6px; color: rgba(255,255,255,0.6); font-size: 11px;';
         const label = new St.Label({
-            text: `Workspace ${wsIndex + 1}`,
+            text: isCurrent ? `Workspace ${wsIndex + 1} (current)` : `Workspace ${wsIndex + 1}`,
             x_align: Clutter.ActorAlign.CENTER,
-            style: 'margin-top: 8px; color: rgba(255,255,255,0.7); font-size: 11px;',
+            style: labelStyle,
         });
         card.add_child(label);
 
-        // Window count
-        if (wins.length > 1) {
+        if (wins.length > 0) {
             const count = new St.Label({
-                text: `${wins.length} windows`,
+                text: `${wins.length} window${wins.length > 1 ? 's' : ''}`,
                 x_align: Clutter.ActorAlign.CENTER,
-                style: 'color: rgba(255,255,255,0.4); font-size: 10px;',
+                style: 'color: rgba(255,255,255,0.35); font-size: 10px;',
             });
             card.add_child(count);
         }
 
-        this._applyPerspective(card, thumb);
-        this._wireCardHover(card, thumb, wins);
+        card.set_pivot_point(0.0, 0.5);
+
+        const idx = this._cards.length;
+        this._wireCardEvents(card, thumb, wins, idx);
 
         card.connect('button-release-event', () => {
             this._destroyPreview();
-            ws.activate(global.get_current_time());
+            if (!isCurrent) {
+                ws.activate(global.get_current_time());
+            }
             if (this._settings.get_boolean('sidebar-auto-hide'))
                 this._scheduleHide();
             this._scheduleRefresh();
@@ -549,13 +547,10 @@ class StageSidebar {
         return card;
     }
 
-    /**
-     * Create a thumbnail widget from a window list.
-     */
     _makeThumb(windows) {
         const thumb = new St.Widget({
             reactive: true,
-            style: 'border-radius: 14px; background-color: rgba(30,30,34,0.6);',
+            style: 'border-radius: 12px; background-color: rgba(30,30,34,0.55);',
         });
 
         let hasClone = false;
@@ -571,18 +566,17 @@ class StageSidebar {
                     });
                     thumb.add_child(clone);
                     hasClone = true;
-                } catch (_e) { /* disposed actor */ }
+                } catch (_e) { /* disposed */ }
             }
         }
 
         if (!hasClone) {
-            // Try to get app icon for fallback
             const tracker = Shell.WindowTracker.get_default();
             const win = windows[0];
             const app = win ? tracker.get_window_app(win) : null;
             if (app) {
-                const icon = app.create_icon_texture(64);
-                icon.set_position((THUMB_W - 64) / 2, (THUMB_H - 64) / 2);
+                const icon = app.create_icon_texture(48);
+                icon.set_position((THUMB_W - 48) / 2, (THUMB_H - 48) / 2);
                 thumb.add_child(icon);
             }
             thumb.set_size(THUMB_W, THUMB_H);
@@ -591,51 +585,88 @@ class StageSidebar {
         return thumb;
     }
 
+    // ── Bell curve scaling ──
+
     /**
-     * Apply perspective transform to a card.
+     * Reset all cards to their resting state: small + perspective.
      */
-    _applyPerspective(card, _thumb) {
-        card.set_pivot_point(0.0, 0.5);
-        card.rotation_angle_y = PERSPECTIVE_ANGLE;
-        // Slight transparency when in perspective
-        card.set_opacity(210);
+    _resetAllCardScales() {
+        const base = this._BASE_SCALE;
+        const angle = this._PERSP_ANGLE;
+        for (const card of this._cards) {
+            card.remove_all_transitions();
+            card.set_scale(base, base);
+            card.rotation_angle_y = angle;
+            card.set_opacity(190);
+        }
     }
 
     /**
-     * Wire hover effects: flatten perspective, glow, show preview.
+     * Apply bell curve scaling: hovered card is full size,
+     * neighbors scale down smoothly based on distance.
      */
-    _wireCardHover(card, thumb, windows) {
+    _applyBellCurve(hoveredIdx) {
+        const base = this._BASE_SCALE;
+        const angle = this._PERSP_ANGLE;
+
+        for (let i = 0; i < this._cards.length; i++) {
+            const dist = Math.abs(i - hoveredIdx);
+            const factor = _bellCurve(dist, BELL_SIGMA);
+            // Scale: base + (1-base) * factor → ranges from base to 1.0
+            const s = base + (1.0 - base) * factor;
+            // Perspective: full angle at dist=far, 0 at hovered
+            const rot = angle * (1.0 - factor);
+            // Opacity: 190 at far, 255 at hovered
+            const op = Math.round(190 + 65 * factor);
+
+            this._cards[i].ease({
+                scale_x: s, scale_y: s,
+                rotation_angle_y: rot,
+                opacity: op,
+                duration: 180,
+                mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+            });
+        }
+    }
+
+    // ── Card events ──
+
+    _wireCardEvents(card, thumb, windows, cardIdx) {
         card.connect('enter-event', () => {
             this._hovered = true;
             this._kill('_hideTimer');
-            // Flatten + brighten
-            card.ease({
-                rotation_angle_y: 0,
-                opacity: 255,
-                scale_x: 1.04, scale_y: 1.04,
-                duration: 200,
-                mode: Clutter.AnimationMode.EASE_OUT_QUAD,
-            });
-            // Soft glow instead of hard border
-            thumb.set_style('border-radius: 14px; background-color: rgba(50,50,58,0.8); box-shadow: 0 4px 20px rgba(120,130,255,0.2);');
-            // Show preview
+            this._hoveredIdx = cardIdx;
+
+            // Bell curve scale all cards
+            this._applyBellCurve(cardIdx);
+
+            // Glow on hovered thumb
+            thumb.set_style('border-radius: 12px; background-color: rgba(50,50,58,0.75); box-shadow: 0 4px 20px rgba(120,140,255,0.18);');
+
+            // Preview
             this._kill('_hoverTimer');
-            this._hoverTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 250, () => {
+            this._hoverTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 220, () => {
                 this._hoverTimer = null;
                 this._showPreview(card, windows);
                 return GLib.SOURCE_REMOVE;
             });
         });
+
         card.connect('leave-event', () => {
-            // Restore perspective + dim
-            card.ease({
-                rotation_angle_y: PERSPECTIVE_ANGLE,
-                opacity: 210,
-                scale_x: 1.0, scale_y: 1.0,
-                duration: 200,
-                mode: Clutter.AnimationMode.EASE_OUT_QUAD,
-            });
-            thumb.set_style('border-radius: 14px; background-color: rgba(30,30,34,0.6);');
+            this._hoveredIdx = -1;
+            // Return all cards to resting scale
+            const base = this._BASE_SCALE;
+            const angle = this._PERSP_ANGLE;
+            for (const c of this._cards) {
+                c.ease({
+                    scale_x: base, scale_y: base,
+                    rotation_angle_y: angle,
+                    opacity: 190,
+                    duration: 200,
+                    mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+                });
+            }
+            thumb.set_style('border-radius: 12px; background-color: rgba(30,30,34,0.55);');
             this._kill('_hoverTimer');
             this._destroyPreview();
         });
@@ -668,7 +699,7 @@ class StageSidebar {
         let py = Math.max(mon.y + topH + 8, Math.min(cardY, mon.y + mon.height - ph - 20));
 
         this._preview = new St.Widget({
-            style: 'background-color: rgba(25,25,28,0.92); border-radius: 14px; border: 1px solid rgba(255,255,255,0.08); box-shadow: 0 8px 32px rgba(0,0,0,0.5);',
+            style: 'background-color: rgba(22,22,26,0.94); border-radius: 14px; box-shadow: 0 8px 32px rgba(0,0,0,0.55);',
             reactive: false,
         });
         this._preview.set_size(pw + 12, ph + 12);
@@ -702,7 +733,6 @@ class StageSidebar {
         for (const win of windows) {
             if (win.minimized) win.unminimize();
         }
-        // Activate the most recent window
         windows[0].activate(global.get_current_time());
 
         if (this._settings.get_boolean('sidebar-auto-hide'))
