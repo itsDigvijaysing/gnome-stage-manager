@@ -1,7 +1,9 @@
 /**
  * Stage Manager - GNOME Shell Extension
  *
- * macOS Stage Manager for GNOME.
+ * macOS-style Stage Manager for GNOME.
+ * Groups windows into "stages" — only one group visible at a time,
+ * others shown as sidebar thumbnail cards.
  *
  * Compatible with GNOME 45+ (ESM), Wayland and X11.
  */
@@ -16,11 +18,14 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
 
 
-const THUMB_W = 160;
-const THUMB_H = 100;
-const ICON_SIZE = 24;
-const MAX_GROUPS = 10;
-const BELL_SIGMA = 1.4; // gaussian spread for bell curve scaling
+const THUMB_W = 170;
+const THUMB_H = 110;
+const ICON_SIZE = 22;
+const MAX_GROUPS = 8;
+const BELL_SIGMA = 0.9;   // tight: only 1-2 neighbors affected
+const MAX_STACK = 3;
+const STACK_H = 14;   // horizontal spread between stacked layers
+const STACK_V = 4;    // slight vertical offset per layer
 
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -44,6 +49,11 @@ function _nullCloneSources(actor) {
     } catch (_e) { /* actor already gone */ }
 }
 
+function _bellCurve(dist, sigma) {
+    return Math.exp(-(dist * dist) / (2 * sigma * sigma));
+}
+
+/** Group windows by app (for 'apps' sidebar mode). */
 function _groupByApp(workspace, focusedWindow) {
     const tracker = Shell.WindowTracker.get_default();
     const appMap = new Map();
@@ -71,14 +81,6 @@ function _groupByApp(workspace, focusedWindow) {
     }
 
     return [...appMap.values()];
-}
-
-/**
- * Gaussian bell curve: returns a value between 0 and 1.
- * Peak at dist=0, falls off with sigma.
- */
-function _bellCurve(dist, sigma) {
-    return Math.exp(-(dist * dist) / (2 * sigma * sigma));
 }
 
 
@@ -161,10 +163,17 @@ class StageSidebar {
         this._hoverTimer = null;
         this._refreshTimer = null;
         this._hideTimer = null;
+        this._swapTimer = null;
         this._visible = false;
         this._hovered = false;
         this._animating = false;
         this._hoveredIdx = -1;
+
+        // Group tracking (for 'groups' mode)
+        this._groups = [];
+        this._activeGroupId = null;
+        this._nextGid = 0;
+        this._swapping = false;
     }
 
     // ── Settings getters ──
@@ -178,21 +187,23 @@ class StageSidebar {
     enable() {
         this._build();
         this._wire();
+        this._initGroups();
         if (!this._settings.get_boolean('sidebar-auto-hide'))
             this._show();
-        else if (this._visible)
-            this._refresh();
     }
 
     disable() {
         this._kill('_refreshTimer');
         this._kill('_hideTimer');
         this._kill('_hoverTimer');
+        this._kill('_swapTimer');
         this._sigs.splice(0).forEach(s => { try { s.o.disconnect(s.i); } catch (_) { /* */ } });
         this._setSigs.splice(0).forEach(id => { try { this._settings.disconnect(id); } catch (_) { /* */ } });
         this._destroyPreview();
         this._safeDestroyContent();
         this._cards = [];
+        this._groups = [];
+        this._activeGroupId = null;
         this._box = null;
         this._scroll = null;
         if (this._panel) {
@@ -206,6 +217,8 @@ class StageSidebar {
             this._edge = null;
         }
     }
+
+    // ── Build UI ──
 
     _build() {
         const mon = Main.layoutManager.primaryMonitor;
@@ -226,7 +239,7 @@ class StageSidebar {
             if (!this._fullscreen()) this._show();
         });
 
-        // Panel
+        // Panel container — fully transparent, cards have their own backgrounds
         this._panel = new St.Widget({
             reactive: true, track_hover: true,
             style: 'background-color: transparent;',
@@ -250,7 +263,7 @@ class StageSidebar {
             vertical: true,
             x_align: Clutter.ActorAlign.CENTER,
             y_align: Clutter.ActorAlign.START,
-            style: 'padding: 50px 0px; spacing: 6px;',
+            style: 'padding: 40px 0px; spacing: 10px;',
         });
         this._scroll.set_child(this._box);
 
@@ -275,14 +288,30 @@ class StageSidebar {
         });
     }
 
+    // ── Wire signals ──
+
     _wire() {
         const sig = (o, s, cb) => { this._sigs.push({ o, i: o.connect(s, cb) }); };
+
+        sig(global.window_manager, 'map', (_wm, actor) => {
+            const win = actor?.meta_window;
+            if (win) this._onWindowMap(win);
+        });
+        sig(global.window_manager, 'destroy', (_wm, actor) => {
+            const win = actor?.meta_window;
+            if (win) this._onWindowDestroy(win);
+        });
+        sig(global.window_manager, 'minimize', (_wm, actor) => {
+            const win = actor?.meta_window;
+            if (win) this._onWindowMinimize(win);
+        });
+        sig(global.window_manager, 'unminimize', (_wm, actor) => {
+            const win = actor?.meta_window;
+            if (win) this._onWindowUnminimize(win);
+        });
+
         sig(global.display, 'notify::focus-window', () => this._scheduleRefresh());
-        sig(global.window_manager, 'map', () => this._scheduleRefresh());
-        sig(global.window_manager, 'destroy', () => this._scheduleRefresh());
-        sig(global.window_manager, 'minimize', () => this._scheduleRefresh());
-        sig(global.window_manager, 'unminimize', () => this._scheduleRefresh());
-        sig(global.workspace_manager, 'active-workspace-changed', () => this._scheduleRefresh());
+        sig(global.workspace_manager, 'active-workspace-changed', () => this._initGroups());
         sig(global.workspace_manager, 'workspace-added', () => this._scheduleRefresh());
         sig(global.workspace_manager, 'workspace-removed', () => this._scheduleRefresh());
         sig(global.display, 'in-fullscreen-changed', () => this._onFullscreen());
@@ -303,12 +332,172 @@ class StageSidebar {
         this._setSigs.push(this._settings.connect('changed::show-app-icons', () => {
             if (this._visible) this._refresh();
         }));
+        this._setSigs.push(this._settings.connect('changed::show-group-count', () => {
+            if (this._visible) this._refresh();
+        }));
         this._setSigs.push(this._settings.connect('changed::card-base-scale', () => {
             if (this._visible) this._refresh();
         }));
         this._setSigs.push(this._settings.connect('changed::perspective-angle', () => {
             if (this._visible) this._refresh();
         }));
+    }
+
+    // ── Group management (for 'groups' mode) ─────────────────────────────
+
+    _initGroups() {
+        const ws = global.workspace_manager.get_active_workspace();
+        const allWins = ws.list_windows().filter(w => _isNormal(w));
+
+        this._groups = [];
+        this._nextGid = 0;
+        this._activeGroupId = null;
+        this._swapping = false;
+
+        const visible = allWins.filter(w => !w.minimized);
+        if (visible.length > 0) {
+            const g = { id: this._nextGid++, windows: new Set(visible) };
+            this._groups.push(g);
+            this._activeGroupId = g.id;
+        }
+
+        const tracker = Shell.WindowTracker.get_default();
+        const byApp = new Map();
+        for (const win of allWins.filter(w => w.minimized)) {
+            const app = tracker.get_window_app(win);
+            const key = app ? app.get_id() : `_anon_${win.get_id()}`;
+            if (!byApp.has(key)) byApp.set(key, []);
+            byApp.get(key).push(win);
+        }
+        for (const [, wins] of byApp) {
+            this._groups.push({ id: this._nextGid++, windows: new Set(wins) });
+        }
+
+        if (this._visible) this._refresh();
+    }
+
+    _getActiveGroup() {
+        return this._groups.find(g => g.id === this._activeGroupId) || null;
+    }
+
+    _getInactiveGroups() {
+        return this._groups.filter(g => g.id !== this._activeGroupId && g.windows.size > 0);
+    }
+
+    _findGroupForWindow(win) {
+        return this._groups.find(g => g.windows.has(win)) || null;
+    }
+
+    _cleanupEmptyGroups() {
+        this._groups = this._groups.filter(g => g.windows.size > 0);
+        if (this._activeGroupId !== null && !this._groups.find(g => g.id === this._activeGroupId)) {
+            this._activeGroupId = null;
+        }
+    }
+
+    _onWindowMinimize(win) {
+        if (this._swapping || !_isNormal(win)) return;
+        if (this._settings.get_string('sidebar-mode') === 'groups') {
+            const group = this._findGroupForWindow(win);
+            if (group && group.id === this._activeGroupId) {
+                group.windows.delete(win);
+                this._groups.push({ id: this._nextGid++, windows: new Set([win]) });
+                this._cleanupEmptyGroups();
+            }
+        }
+        this._scheduleRefresh();
+    }
+
+    _onWindowUnminimize(win) {
+        if (this._swapping || !_isNormal(win)) return;
+        if (this._settings.get_string('sidebar-mode') === 'groups') {
+            const group = this._findGroupForWindow(win);
+            if (group && group.id !== this._activeGroupId) {
+                group.windows.delete(win);
+            }
+            let active = this._getActiveGroup();
+            if (!active) {
+                active = { id: this._nextGid++, windows: new Set() };
+                this._groups.push(active);
+                this._activeGroupId = active.id;
+            }
+            active.windows.add(win);
+            this._cleanupEmptyGroups();
+        }
+        this._scheduleRefresh();
+    }
+
+    _onWindowMap(win) {
+        if (!_isNormal(win)) return;
+        if (this._settings.get_string('sidebar-mode') === 'groups') {
+            let active = this._getActiveGroup();
+            if (!active) {
+                active = { id: this._nextGid++, windows: new Set() };
+                this._groups.push(active);
+                this._activeGroupId = active.id;
+            }
+            active.windows.add(win);
+        }
+        this._scheduleRefresh();
+    }
+
+    _onWindowDestroy(win) {
+        for (const group of this._groups) {
+            group.windows.delete(win);
+        }
+        this._cleanupEmptyGroups();
+        this._scheduleRefresh();
+    }
+
+    _swapToGroup(targetGroup) {
+        if (this._swapping) return;
+        if (targetGroup.id === this._activeGroupId) return;
+
+        this._swapping = true;
+        this._destroyPreview();
+
+        const activeGroup = this._getActiveGroup();
+
+        if (activeGroup) {
+            for (const win of activeGroup.windows) {
+                if (!win.minimized) {
+                    try { win.minimize(); } catch (_) { /* */ }
+                }
+            }
+        }
+
+        for (const win of targetGroup.windows) {
+            if (win.minimized) {
+                try { win.unminimize(); } catch (_) { /* */ }
+            }
+        }
+
+        const sorted = [...targetGroup.windows].sort((a, b) =>
+            (b.get_user_time() || 0) - (a.get_user_time() || 0)
+        );
+        if (sorted.length > 0) {
+            sorted[0].activate(global.get_current_time());
+        }
+
+        this._activeGroupId = targetGroup.id;
+
+        this._kill('_swapTimer');
+        this._swapTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 400, () => {
+            this._swapTimer = null;
+            this._swapping = false;
+            return GLib.SOURCE_REMOVE;
+        });
+
+        this._hovered = false;
+        this._kill('_refreshTimer');
+        this._refreshTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 120, () => {
+            this._refreshTimer = null;
+            if (this._visible) this._refresh();
+            return GLib.SOURCE_REMOVE;
+        });
+
+        if (this._settings.get_boolean('sidebar-auto-hide'))
+            this._scheduleHide();
     }
 
     // ── Fullscreen ──
@@ -388,7 +577,7 @@ class StageSidebar {
         });
     }
 
-    // ── Render ──
+    // ── Render ──────────────────────────────────────────────────────────
 
     _refresh() {
         if (!this._settings.get_boolean('enable-stage-sidebar')) return;
@@ -401,28 +590,33 @@ class StageSidebar {
 
         if (mode === 'workspaces')
             this._refreshWorkspaces();
-        else
+        else if (mode === 'apps')
             this._refreshApps();
+        else
+            this._refreshGroups();
 
-        // Apply initial small scale + perspective to all cards
-        this._resetAllCardScales();
+        this._animateCardsEntrance();
+    }
+
+    _refreshGroups() {
+        const inactive = this._getInactiveGroups().slice(0, MAX_GROUPS);
+        for (const group of inactive) {
+            try {
+                const card = this._makeGroupCard(group);
+                if (card) { this._box.add_child(card); this._cards.push(card); }
+            } catch (e) { console.error(`[StageManager] group card: ${e.message}`); }
+        }
     }
 
     _refreshApps() {
         const activeWs = global.workspace_manager.get_active_workspace();
         const focusedWin = global.display.get_focus_window();
         const groups = _groupByApp(activeWs, focusedWin).slice(0, MAX_GROUPS);
-
         for (const group of groups) {
             try {
                 const card = this._makeAppCard(group);
-                if (card) {
-                    this._box.add_child(card);
-                    this._cards.push(card);
-                }
-            } catch (e) {
-                console.error(`[StageManager] card error: ${e.message}`);
-            }
+                if (card) { this._box.add_child(card); this._cards.push(card); }
+            } catch (e) { console.error(`[StageManager] app card: ${e.message}`); }
         }
     }
 
@@ -431,164 +625,261 @@ class StageSidebar {
         const activeIdx = wsm.get_active_workspace_index();
         const n = wsm.get_n_workspaces();
         const showCurrent = this._settings.get_boolean('show-workspace-current');
-
         for (let i = 0; i < n; i++) {
             if (!showCurrent && i === activeIdx) continue;
             const ws = wsm.get_workspace_by_index(i);
             const wins = ws.list_windows().filter(w => _isNormal(w));
             if (wins.length === 0 && i !== activeIdx) continue;
-
             try {
                 const card = this._makeWorkspaceCard(ws, wins, i, i === activeIdx);
-                if (card) {
-                    this._box.add_child(card);
-                    this._cards.push(card);
-                }
-            } catch (e) {
-                console.error(`[StageManager] ws card error: ${e.message}`);
-            }
+                if (card) { this._box.add_child(card); this._cards.push(card); }
+            } catch (e) { console.error(`[StageManager] ws card: ${e.message}`); }
         }
     }
 
     _safeDestroyContent() {
         if (!this._box) return;
-        try {
-            _nullCloneSources(this._box);
-            this._box.destroy_all_children();
-        } catch (_e) { /* */ }
+        try { _nullCloneSources(this._box); this._box.destroy_all_children(); } catch (_) { /* */ }
     }
 
-    // ── Card builders ──
+    // ── Entrance animation ──
+
+    _animateCardsEntrance() {
+        const base = this._BASE_SCALE;
+        const angle = this._PERSP_ANGLE;
+
+        for (let i = 0; i < this._cards.length; i++) {
+            const card = this._cards[i];
+
+            // Start invisible, shifted down
+            card.set_opacity(0);
+            card.translation_y = 24;
+            card.set_scale(base * 0.82, base * 0.82);
+
+            // Perspective on the thumb (not the card)
+            const thumb = card._thumb;
+            if (thumb) {
+                thumb.set_pivot_point(0.0, 0.5);
+                thumb.rotation_angle_y = angle;
+            }
+
+            card.ease({
+                opacity: 190,
+                translation_y: 0,
+                scale_x: base,
+                scale_y: base,
+                duration: 300,
+                delay: i * 55,
+                mode: Clutter.AnimationMode.EASE_OUT_CUBIC,
+            });
+        }
+    }
+
+    // ── Card builders ───────────────────────────────────────────────────
+
+    /**
+     * Create a card wrapper with a frosted-glass pill background.
+     * The card itself has the visual bg — the panel is fully transparent.
+     */
+    _wrapCard() {
+        return new St.BoxLayout({
+            vertical: true, reactive: true,
+            x_align: Clutter.ActorAlign.CENTER,
+            style: 'padding: 8px 14px; border-radius: 16px; ' +
+                   'background-color: rgba(28,28,34,0.55);',
+        });
+    }
+
+    _makeGroupCard(group) {
+        const windows = [...group.windows].sort((a, b) =>
+            (b.get_user_time() || 0) - (a.get_user_time() || 0)
+        );
+        if (windows.length === 0) return null;
+
+        const card = this._wrapCard();
+        const thumb = this._makeStackedThumb(windows);
+        card.add_child(thumb);
+        card._thumb = thumb;
+
+        if (this._settings.get_boolean('show-app-icons')) {
+            const tracker = Shell.WindowTracker.get_default();
+            const seenApps = new Set();
+            const iconBox = new St.BoxLayout({
+                x_align: Clutter.ActorAlign.CENTER,
+                style: 'margin-top: 5px; spacing: 4px;',
+            });
+            for (const win of windows) {
+                const app = tracker.get_window_app(win);
+                if (app && !seenApps.has(app.get_id())) {
+                    seenApps.add(app.get_id());
+                    iconBox.add_child(app.create_icon_texture(ICON_SIZE));
+                }
+            }
+            if (seenApps.size > 0) card.add_child(iconBox);
+        }
+
+        // Scale pivot at center of card
+        card.set_pivot_point(0.5, 0.5);
+
+        const idx = this._cards.length;
+        this._wireCardEvents(card, thumb, windows, idx);
+
+        card.connect('button-release-event', () => {
+            this._destroyPreview();
+            this._swapToGroup(group);
+            return Clutter.EVENT_STOP;
+        });
+
+        return card;
+    }
 
     _makeAppCard(group) {
         const { app, windows } = group;
-
-        const card = new St.BoxLayout({
-            vertical: true, reactive: true,
-            x_align: Clutter.ActorAlign.CENTER,
-            style: 'padding: 6px 12px;',
-        });
-
-        const thumb = this._makeThumb(windows);
+        const card = this._wrapCard();
+        const thumb = this._makeStackedThumb(windows);
         card.add_child(thumb);
         card._thumb = thumb;
 
         if (app && this._settings.get_boolean('show-app-icons')) {
             const iconBox = new St.BoxLayout({
                 x_align: Clutter.ActorAlign.CENTER,
-                style: 'margin-top: 6px;',
+                style: 'margin-top: 5px;',
             });
             iconBox.add_child(app.create_icon_texture(ICON_SIZE));
             card.add_child(iconBox);
         }
 
-        // Pivot + perspective applied by _resetAllCardScales
-        card.set_pivot_point(0.0, 0.5);
-
-        const idx = this._cards.length; // will be the index after push
+        card.set_pivot_point(0.5, 0.5);
+        const idx = this._cards.length;
         this._wireCardEvents(card, thumb, windows, idx);
 
         card.connect('button-release-event', () => {
             this._destroyPreview();
-            this._activate(group);
+            this._activateApp(group);
             return Clutter.EVENT_STOP;
         });
 
         return card;
     }
 
-    _makeWorkspaceCard(ws, wins, wsIndex, isCurrent) {
-        const card = new St.BoxLayout({
-            vertical: true, reactive: true,
-            x_align: Clutter.ActorAlign.CENTER,
-            style: 'padding: 6px 12px;',
-        });
+    _activateApp(group) {
+        if (this._animating) return;
+        const { windows } = group;
+        if (windows.length === 0) return;
+        for (const win of windows) { if (win.minimized) win.unminimize(); }
+        windows[0].activate(global.get_current_time());
+        if (this._settings.get_boolean('sidebar-auto-hide')) this._scheduleHide();
+        this._scheduleRefresh();
+    }
 
-        const thumb = this._makeThumb(wins);
-        card.add_child(thumb);
-        card._thumb = thumb;
+    _makeStackedThumb(windows) {
+        const n = Math.min(windows.length, MAX_STACK);
+        const totalH = (n - 1) * STACK_H;
+        const totalV = (n - 1) * STACK_V;
+        const container = new St.Widget({ reactive: false });
+        container.set_size(THUMB_W + totalH, THUMB_H + totalV);
 
-        // Label with highlight for current workspace
-        const labelStyle = isCurrent
-            ? 'margin-top: 6px; color: rgba(140,180,255,0.9); font-size: 11px; font-weight: bold;'
-            : 'margin-top: 6px; color: rgba(255,255,255,0.6); font-size: 11px;';
-        const label = new St.Label({
-            text: isCurrent ? `Workspace ${wsIndex + 1} (current)` : `Workspace ${wsIndex + 1}`,
-            x_align: Clutter.ActorAlign.CENTER,
-            style: labelStyle,
-        });
-        card.add_child(label);
+        // Render back → front: back cards fan out to the right
+        for (let i = n - 1; i >= 0; i--) {
+            const win = windows[i];
+            const x = i * STACK_H;    // back cards further right
+            const y = i * STACK_V;    // slight downward offset
+            const isFront = (i === 0);
+            const layerOpacity = isFront ? 255 : Math.max(140, 210 - i * 30);
+            const bgAlpha = isFront ? 0.6 : (0.45 - i * 0.05);
+            const radius = isFront ? 12 : 10;
 
-        if (wins.length > 0) {
-            const count = new St.Label({
-                text: `${wins.length} window${wins.length > 1 ? 's' : ''}`,
-                x_align: Clutter.ActorAlign.CENTER,
-                style: 'color: rgba(255,255,255,0.35); font-size: 10px;',
+            const layer = new St.Widget({
+                reactive: false,
+                style: `border-radius: ${radius}px; background-color: rgba(30,30,34,${bgAlpha});`,
+                opacity: layerOpacity,
             });
-            card.add_child(count);
-        }
+            layer.set_size(THUMB_W, THUMB_H);
+            layer.set_position(x, y);
 
-        card.set_pivot_point(0.0, 0.5);
-
-        const idx = this._cards.length;
-        this._wireCardEvents(card, thumb, wins, idx);
-
-        card.connect('button-release-event', () => {
-            this._destroyPreview();
-            if (!isCurrent) {
-                ws.activate(global.get_current_time());
-            }
-            if (this._settings.get_boolean('sidebar-auto-hide'))
-                this._scheduleHide();
-            this._scheduleRefresh();
-            return Clutter.EVENT_STOP;
-        });
-
-        return card;
-    }
-
-    _makeThumb(windows) {
-        const thumb = new St.Widget({
-            reactive: true,
-            style: 'border-radius: 12px; background-color: rgba(30,30,34,0.55);',
-        });
-
-        let hasClone = false;
-        const visibleWin = windows.find(w => !w.minimized && w.get_compositor_private());
-        if (visibleWin) {
-            const actor = visibleWin.get_compositor_private();
+            const actor = win.get_compositor_private?.();
             if (actor) {
                 try {
                     const clone = new Clutter.Clone({
-                        source: actor,
-                        width: THUMB_W,
-                        height: THUMB_H,
+                        source: actor, reactive: false,
+                        width: THUMB_W, height: THUMB_H,
                     });
-                    thumb.add_child(clone);
-                    hasClone = true;
-                } catch (_e) { /* disposed */ }
+                    layer.add_child(clone);
+                } catch (_) { this._addIconFallback(layer, win); }
+            } else {
+                this._addIconFallback(layer, win);
             }
+
+            container.add_child(layer);
         }
 
-        if (!hasClone) {
-            const tracker = Shell.WindowTracker.get_default();
-            const win = windows[0];
-            const app = win ? tracker.get_window_app(win) : null;
-            if (app) {
-                const icon = app.create_icon_texture(48);
-                icon.set_position((THUMB_W - 48) / 2, (THUMB_H - 48) / 2);
-                thumb.add_child(icon);
-            }
-            thumb.set_size(THUMB_W, THUMB_H);
+        const children = container.get_children();
+        container._frontLayer = children.length > 0 ? children[children.length - 1] : null;
+
+        // Count badge — bottom-left of front layer
+        if (windows.length > 1 && this._settings.get_boolean('show-group-count')) {
+            const badge = new St.Label({
+                text: `${windows.length}`,
+                style: 'background-color: rgba(100,120,220,0.85); color: white; ' +
+                       'border-radius: 9px; padding: 1px 7px; font-size: 10px; font-weight: bold;',
+                reactive: false,
+            });
+            badge.set_position(4, THUMB_H - 20);
+            container.add_child(badge);
         }
 
-        return thumb;
+        return container;
     }
 
-    // ── Bell curve scaling ──
+    _addIconFallback(layer, win) {
+        const tracker = Shell.WindowTracker.get_default();
+        const app = tracker.get_window_app(win);
+        if (app) {
+            const icon = app.create_icon_texture(48);
+            icon.set_position((THUMB_W - 48) / 2, (THUMB_H - 48) / 2);
+            layer.add_child(icon);
+        }
+    }
+
+    _makeWorkspaceCard(ws, wins, wsIndex, isCurrent) {
+        const card = this._wrapCard();
+        const thumb = this._makeStackedThumb(wins);
+        card.add_child(thumb);
+        card._thumb = thumb;
+
+        const labelStyle = isCurrent
+            ? 'margin-top: 6px; color: rgba(140,180,255,0.9); font-size: 11px; font-weight: bold;'
+            : 'margin-top: 6px; color: rgba(255,255,255,0.6); font-size: 11px;';
+        card.add_child(new St.Label({
+            text: isCurrent ? `Workspace ${wsIndex + 1} (current)` : `Workspace ${wsIndex + 1}`,
+            x_align: Clutter.ActorAlign.CENTER, style: labelStyle,
+        }));
+        if (wins.length > 0) {
+            card.add_child(new St.Label({
+                text: `${wins.length} window${wins.length > 1 ? 's' : ''}`,
+                x_align: Clutter.ActorAlign.CENTER,
+                style: 'color: rgba(255,255,255,0.35); font-size: 10px;',
+            }));
+        }
+
+        card.set_pivot_point(0.5, 0.5);
+        const idx = this._cards.length;
+        this._wireCardEvents(card, thumb, wins, idx);
+        card.connect('button-release-event', () => {
+            this._destroyPreview();
+            if (!isCurrent) ws.activate(global.get_current_time());
+            if (this._settings.get_boolean('sidebar-auto-hide')) this._scheduleHide();
+            this._scheduleRefresh();
+            return Clutter.EVENT_STOP;
+        });
+        return card;
+    }
+
+    // ── Bell curve scaling ──────────────────────────────────────────────
 
     /**
-     * Reset all cards to their resting state: small + perspective.
+     * Reset all cards to resting state.
+     * Scale + opacity on card, perspective rotation on THUMB only.
      */
     _resetAllCardScales() {
         const base = this._BASE_SCALE;
@@ -596,14 +887,20 @@ class StageSidebar {
         for (const card of this._cards) {
             card.remove_all_transitions();
             card.set_scale(base, base);
-            card.rotation_angle_y = angle;
             card.set_opacity(190);
+            // Perspective on thumb — consistent direction for all cards
+            const thumb = card._thumb;
+            if (thumb) {
+                thumb.remove_all_transitions();
+                thumb.rotation_angle_y = angle;
+            }
         }
     }
 
     /**
-     * Apply bell curve scaling: hovered card is full size,
-     * neighbors scale down smoothly based on distance.
+     * Bell curve: hovered card scales to 1.0 and thumb goes flat.
+     * Only 1-2 neighbors are affected (tight sigma).
+     * Scale/opacity on card, perspective on thumb.
      */
     _applyBellCurve(hoveredIdx) {
         const base = this._BASE_SCALE;
@@ -612,24 +909,30 @@ class StageSidebar {
         for (let i = 0; i < this._cards.length; i++) {
             const dist = Math.abs(i - hoveredIdx);
             const factor = _bellCurve(dist, BELL_SIGMA);
-            // Scale: base + (1-base) * factor → ranges from base to 1.0
             const s = base + (1.0 - base) * factor;
-            // Perspective: full angle at dist=far, 0 at hovered
-            const rot = angle * (1.0 - factor);
-            // Opacity: 190 at far, 255 at hovered
             const op = Math.round(190 + 65 * factor);
+            // Thumb perspective: hovered = flat, far = full angle
+            const rot = angle * (1.0 - factor);
 
             this._cards[i].ease({
                 scale_x: s, scale_y: s,
-                rotation_angle_y: rot,
                 opacity: op,
                 duration: 180,
                 mode: Clutter.AnimationMode.EASE_OUT_QUAD,
             });
+
+            const thumb = this._cards[i]._thumb;
+            if (thumb) {
+                thumb.ease({
+                    rotation_angle_y: rot,
+                    duration: 180,
+                    mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+                });
+            }
         }
     }
 
-    // ── Card events ──
+    // ── Card events ─────────────────────────────────────────────────────
 
     _wireCardEvents(card, thumb, windows, cardIdx) {
         card.connect('enter-event', () => {
@@ -637,13 +940,23 @@ class StageSidebar {
             this._kill('_hideTimer');
             this._hoveredIdx = cardIdx;
 
-            // Bell curve scale all cards
             this._applyBellCurve(cardIdx);
 
-            // Glow on hovered thumb
-            thumb.set_style('border-radius: 12px; background-color: rgba(50,50,58,0.75); box-shadow: 0 4px 20px rgba(120,140,255,0.18);');
+            // Glow on front layer
+            const front = thumb._frontLayer;
+            if (front) {
+                front.set_style(
+                    'border-radius: 12px; background-color: rgba(50,50,58,0.75); ' +
+                    'box-shadow: 0 4px 20px rgba(120,140,255,0.18);'
+                );
+            }
+            // Highlight card pill
+            card.set_style(
+                'padding: 8px 14px; border-radius: 16px; ' +
+                'background-color: rgba(45,45,55,0.7);'
+            );
 
-            // Preview
+            // Preview after short delay
             this._kill('_hoverTimer');
             this._hoverTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 220, () => {
                 this._hoverTimer = null;
@@ -654,58 +967,175 @@ class StageSidebar {
 
         card.connect('leave-event', () => {
             this._hoveredIdx = -1;
-            // Return all cards to resting scale
+
+            // Reset all cards
             const base = this._BASE_SCALE;
             const angle = this._PERSP_ANGLE;
             for (const c of this._cards) {
                 c.ease({
                     scale_x: base, scale_y: base,
-                    rotation_angle_y: angle,
                     opacity: 190,
                     duration: 200,
                     mode: Clutter.AnimationMode.EASE_OUT_QUAD,
                 });
+                const t = c._thumb;
+                if (t) {
+                    t.ease({
+                        rotation_angle_y: angle,
+                        duration: 200,
+                        mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+                    });
+                }
             }
-            thumb.set_style('border-radius: 12px; background-color: rgba(30,30,34,0.55);');
+
+            // Remove glow
+            const front = thumb._frontLayer;
+            if (front) {
+                front.set_style('border-radius: 12px; background-color: rgba(30,30,34,0.6);');
+            }
+            // Reset card pill
+            card.set_style(
+                'padding: 8px 14px; border-radius: 16px; ' +
+                'background-color: rgba(28,28,34,0.55);'
+            );
+
             this._kill('_hoverTimer');
             this._destroyPreview();
         });
     }
 
-    // ── Preview ──
+    // ── Preview ─────────────────────────────────────────────────────────
 
+    /**
+     * Show a larger preview showing ALL windows in the group, tiled vertically.
+     * Falls back to icon grid if no compositor actors available.
+     */
     _showPreview(card, windows) {
         this._destroyPreview();
-        const win = windows.find(w => !w.minimized && w.get_compositor_private());
-        if (!win) return;
-
-        const actor = win.get_compositor_private();
-        if (!actor) return;
-        const rect = win.get_frame_rect();
-        if (rect.width === 0) return;
 
         const mon = Main.layoutManager.primaryMonitor;
-        const maxW = Math.min(mon.width * 0.3, 480);
-        const maxH = Math.min(mon.height * 0.35, 360);
-        const s = Math.min(maxW / rect.width, maxH / rect.height, 1.0);
-        const pw = rect.width * s, ph = rect.height * s;
-
-        let clone;
-        try { clone = new Clutter.Clone({ source: actor, width: pw, height: ph }); } catch (_) { return; }
-
         const topH = Main.panel ? Main.panel.height : 0;
         let [, cardY] = [0, 0];
         try { [, cardY] = card.get_transformed_position(); } catch (_) { return; }
-        let py = Math.max(mon.y + topH + 8, Math.min(cardY, mon.y + mon.height - ph - 20));
+
+        // Collect windows that have compositor actors (cloneable)
+        const cloneable = windows.filter(w => {
+            try { return !!w.get_compositor_private(); } catch (_) { return false; }
+        });
+
+        if (cloneable.length === 0) {
+            this._showIconPreview(windows, cardY);
+            return;
+        }
+
+        // Layout: tile all windows vertically
+        const maxPreviewW = Math.min(mon.width * 0.32, 500);
+        const padding = 8;
+        const gap = 6;
+        const maxPerWin = cloneable.length;
+        const clones = [];
+        let maxCloneW = 0;
+        let totalH = padding * 2;
+
+        for (const w of cloneable.slice(0, 4)) {
+            const actor = w.get_compositor_private();
+            if (!actor) continue;
+            const rect = w.get_frame_rect();
+            if (rect.width === 0) continue;
+
+            const maxWinH = (mon.height * 0.45 - padding * 2 - gap * (Math.min(maxPerWin, 4) - 1)) / Math.min(maxPerWin, 4);
+            const s = Math.min((maxPreviewW - padding * 2) / rect.width, maxWinH / rect.height, 1.0);
+            const cw = rect.width * s;
+            const ch = rect.height * s;
+
+            try {
+                const clone = new Clutter.Clone({ source: actor, width: cw, height: ch });
+                clones.push({ clone, w: cw, h: ch });
+                totalH += ch + gap;
+                maxCloneW = Math.max(maxCloneW, cw);
+            } catch (_) { /* skip */ }
+        }
+
+        if (clones.length === 0) {
+            this._showIconPreview(windows, cardY);
+            return;
+        }
+
+        totalH -= gap; // remove trailing gap
+        const previewW = maxCloneW + padding * 2;
+        const previewH = totalH;
+
+        let py = Math.max(mon.y + topH + 8, Math.min(cardY, mon.y + mon.height - previewH - 20));
 
         this._preview = new St.Widget({
             style: 'background-color: rgba(22,22,26,0.94); border-radius: 14px; box-shadow: 0 8px 32px rgba(0,0,0,0.55);',
             reactive: false,
         });
-        this._preview.set_size(pw + 12, ph + 12);
+        this._preview.set_size(previewW, previewH);
         this._preview.set_position(mon.x + this._PANEL_W + 8, py);
-        clone.set_position(6, 6);
-        this._preview.add_child(clone);
+
+        let yOff = padding;
+        for (const { clone, w, h } of clones) {
+            clone.set_position(padding + (maxCloneW - w) / 2, yOff);
+            this._preview.add_child(clone);
+            yOff += h + gap;
+        }
+
+        Main.layoutManager.addChrome(this._preview, { affectsInputRegion: false, trackFullscreen: false });
+        this._preview.set_opacity(0);
+        this._preview.ease({ opacity: 255, duration: 150, mode: Clutter.AnimationMode.EASE_OUT_QUAD });
+    }
+
+    /**
+     * Fallback preview: app icons + names when clones aren't available.
+     */
+    _showIconPreview(windows, cardY) {
+        const tracker = Shell.WindowTracker.get_default();
+        const mon = Main.layoutManager.primaryMonitor;
+        const topH = Main.panel ? Main.panel.height : 0;
+
+        const previewW = 220;
+        const previewH = 160;
+
+        this._preview = new St.Widget({
+            style: 'background-color: rgba(22,22,26,0.94); border-radius: 14px; box-shadow: 0 8px 32px rgba(0,0,0,0.55);',
+            reactive: false,
+        });
+        this._preview.set_size(previewW, previewH);
+        let py = Math.max(mon.y + topH + 8, Math.min(cardY, mon.y + mon.height - previewH - 20));
+        this._preview.set_position(mon.x + this._PANEL_W + 8, py);
+
+        const seenApps = new Map();
+        for (const w of windows) {
+            const app = tracker.get_window_app(w);
+            if (app && !seenApps.has(app.get_id())) seenApps.set(app.get_id(), app);
+        }
+
+        let yOff = 14;
+        const names = [...seenApps.values()].map(a => a.get_name()).join(', ');
+        const title = new St.Label({
+            text: names || 'Application',
+            style: 'color: rgba(255,255,255,0.85); font-size: 12px; font-weight: bold;',
+        });
+        title.set_position(14, yOff);
+        title.set_width(previewW - 28);
+        this._preview.add_child(title);
+        yOff += 28;
+
+        let xOff = 14;
+        for (const [, app] of seenApps) {
+            const icon = app.create_icon_texture(48);
+            icon.set_position(xOff, yOff);
+            this._preview.add_child(icon);
+            xOff += 56;
+            if (xOff + 48 > previewW) { xOff = 14; yOff += 56; }
+        }
+
+        this._preview.add_child(new St.Label({
+            text: `${windows.length} window${windows.length > 1 ? 's' : ''} (minimized)`,
+            style: 'color: rgba(255,255,255,0.4); font-size: 10px;',
+            x: 14, y: previewH - 24,
+        }));
 
         Main.layoutManager.addChrome(this._preview, { affectsInputRegion: false, trackFullscreen: false });
         this._preview.set_opacity(0);
@@ -721,23 +1151,6 @@ class StageSidebar {
             } catch (_) { /* */ }
             this._preview = null;
         }
-    }
-
-    // ── Activate ──
-
-    _activate(group) {
-        if (this._animating) return;
-        const { windows } = group;
-        if (windows.length === 0) return;
-
-        for (const win of windows) {
-            if (win.minimized) win.unminimize();
-        }
-        windows[0].activate(global.get_current_time());
-
-        if (this._settings.get_boolean('sidebar-auto-hide'))
-            this._scheduleHide();
-        this._scheduleRefresh();
     }
 
     // ── Util ──

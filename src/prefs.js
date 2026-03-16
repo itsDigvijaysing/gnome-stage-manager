@@ -49,22 +49,24 @@ export default class StageManagerPreferences extends ExtensionPreferences {
         settings.bind('enable-stage-sidebar', sideSwitch, 'active', Gio.SettingsBindFlags.DEFAULT);
         sideGroup.add(sideSwitch);
 
-        // Sidebar mode
+        // Sidebar mode — 3 options
         const modeRow = new Adw.ActionRow({
             title: 'Sidebar Content',
-            subtitle: 'What to show in the sidebar cards',
+            subtitle: 'Groups = Stage Manager (swap), Apps = per-app (focus), Workspaces',
         });
+        const modeKeys = ['groups', 'apps', 'workspaces'];
+        const modeLabels = ['Groups (Stage Manager)', 'Apps (per-app focus)', 'Workspaces'];
         const modeDropdown = new Gtk.DropDown({
-            model: Gtk.StringList.new(['Apps (current workspace)', 'Workspaces']),
+            model: Gtk.StringList.new(modeLabels),
             valign: Gtk.Align.CENTER,
         });
         // Sync setting → dropdown
         const modeVal = settings.get_string('sidebar-mode');
-        modeDropdown.set_selected(modeVal === 'workspaces' ? 1 : 0);
+        modeDropdown.set_selected(Math.max(0, modeKeys.indexOf(modeVal)));
         // Sync dropdown → setting
         modeDropdown.connect('notify::selected', () => {
             const sel = modeDropdown.get_selected();
-            settings.set_string('sidebar-mode', sel === 1 ? 'workspaces' : 'apps');
+            settings.set_string('sidebar-mode', modeKeys[sel] || 'groups');
         });
         modeRow.add_suffix(modeDropdown);
         sideGroup.add(modeRow);
@@ -82,6 +84,13 @@ export default class StageManagerPreferences extends ExtensionPreferences {
         });
         settings.bind('show-app-icons', iconSwitch, 'active', Gio.SettingsBindFlags.DEFAULT);
         sideGroup.add(iconSwitch);
+
+        const groupCountSwitch = new Adw.SwitchRow({
+            title: 'Show Window Count Badge',
+            subtitle: 'Show number of windows on group thumbnails',
+        });
+        settings.bind('show-group-count', groupCountSwitch, 'active', Gio.SettingsBindFlags.DEFAULT);
+        sideGroup.add(groupCountSwitch);
 
         const showCurrentWsSwitch = new Adw.SwitchRow({
             title: 'Show Current Workspace',

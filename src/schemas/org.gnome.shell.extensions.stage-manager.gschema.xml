@@ -4,7 +4,7 @@
             path="/org/gnome/shell/extensions/stage-manager/">
 
         <key name="enable-maximize-to-workspace" type="b">
-            <default>true</default>
+            <default>false</default>
             <summary>Enable Maximize to Workspace</summary>
             <description>When a window is maximized, automatically move it to a new workspace. When unmaximized, return it to the previous workspace.</description>
         </key>
@@ -56,9 +56,9 @@
         </key>
 
         <key name="sidebar-mode" type="s">
-            <default>'apps'</default>
+            <default>'groups'</default>
             <summary>Sidebar Mode</summary>
-            <description>What to show in sidebar cards. 'apps' = inactive apps on current workspace. 'workspaces' = other workspaces.</description>
+            <description>What to show in sidebar cards. 'groups' = stage manager (swap groups), 'apps' = per-app (just focus), 'workspaces' = other workspaces.</description>
         </key>
 
         <key name="card-base-scale" type="i">
@@ -73,6 +73,12 @@
             <range min="0" max="45"/>
             <summary>Perspective Angle</summary>
             <description>Y-axis rotation in degrees for the 3D perspective effect on cards.</description>
+        </key>
+
+        <key name="show-group-count" type="b">
+            <default>true</default>
+            <summary>Show Group Window Count</summary>
+            <description>Show a window count badge on thumbnails when a group has multiple windows.</description>
         </key>
 
         <key name="show-workspace-current" type="b">
