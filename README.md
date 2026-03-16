@@ -29,9 +29,8 @@ Group windows into stages — only one group is visible at a time, others appear
 ## Screenshots
 
 <!-- Add your screenshots here -->
-![Sidebar with Multiple Groups](assets/sidebar.png)
-![Live Preview on Hover](assets/sidebar_only.png)
-<!-- ![Screenshot 2](assets/screenshot2.png) -->
+<!-- ![Sidebar with Multiple Groups](assets/sidebar.png)
+![Live Preview on Hover](assets/sidebar_only.png) -->
 
 ## Requirements
 
