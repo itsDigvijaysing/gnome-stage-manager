@@ -1,10 +1,8 @@
 {
     "name": "Stage Manager",
-    "description": "macOS Stage Manager-like window management for GNOME. Inactive windows appear as stacked thumbnail cards in a left-side strip. Switch stages with smooth animations.",
+    "description": "macOS Stage Manager-like window management for GNOME. Group windows into stages — only one group is visible at a time, others appear as stacked thumbnail cards in a left sidebar. Click a card to swap stages. Supports per-app mode, workspace mode, bell-curve hover animations, and 3D perspective.",
     "uuid": "stage-manager@gnome-stage-manager",
-    "url": "https://github.com/gnome-stage-manager/gnome-stage-manager",
+    "url": "https://github.com/itsdigvijaysing/gnome-stage-manager",
     "shell-version": ["45", "46", "47", "48"],
-    "version": 1,
-    "session-modes": ["user"],
     "settings-schema": "org.gnome.shell.extensions.stage-manager"
 }
