@@ -74,9 +74,7 @@ require it.)
   release. Date format: RFC 5322 (`Wed, 13 May 2026 ...`).
 - `debian/control`: replace placeholder `Maintainer:
   Stage Manager Contributors <stage-manager@example.com>` with
-  `Digvijaysing <lightspeakai@gmail.com>` (per the GitHub repo owner
-  `itsdigvijaysing` and the user email on file). If the user prefers a
-  different address, this is a one-line edit at implementation time.
+  `Digvijaysing <itsdigvijaysing@gmail.com>`.
 
 ## Section 2 — Bug: return-on-unmaximize
 
