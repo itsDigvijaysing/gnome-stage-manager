@@ -3,6 +3,7 @@
  */
 
 import Adw from 'gi://Adw';
+import Gdk from 'gi://Gdk';
 import Gio from 'gi://Gio';
 import Gtk from 'gi://Gtk';
 import GLib from 'gi://GLib';
@@ -99,6 +100,16 @@ export default class StageManagerPreferences extends ExtensionPreferences {
         settings.bind('show-workspace-current', showCurrentWsSwitch, 'active', Gio.SettingsBindFlags.DEFAULT);
         sideGroup.add(showCurrentWsSwitch);
 
+        // Shortcuts
+        const shortcutGroup = new Adw.PreferencesGroup({
+            title: 'Shortcuts',
+            description: 'Keyboard shortcuts for the sidebar (none set by default)',
+        });
+        behaviorPage.add(shortcutGroup);
+
+        this._addShortcutRow(shortcutGroup, settings, 'toggle-sidebar',
+            'Toggle Sidebar', 'Show or hide the stage sidebar');
+
         // ── Appearance Page ──
         const lookPage = new Adw.PreferencesPage({
             title: 'Appearance',
@@ -142,7 +153,7 @@ export default class StageManagerPreferences extends ExtensionPreferences {
 
         const versionRow = new Adw.ActionRow({
             title: 'Version',
-            subtitle: '1.0.0',
+            subtitle: this.metadata['version-name'] || '1.3.0',
         });
         infoGroup.add(versionRow);
 
@@ -225,6 +236,80 @@ export default class StageManagerPreferences extends ExtensionPreferences {
         settings.bind(key, spin, 'value', Gio.SettingsBindFlags.DEFAULT);
         row.add_suffix(spin);
         group.add(row);
+    }
+
+    _addShortcutRow(group, settings, key, title, subtitle) {
+        const row = new Adw.ActionRow({ title, subtitle });
+
+        const label = new Gtk.ShortcutLabel({
+            disabled_text: 'Disabled',
+            valign: Gtk.Align.CENTER,
+        });
+        const refreshLabel = () => {
+            const accels = settings.get_strv(key);
+            label.set_accelerator(accels.length > 0 ? accels[0] : '');
+        };
+        refreshLabel();
+        const settingsId = settings.connect(`changed::${key}`, refreshLabel);
+        row.connect('destroy', () => settings.disconnect(settingsId));
+
+        const setBtn = new Gtk.Button({
+            label: 'Set',
+            valign: Gtk.Align.CENTER,
+        });
+        setBtn.connect('clicked', () => this._captureShortcut(setBtn.get_root(), settings, key));
+
+        const clearBtn = new Gtk.Button({
+            icon_name: 'edit-clear-symbolic',
+            valign: Gtk.Align.CENTER,
+            tooltip_text: 'Clear shortcut',
+        });
+        clearBtn.connect('clicked', () => settings.set_strv(key, []));
+
+        row.add_suffix(label);
+        row.add_suffix(setBtn);
+        row.add_suffix(clearBtn);
+        group.add(row);
+    }
+
+    _captureShortcut(parent, settings, key) {
+        const dialog = new Adw.MessageDialog({
+            transient_for: parent,
+            modal: true,
+            heading: 'Press shortcut',
+            body: 'Press the key combination you want to use, or Escape to cancel.',
+        });
+        dialog.add_response('cancel', 'Cancel');
+
+        const controller = new Gtk.EventControllerKey();
+        controller.connect('key-pressed', (_c, keyval, _kc, state) => {
+            // Ignore modifier-only presses.
+            if (this._isModifierKey(keyval)) return Gdk.EVENT_PROPAGATE;
+
+            const mask = state & Gtk.accelerator_get_default_mod_mask();
+            if (keyval === Gdk.KEY_Escape && mask === 0) {
+                dialog.close();
+                return Gdk.EVENT_STOP;
+            }
+
+            const accel = Gtk.accelerator_name(keyval, mask);
+            if (accel && accel.length > 0) {
+                settings.set_strv(key, [accel]);
+                dialog.close();
+            }
+            return Gdk.EVENT_STOP;
+        });
+        dialog.add_controller(controller);
+        dialog.present();
+    }
+
+    _isModifierKey(keyval) {
+        return keyval === Gdk.KEY_Control_L || keyval === Gdk.KEY_Control_R ||
+               keyval === Gdk.KEY_Shift_L   || keyval === Gdk.KEY_Shift_R   ||
+               keyval === Gdk.KEY_Alt_L     || keyval === Gdk.KEY_Alt_R     ||
+               keyval === Gdk.KEY_Super_L   || keyval === Gdk.KEY_Super_R   ||
+               keyval === Gdk.KEY_Meta_L    || keyval === Gdk.KEY_Meta_R    ||
+               keyval === Gdk.KEY_Hyper_L   || keyval === Gdk.KEY_Hyper_R;
     }
 
     _getGnomeVersion() {

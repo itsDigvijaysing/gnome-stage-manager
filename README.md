@@ -34,7 +34,7 @@ Group windows into stages — only one group is visible at a time, others appear
 
 ## Requirements
 
-- GNOME Shell 45, 46, 47, or 48
+- GNOME Shell 45 through 50 (Ubuntu 26.04 LTS supported)
 - Wayland or X11
 
 ## Installation

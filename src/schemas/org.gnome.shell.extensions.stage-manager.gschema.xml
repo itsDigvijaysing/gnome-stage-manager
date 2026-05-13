@@ -87,5 +87,11 @@
             <description>In workspace mode, also show the current workspace card in the sidebar.</description>
         </key>
 
+        <key name="toggle-sidebar" type="as">
+            <default>[]</default>
+            <summary>Toggle Sidebar Shortcut</summary>
+            <description>Keyboard shortcut to toggle the stage sidebar visibility. Empty array means no shortcut is bound.</description>
+        </key>
+
     </schema>
 </schemalist>
