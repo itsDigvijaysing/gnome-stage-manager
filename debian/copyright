@@ -1,10 +1,10 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: gnome-shell-extension-stage-manager
-Upstream-Contact: stage-manager@example.com
-Source: https://github.com/gnome-stage-manager/gnome-stage-manager
+Upstream-Contact: itsdigvijaysing@gmail.com
+Source: https://github.com/itsdigvijaysing/gnome-stage-manager
 
 Files: *
-Copyright: 2026 Stage Manager Contributors
+Copyright: 2026 Digvijaysing
 License: GPL-3.0+
 
 License: GPL-3.0+

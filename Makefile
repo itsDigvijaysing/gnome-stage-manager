@@ -28,12 +28,15 @@ uninstall:
 	@rm -rf $(EXTENSION_DIR)
 	@echo "Extension uninstalled."
 
-# Create a distributable zip for GNOME Extensions Store
-# NOTE: compiled schemas MUST be included — GNOME Shell loads them at runtime
-pack: build
+# Create a distributable zip for GNOME Extensions Store (extensions.gnome.org).
+# NOTE: per EGO-P-006, compiled schemas MUST NOT be shipped for shell-version
+# 45+ — GNOME Shell compiles them at install time. The pack target therefore
+# does NOT depend on `build`, and excludes any *.compiled files defensively.
+pack:
 	@mkdir -p $(DIST_DIR)
+	@rm -f $(PACK_FILE)
 	@cd $(SRC_DIR) && zip -r ../$(PACK_FILE) . \
-		-x "__pycache__/*"
+		-x "__pycache__/*" "schemas/*.compiled" "*.compiled"
 	@echo "Extension packed: $(PACK_FILE)"
 
 # Clean build artifacts
