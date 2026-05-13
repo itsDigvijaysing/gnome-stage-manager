@@ -199,7 +199,6 @@ class StageSidebar {
     constructor(settings) {
         this._settings = settings;
         this._sigs = [];        // persistent signals (cleared in disable)
-        this._setSigs = [];     // GSettings signals (disconnected on settings in disable)
         this._cardSigs = [];    // per-card signals (cleared each refresh)
         this._cards = [];
         this._panel = null;
@@ -269,15 +268,14 @@ class StageSidebar {
     disable() {
         // Timers first — must run before any actor destroy so timer callbacks
         // can't fire against half-destroyed state.
-        this._kill('_refreshTimer');
-        this._kill('_hideTimer');
-        this._kill('_hoverTimer');
-        this._kill('_swapTimer');
+        this._killRefreshTimer();
+        this._killHideTimer();
+        this._killHoverTimer();
+        this._killSwapTimer();
         // Keybinding before signals so the wm doesn't keep a stale handler.
         this._removeKeybinding();
         // Signals next — disconnect everything we connected (EGO-L-003).
         this._sigs.splice(0).forEach(s => { try { s.o.disconnect(s.i); } catch (_) { /* actor gone */ } });
-        this._setSigs.splice(0).forEach(id => { try { this._settings.disconnect(id); } catch (_) { /* */ } });
         this._disconnectCardSigs();
         // Then preview + card content (cards live inside _box).
         this._destroyPreview();
@@ -377,7 +375,7 @@ class StageSidebar {
 
         this._sig(this._panel, 'enter-event', () => {
             this._hovered = true;
-            this._kill('_hideTimer');
+            this._killHideTimer();
         });
         this._sig(this._panel, 'leave-event', () => {
             this._hovered = false;
@@ -475,31 +473,31 @@ class StageSidebar {
             });
         } catch (_) { /* color_scheme not available — older shell */ }
 
-        this._setSigs.push(this._settings.connect('changed::enable-stage-sidebar', () => {
+        sig(this._settings, 'changed::enable-stage-sidebar', () => {
             if (!this._settings.get_boolean('enable-stage-sidebar') && this._visible) this._hide();
-        }));
-        this._setSigs.push(this._settings.connect('changed::sidebar-mode', () => {
+        });
+        sig(this._settings, 'changed::sidebar-mode', () => {
             if (this._visible) this._refresh();
-        }));
-        this._setSigs.push(this._settings.connect('changed::sidebar-auto-hide', () => {
+        });
+        sig(this._settings, 'changed::sidebar-auto-hide', () => {
             if (this._settings.get_boolean('sidebar-auto-hide')) {
                 if (!this._hovered) this._scheduleHide();
             } else {
                 this._show();
             }
-        }));
-        this._setSigs.push(this._settings.connect('changed::show-app-icons', () => {
+        });
+        sig(this._settings, 'changed::show-app-icons', () => {
             if (this._visible) this._refresh();
-        }));
-        this._setSigs.push(this._settings.connect('changed::show-group-count', () => {
+        });
+        sig(this._settings, 'changed::show-group-count', () => {
             if (this._visible) this._refresh();
-        }));
-        this._setSigs.push(this._settings.connect('changed::card-base-scale', () => {
+        });
+        sig(this._settings, 'changed::card-base-scale', () => {
             if (this._visible) this._refresh();
-        }));
-        this._setSigs.push(this._settings.connect('changed::perspective-angle', () => {
+        });
+        sig(this._settings, 'changed::perspective-angle', () => {
             if (this._visible) this._refresh();
-        }));
+        });
     }
 
     // ── Group management (for 'groups' mode) ─────────────────────────────
@@ -640,7 +638,7 @@ class StageSidebar {
 
         this._activeGroupId = targetGroup.id;
 
-        this._kill('_swapTimer');
+        this._killSwapTimer();
         this._swapTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 400, () => {
             this._swapTimer = null;
             this._swapping = false;
@@ -648,7 +646,7 @@ class StageSidebar {
         });
 
         this._hovered = false;
-        this._kill('_refreshTimer');
+        this._killRefreshTimer();
         this._refreshTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 120, () => {
             this._refreshTimer = null;
             if (this._visible) this._refresh();
@@ -719,7 +717,7 @@ class StageSidebar {
 
         this._visible = true;
         this._animating = true;
-        this._kill('_hideTimer');
+        this._killHideTimer();
         this._refresh();
 
         this._panel.remove_all_transitions();
@@ -748,7 +746,7 @@ class StageSidebar {
     }
 
     _scheduleHide() {
-        this._kill('_hideTimer');
+        this._killHideTimer();
         this._hideTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, this._HIDE_DELAY_MS, () => {
             this._hideTimer = null;
             if (!this._hovered) this._hide();
@@ -759,7 +757,10 @@ class StageSidebar {
     _scheduleRefresh() {
         // EGO-L-007: must remove any in-flight timer before re-arming the same field.
         // Behaviour is debounce — each call resets the 200ms window.
-        this._kill('_refreshTimer');
+        // The remove is inlined here (not via _killRefreshTimer) because shexli's
+        // EGO-L-007 check looks for GLib.source_remove textually adjacent to the
+        // re-arm; the helper-method form trips a false positive at this site.
+        if (this._refreshTimer) { GLib.source_remove(this._refreshTimer); this._refreshTimer = null; }
         this._refreshTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 200, () => {
             this._refreshTimer = null;
             if (this._visible && !this._hovered) this._refresh();
@@ -1141,7 +1142,7 @@ class StageSidebar {
     _wireCardEvents(card, thumb, windows, cardIdx) {
         this._cardSig(card, 'enter-event', () => {
             this._hovered = true;
-            this._kill('_hideTimer');
+            this._killHideTimer();
             this._hoveredIdx = cardIdx;
 
             this._applyBellCurve(cardIdx);
@@ -1154,7 +1155,7 @@ class StageSidebar {
             card.set_style_class_name(this._cls('stage-card', 'stage-card-hover'));
 
             // Preview after short delay
-            this._kill('_hoverTimer');
+            this._killHoverTimer();
             this._hoverTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 220, () => {
                 this._hoverTimer = null;
                 this._showPreview(card, windows);
@@ -1191,7 +1192,7 @@ class StageSidebar {
                 front.set_style_class_name(this._cls('stage-thumb-layer'));
             card.set_style_class_name(this._cls('stage-card'));
 
-            this._kill('_hoverTimer');
+            this._killHoverTimer();
             this._destroyPreview();
         });
     }
@@ -1349,9 +1350,25 @@ class StageSidebar {
     }
 
     // ── Util ──
+    // Per-timer kill helpers — each names its field explicitly so shexli
+    // (EGO-L-004) can statically trace GLib.source_remove(this._fooTimer).
+    // A single dynamic _kill(name) helper would be functionally identical
+    // but the static analyser cannot follow dynamic property access.
 
-    _kill(name) {
-        if (this[name]) { GLib.source_remove(this[name]); this[name] = null; }
+    _killRefreshTimer() {
+        if (this._refreshTimer) { GLib.source_remove(this._refreshTimer); this._refreshTimer = null; }
+    }
+
+    _killHideTimer() {
+        if (this._hideTimer) { GLib.source_remove(this._hideTimer); this._hideTimer = null; }
+    }
+
+    _killHoverTimer() {
+        if (this._hoverTimer) { GLib.source_remove(this._hoverTimer); this._hoverTimer = null; }
+    }
+
+    _killSwapTimer() {
+        if (this._swapTimer) { GLib.source_remove(this._swapTimer); this._swapTimer = null; }
     }
 }
 
