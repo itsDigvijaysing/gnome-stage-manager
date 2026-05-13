@@ -323,7 +323,7 @@ class StageSidebar {
         });
         this._edge.set_size(edgeW, panelH);
         this._edge.set_position(mon.x, mon.y + topH);
-        Main.layoutManager.addChrome(this._edge, { affectsInputRegion: true, trackFullscreen: false });
+        Main.layoutManager.addChrome(this._edge, { trackFullscreen: false });
         this._sig(this._edge, 'enter-event', () => {
             if (!this._fullscreen()) this._show();
         });
@@ -336,7 +336,7 @@ class StageSidebar {
         this._panel.set_size(panelW, panelH);
         this._panel.set_position(mon.x - panelW, mon.y + topH);
         this._visible = false;
-        Main.layoutManager.addChrome(this._panel, { affectsInputRegion: true, trackFullscreen: false });
+        Main.layoutManager.addChrome(this._panel, { trackFullscreen: false });
 
         // ScrollView → BoxLayout
         this._scroll = new St.ScrollView({
@@ -1273,7 +1273,7 @@ class StageSidebar {
             yOff += h + gap;
         }
 
-        Main.layoutManager.addChrome(this._preview, { affectsInputRegion: false, trackFullscreen: false });
+        Main.layoutManager.addChrome(this._preview, { trackFullscreen: false });
         this._preview.set_opacity(0);
         this._preview.ease({ opacity: 255, duration: 150, mode: Clutter.AnimationMode.EASE_OUT_QUAD });
     }
@@ -1332,7 +1332,7 @@ class StageSidebar {
             x: 14 * sf, y: previewH - 24 * sf,
         }));
 
-        Main.layoutManager.addChrome(this._preview, { affectsInputRegion: false, trackFullscreen: false });
+        Main.layoutManager.addChrome(this._preview, { trackFullscreen: false });
         this._preview.set_opacity(0);
         this._preview.ease({ opacity: 255, duration: 150, mode: Clutter.AnimationMode.EASE_OUT_QUAD });
     }

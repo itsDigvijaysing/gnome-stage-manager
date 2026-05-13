@@ -4,3 +4,4 @@ src/schemas/*.compiled
 .builddir/
 node_modules/
 .eslintcache
+CLAUDE.md
