@@ -6,9 +6,9 @@ import Adw from 'gi://Adw';
 import Gdk from 'gi://Gdk';
 import Gio from 'gi://Gio';
 import Gtk from 'gi://Gtk';
-import GLib from 'gi://GLib';
 
 import { ExtensionPreferences } from 'resource:///org/gnome/Shell/Extensions/js/extensions/prefs.js';
+import * as Config from 'resource:///org/gnome/Shell/Extensions/js/misc/config.js';
 
 
 export default class StageManagerPreferences extends ExtensionPreferences {
@@ -313,24 +313,28 @@ export default class StageManagerPreferences extends ExtensionPreferences {
     }
 
     _getGnomeVersion() {
-        try {
-            const [ok, out] = GLib.spawn_command_line_sync('gnome-shell --version');
-            if (ok) return new TextDecoder().decode(out).trim().replace('GNOME Shell ', '');
-        } catch (_) { /* */ }
-        return 'unknown';
+        return Config.PACKAGE_VERSION || 'unknown';
     }
 
     _loadLogs(textView) {
+        const buf = textView.get_buffer();
+        let proc;
         try {
-            const [ok, out] = GLib.spawn_command_line_sync(
-                'bash -c "journalctl --user -b --no-pager -n 50 -g stage-manager 2>/dev/null"'
+            proc = Gio.Subprocess.new(
+                ['journalctl', '--user', '-b', '--no-pager', '-n', '50', '-g', 'stage-manager'],
+                Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_SILENCE
             );
-            const text = ok ? new TextDecoder().decode(out).trim() : '';
-            const buf = textView.get_buffer();
-            buf.set_text(text || 'No recent logs found.', -1);
         } catch (_e) {
-            const buf = textView.get_buffer();
             buf.set_text('Could not load logs. Run manually:\njournalctl --user -b -g stage-manager', -1);
+            return;
         }
+        proc.communicate_utf8_async(null, null, (p, res) => {
+            let text = '';
+            try {
+                const [, stdout] = p.communicate_utf8_finish(res);
+                text = (stdout || '').trim();
+            } catch (_e) { /* leave text empty */ }
+            buf.set_text(text || 'No recent logs found.', -1);
+        });
     }
 }
