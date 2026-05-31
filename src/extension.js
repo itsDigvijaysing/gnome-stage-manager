@@ -112,7 +112,7 @@ class MaximizeToWorkspace {
     }
 
     disable() {
-        this._sigs.splice(0).forEach(s => { try { s.o.disconnect(s.i); } catch (_) { /* */ } });
+        this._sigs.splice(0).forEach(s => s.o.disconnect(s.i));
         this._timers.splice(0).forEach(id => GLib.source_remove(id));
         this._moved.clear();
         this._origin.clear();
@@ -241,9 +241,7 @@ class StageSidebar {
     }
 
     _disconnectCardSigs() {
-        this._cardSigs.splice(0).forEach(s => {
-            try { s.o.disconnect(s.i); } catch (_) { /* actor gone */ }
-        });
+        this._cardSigs.splice(0).forEach(s => s.o.disconnect(s.i));
     }
 
     // ── Settings getters ──
@@ -275,7 +273,7 @@ class StageSidebar {
         // Keybinding before signals so the wm doesn't keep a stale handler.
         this._removeKeybinding();
         // Signals next — disconnect everything we connected (EGO-L-003).
-        this._sigs.splice(0).forEach(s => { try { s.o.disconnect(s.i); } catch (_) { /* actor gone */ } });
+        this._sigs.splice(0).forEach(s => s.o.disconnect(s.i));
         this._disconnectCardSigs();
         // Then preview + card content (cards live inside _box).
         this._destroyPreview();
@@ -286,11 +284,11 @@ class StageSidebar {
         // Explicit destroy for every actor created in _build() (EGO-L-002).
         // Destroy children before parents so set_child(null) calls don't dangle.
         if (this._box) {
-            try { this._box.destroy(); } catch (_) { /* */ }
+            this._box.destroy();
             this._box = null;
         }
         if (this._scroll) {
-            try { this._scroll.destroy(); } catch (_) { /* */ }
+            this._scroll.destroy();
             this._scroll = null;
         }
         if (this._panel) {
@@ -410,21 +408,13 @@ class StageSidebar {
     }
 
     _recomputeScale() {
-        try {
-            this._scaleFactor = St.ThemeContext.get_for_stage(global.stage).scale_factor || 1;
-        } catch (_) {
-            this._scaleFactor = 1;
-        }
+        this._scaleFactor = St.ThemeContext.get_for_stage(global.stage).scale_factor || 1;
     }
 
     _recomputeThemeClass() {
-        let isLight = false;
-        try {
-            const cs = St.Settings.get().color_scheme;
-            // GNOME 47+ exposes color_scheme; PREFER_LIGHT === 2 on enum.
-            isLight = (cs === St.SystemColorScheme?.PREFER_LIGHT) || (cs === 2);
-        } catch (_) { /* older shell — assume dark */ }
-        this._themeClass = isLight ? 'light' : '';
+        // GNOME 47+ exposes color_scheme; PREFER_LIGHT is the light variant.
+        const cs = St.Settings.get().color_scheme;
+        this._themeClass = (cs === St.SystemColorScheme.PREFER_LIGHT) ? 'light' : '';
     }
 
     // ── Wire signals ──
@@ -466,12 +456,10 @@ class StageSidebar {
         });
 
         // Theme: swap the .light style class when system color scheme changes.
-        try {
-            sig(St.Settings.get(), 'notify::color-scheme', () => {
-                this._recomputeThemeClass();
-                if (this._visible) this._refresh();
-            });
-        } catch (_) { /* color_scheme not available — older shell */ }
+        sig(St.Settings.get(), 'notify::color-scheme', () => {
+            this._recomputeThemeClass();
+            if (this._visible) this._refresh();
+        });
 
         sig(this._settings, 'changed::enable-stage-sidebar', () => {
             if (!this._settings.get_boolean('enable-stage-sidebar') && this._visible) this._hide();
@@ -646,6 +634,9 @@ class StageSidebar {
         });
 
         this._hovered = false;
+        // Reuses the single _refreshTimer debounce slot. _killRefreshTimer()
+        // first cancels any pending 200ms _scheduleRefresh timer, so a swap
+        // refresh and a debounced refresh can never both be queued.
         this._killRefreshTimer();
         this._refreshTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 120, () => {
             this._refreshTimer = null;
@@ -683,23 +674,19 @@ class StageSidebar {
     // ── Keybinding ──
 
     _addKeybinding() {
-        try {
-            Main.wm.addKeybinding(
-                KEYBIND_NAME,
-                this._settings,
-                Meta.KeyBindingFlags.NONE,
-                Shell.ActionMode.NORMAL | Shell.ActionMode.OVERVIEW,
-                () => this._toggleVisible(),
-            );
-            this._keybindingAdded = true;
-        } catch (e) {
-            console.error(`[StageManager] addKeybinding failed: ${e.message}`);
-        }
+        Main.wm.addKeybinding(
+            KEYBIND_NAME,
+            this._settings,
+            Meta.KeyBindingFlags.NONE,
+            Shell.ActionMode.NORMAL | Shell.ActionMode.OVERVIEW,
+            () => this._toggleVisible(),
+        );
+        this._keybindingAdded = true;
     }
 
     _removeKeybinding() {
         if (!this._keybindingAdded) return;
-        try { Main.wm.removeKeybinding(KEYBIND_NAME); } catch (_) { /* */ }
+        Main.wm.removeKeybinding(KEYBIND_NAME);
         this._keybindingAdded = false;
     }
 
@@ -833,7 +820,8 @@ class StageSidebar {
 
     _safeDestroyContent() {
         if (!this._box) return;
-        try { _nullCloneSources(this._box); this._box.destroy_all_children(); } catch (_) { /* */ }
+        _nullCloneSources(this._box);
+        this._box.destroy_all_children();
     }
 
     // ── Entrance animation ──
@@ -1340,11 +1328,9 @@ class StageSidebar {
 
     _destroyPreview() {
         if (this._preview) {
-            try {
-                _nullCloneSources(this._preview);
-                Main.layoutManager.removeChrome(this._preview);
-                this._preview.destroy();
-            } catch (_) { /* */ }
+            _nullCloneSources(this._preview);
+            Main.layoutManager.removeChrome(this._preview);
+            this._preview.destroy();
             this._preview = null;
         }
     }
