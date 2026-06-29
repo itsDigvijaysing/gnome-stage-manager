@@ -5,6 +5,7 @@
 import Adw from 'gi://Adw';
 import Gdk from 'gi://Gdk';
 import Gio from 'gi://Gio';
+import GLib from 'gi://GLib';
 import Gtk from 'gi://Gtk';
 
 import { ExtensionPreferences } from 'resource:///org/gnome/Shell/Extensions/js/extensions/prefs.js';
@@ -153,7 +154,7 @@ export default class StageManagerPreferences extends ExtensionPreferences {
 
         const versionRow = new Adw.ActionRow({
             title: 'Version',
-            subtitle: this.metadata['version-name'] || '1.3.0',
+            subtitle: this.metadata['version-name'] || '1.3.2',
         });
         infoGroup.add(versionRow);
 
