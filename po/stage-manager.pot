@@ -1,0 +1,426 @@
+# SOME DESCRIPTIVE TITLE.
+# Copyright (C) YEAR Stage Manager contributors
+# This file is distributed under the same license as the Stage Manager package.
+# FIRST AUTHOR <EMAIL@ADDRESS>, YEAR.
+#
+#, fuzzy
+msgid ""
+msgstr ""
+"Project-Id-Version: Stage Manager 1.4.0\n"
+"Report-Msgid-Bugs-To: https://github.com/itsdigvijaysing/gnome-stage-manager/"
+"issues\n"
+"POT-Creation-Date: 2026-07-28 10:17+0530\n"
+"PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
+"Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
+"Language-Team: LANGUAGE <LL@li.org>\n"
+"Language: \n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=CHARSET\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=INTEGER; plural=EXPRESSION;\n"
+
+#: src/extension.js:1702
+#, javascript-format
+msgid "Workspace %d (current)"
+msgstr ""
+
+#: src/extension.js:1703
+#, javascript-format
+msgid "Workspace %d"
+msgstr ""
+
+#: src/extension.js:1711
+#, javascript-format
+msgid "%d window"
+msgid_plural "%d windows"
+msgstr[0] ""
+msgstr[1] ""
+
+#: src/extension.js:1949
+msgid "Application"
+msgstr ""
+
+#: src/extension.js:1969
+#, javascript-format
+msgid "%d window (minimized)"
+msgid_plural "%d windows (minimized)"
+msgstr[0] ""
+msgstr[1] ""
+
+#: src/prefs.js:21
+msgid "Behavior"
+msgstr ""
+
+#: src/prefs.js:28
+msgid "Maximize to Workspace"
+msgstr ""
+
+#: src/prefs.js:29
+msgid "Move maximized windows to their own workspace"
+msgstr ""
+
+#: src/prefs.js:34
+#: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:8
+msgid "Enable Maximize to Workspace"
+msgstr ""
+
+#: src/prefs.js:35
+msgid "When maximized, window moves to a new empty workspace"
+msgstr ""
+
+#: src/prefs.js:42
+msgid "Stage Manager Sidebar"
+msgstr ""
+
+#: src/prefs.js:43
+msgid "Left sidebar showing inactive app thumbnails"
+msgstr ""
+
+#: src/prefs.js:48
+msgid "Enable Stage Sidebar"
+msgstr ""
+
+#: src/prefs.js:49
+msgid "Show inactive apps as thumbnail cards on the left"
+msgstr ""
+
+#: src/prefs.js:56
+msgid "Sidebar Content"
+msgstr ""
+
+#: src/prefs.js:57
+msgid "Groups = Stage Manager (swap), Apps = per-app (focus), Workspaces"
+msgstr ""
+
+#: src/prefs.js:60
+msgid "Groups (Stage Manager)"
+msgstr ""
+
+#: src/prefs.js:60
+msgid "Apps (per-app focus)"
+msgstr ""
+
+#: src/prefs.js:60
+msgid "Workspaces"
+msgstr ""
+
+#: src/prefs.js:77
+#: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:34
+msgid "Auto-hide Sidebar"
+msgstr ""
+
+#: src/prefs.js:78
+msgid "Off = always visible (macOS default). On = hover to reveal."
+msgstr ""
+
+#: src/prefs.js:84
+msgid "Reserve Space for Sidebar"
+msgstr ""
+
+#: src/prefs.js:85
+msgid ""
+"Maximized windows stop at the sidebar instead of being covered. Needs auto-"
+"hide off."
+msgstr ""
+
+#: src/prefs.js:91
+msgid "Show App Icons"
+msgstr ""
+
+#: src/prefs.js:92
+msgid "Display app icon below each thumbnail"
+msgstr ""
+
+#: src/prefs.js:98
+msgid "Show Window Count Badge"
+msgstr ""
+
+#: src/prefs.js:99
+msgid "Show number of windows on group thumbnails"
+msgstr ""
+
+#: src/prefs.js:105
+#: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:92
+msgid "Show Current Workspace"
+msgstr ""
+
+#: src/prefs.js:106
+msgid "In workspace mode, also show the current workspace card"
+msgstr ""
+
+#: src/prefs.js:113
+msgid "Shortcuts"
+msgstr ""
+
+#: src/prefs.js:114
+msgid "Keyboard shortcuts for the sidebar (none set by default)"
+msgstr ""
+
+#: src/prefs.js:119
+msgid "Toggle Sidebar"
+msgstr ""
+
+#: src/prefs.js:119
+msgid "Show or hide the stage sidebar"
+msgstr ""
+
+#: src/prefs.js:123
+msgid "Appearance"
+msgstr ""
+
+#: src/prefs.js:128
+msgid "Dimensions"
+msgstr ""
+
+#: src/prefs.js:132
+#: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:21
+msgid "Sidebar Width"
+msgstr ""
+
+#: src/prefs.js:132
+msgid "Width in pixels"
+msgstr ""
+
+#: src/prefs.js:134
+#: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:54
+msgid "Edge Trigger Width"
+msgstr ""
+
+#: src/prefs.js:134
+msgid "Hot zone at screen edge (pixels)"
+msgstr ""
+
+#: src/prefs.js:136
+msgid "Cards"
+msgstr ""
+
+#: src/prefs.js:140
+#: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:73
+msgid "Card Base Scale"
+msgstr ""
+
+#: src/prefs.js:140
+msgid "Default card size percentage (40-100)"
+msgstr ""
+
+#: src/prefs.js:142
+#: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:80
+msgid "Perspective Angle"
+msgstr ""
+
+#: src/prefs.js:142
+msgid "3D rotation in degrees (0 = flat)"
+msgstr ""
+
+#: src/prefs.js:144
+msgid "Animation"
+msgstr ""
+
+#: src/prefs.js:148
+#: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:28
+msgid "Animation Duration"
+msgstr ""
+
+#: src/prefs.js:148
+msgid "Slide speed in milliseconds"
+msgstr ""
+
+#: src/prefs.js:150
+msgid "Hide Delay"
+msgstr ""
+
+#: src/prefs.js:150
+msgid "Delay before hiding after mouse leaves (ms)"
+msgstr ""
+
+#: src/prefs.js:154
+msgid "About"
+msgstr ""
+
+#: src/prefs.js:159
+msgid "Stage Manager"
+msgstr ""
+
+#: src/prefs.js:163
+msgid "Version"
+msgstr ""
+
+#: src/prefs.js:169
+msgid "GNOME Shell"
+msgstr ""
+
+#: src/prefs.js:175
+msgid "Session Type"
+msgstr ""
+
+#: src/prefs.js:176 src/prefs.js:338
+msgid "unknown"
+msgstr ""
+
+#: src/prefs.js:182
+msgid "Extension Logs"
+msgstr ""
+
+#: src/prefs.js:183
+msgid "Recent errors from this extension (for bug reports)"
+msgstr ""
+
+#: src/prefs.js:211
+msgid "Press Refresh to load recent log messages."
+msgstr ""
+
+#: src/prefs.js:214
+msgid "Refresh Logs"
+msgstr ""
+
+#: src/prefs.js:216
+msgid "Refresh"
+msgstr ""
+
+#: src/prefs.js:224
+msgid "Copy Logs"
+msgstr ""
+
+#: src/prefs.js:226
+msgid "Copy to Clipboard"
+msgstr ""
+
+#: src/prefs.js:257
+msgid "Disabled"
+msgstr ""
+
+#: src/prefs.js:269
+msgid "Set"
+msgstr ""
+
+#: src/prefs.js:277
+msgid "Clear shortcut"
+msgstr ""
+
+#: src/prefs.js:294 src/prefs.js:300
+msgid "Press shortcut"
+msgstr ""
+
+#: src/prefs.js:295 src/prefs.js:301
+msgid "Press the key combination you want to use, or Escape to cancel."
+msgstr ""
+
+#: src/prefs.js:303
+msgid "Cancel"
+msgstr ""
+
+#: src/prefs.js:361
+msgid "Could not load logs. Run manually:"
+msgstr ""
+
+#: src/prefs.js:370
+msgid "No recent logs found."
+msgstr ""
+
+#: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:9
+msgid ""
+"When a window is maximized, automatically move it to a new workspace. When "
+"unmaximized, return it to the previous workspace."
+msgstr ""
+
+#: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:14
+msgid "Enable Stage Manager Sidebar"
+msgstr ""
+
+#: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:15
+msgid ""
+"Show a sidebar with inactive window thumbnails on the left side of the "
+"screen."
+msgstr ""
+
+#: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:22
+msgid "Width of the stage manager sidebar in pixels."
+msgstr ""
+
+#: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:29
+msgid "Duration of sidebar show/hide animations in milliseconds."
+msgstr ""
+
+#: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:35
+msgid ""
+"When off (default): the sidebar stays visible, drawn over your windows; the "
+"empty space around the cards passes clicks through to whatever is "
+"underneath. When on: the sidebar stays off screen and is revealed by moving "
+"the pointer to the left edge."
+msgstr ""
+
+#: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:40
+msgid "Reserve Space for the Sidebar"
+msgstr ""
+
+#: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:41
+msgid ""
+"Shrink the work area so maximized windows stop underneath the sidebar "
+"instead of being covered by it, the way macOS shifts the stage across. Only "
+"applies when auto-hide is off, because a reserved strut cannot animate."
+msgstr ""
+
+#: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:47
+msgid "Auto-hide Delay"
+msgstr ""
+
+#: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:48
+msgid ""
+"Delay in milliseconds before hiding the sidebar after the pointer leaves."
+msgstr ""
+
+#: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:55
+msgid ""
+"Width of the invisible hot zone at the screen edge to trigger the sidebar."
+msgstr ""
+
+#: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:60
+msgid "Show Application Icons"
+msgstr ""
+
+#: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:61
+msgid "Show application icons below window thumbnails in the sidebar."
+msgstr ""
+
+#: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:66
+msgid "Sidebar Mode"
+msgstr ""
+
+#: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:67
+msgid ""
+"What to show in sidebar cards. 'groups' = stage manager (swap groups), "
+"'apps' = per-app (just focus), 'workspaces' = other workspaces."
+msgstr ""
+
+#: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:74
+msgid ""
+"Default card scale percentage (40-100). Cards grow on hover with a bell "
+"curve effect."
+msgstr ""
+
+#: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:81
+msgid "Y-axis rotation in degrees for the 3D perspective effect on cards."
+msgstr ""
+
+#: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:86
+msgid "Show Group Window Count"
+msgstr ""
+
+#: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:87
+msgid ""
+"Show a window count badge on thumbnails when a group has multiple windows."
+msgstr ""
+
+#: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:93
+msgid "In workspace mode, also show the current workspace card in the sidebar."
+msgstr ""
+
+#: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:98
+msgid "Toggle Sidebar Shortcut"
+msgstr ""
+
+#: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:99
+msgid ""
+"Keyboard shortcut to toggle the stage sidebar visibility. Empty array means "
+"no shortcut is bound."
+msgstr ""

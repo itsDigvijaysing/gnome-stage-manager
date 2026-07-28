@@ -5,7 +5,8 @@
  * Groups windows into "stages" — only one group visible at a time,
  * others shown as sidebar thumbnail cards.
  *
- * Compatible with GNOME 45+ (ESM), Wayland and X11.
+ * Compatible with GNOME 46+ (ESM), Wayland and X11.
+ * (GNOME 45 lacks St.ScrollView.set_child, which _build() relies on.)
  */
 
 import Meta from 'gi://Meta';
@@ -15,19 +16,42 @@ import GLib from 'gi://GLib';
 import Shell from 'gi://Shell';
 
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
-import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
+import { Extension, gettext as _, ngettext } from 'resource:///org/gnome/shell/extensions/extension.js';
 
 
-// Logical (1× scale) dimensions — multiplied by St.ThemeContext.scale_factor
-// at build time so HiDPI renders crisp.
-const THUMB_W = 170;
+// Logical (1× scale) dimensions. Stage coordinates are PHYSICAL pixels, so every
+// hardcoded length here — and every user-facing "pixel" setting — is multiplied
+// by St.ThemeContext.scale_factor before use. (GNOME's own dash.js compares
+// `Main.iconSizes.map(s => s * scaleFactor)` straight against allocation sizes,
+// which is what establishes the unit.)
+const THUMB_W = 170;   // reference width: sets the fan-out ratio and fallback aspect
 const THUMB_H = 110;
 const ICON_SIZE = 22;
 const MAX_GROUPS = 8;
 const BELL_SIGMA = 0.9;   // tight: only 1-2 neighbors affected
 const MAX_STACK = 3;
-const STACK_H = 14;   // horizontal spread between stacked layers
-const STACK_V = 4;    // slight vertical offset per layer
+const STACK_H = 14;   // horizontal fan-out at THUMB_W; scaled proportionally
+const STACK_V = 4;    // vertical offset at THUMB_W; scaled proportionally
+// Safety floor only. It must stay below the narrowest fit the settings allow
+// (120px sidebar, 45° angle, 3-deep stack ⇒ ~57px), or the floor would fight the
+// fit and push the card back outside the sidebar.
+const MIN_THUMB_W = 48;
+// Must match the horizontal `padding` of .stage-card in stylesheet.css — the
+// thumbnail size is derived from it, and a mismatch makes cards overflow.
+const CARD_PAD_X = 14;
+const CARD_MARGIN = 8;    // breathing room between the card and the panel edges
+const SCROLL_STEP = 55;   // wheel travel per notch
+// A card rotated for the 3D effect projects wider than its allocation under the
+// stage's perspective. Fraction of extra width to budget at the maximum angle.
+const PERSP_HEADROOM = 0.18;
+// Thumbnails take their shape from the window they show. These bounds stop an
+// extreme window (a thin sliver, an ultrawide) from producing an absurd card.
+const THUMB_ASPECT_MIN = 0.7;
+const THUMB_ASPECT_MAX = 2.4;
+const CARD_REST_OPACITY = 190;    // resting card opacity
+const CARD_HOVER_OPACITY = 255;   // fully opaque at the centre of the bell curve
+// Fallback stills are full-resolution textures, so only a handful are kept.
+const MAX_SNAPSHOTS = 8;
 const KEYBIND_NAME = 'toggle-sidebar';
 
 
@@ -95,7 +119,11 @@ class MaximizeToWorkspace {
         this._sigs = [];
         this._timers = [];
         this._moved = new Set();
-        this._origin = new Map();   // win → origin workspace index
+        // win → origin Meta.Workspace. The workspace OBJECT is stored, never its
+        // index: mutter reaps empty workspaces and every index after the removed
+        // one shifts down, so a stored index can silently point at a different
+        // workspace by the time the window is unmaximized.
+        this._origin = new Map();
     }
 
     enable() {
@@ -112,23 +140,51 @@ class MaximizeToWorkspace {
     }
 
     disable() {
-        this._sigs.splice(0).forEach(s => s.o.disconnect(s.i));
-        this._timers.splice(0).forEach(id => GLib.source_remove(id));
+        // Each disconnect/remove is guarded on its own: during shell shutdown a
+        // tracked object may already be finalized, and one throw inside the
+        // loop would abandon every remaining cleanup step.
+        this._sigs.splice(0).forEach(s => {
+            try { s.o.disconnect(s.i); } catch (_) { /* already finalized */ }
+        });
+        this._timers.splice(0).forEach(id => {
+            try { GLib.source_remove(id); } catch (_) { /* already fired */ }
+        });
         this._moved.clear();
         this._origin.clear();
     }
 
     _sig(o, s, cb) { this._sigs.push({ o, i: o.connect(s, cb) }); }
 
+    /** Drop a fired timer from tracking without disturbing the others. */
+    _untrackTimer(id) {
+        const i = this._timers.indexOf(id);
+        if (i >= 0) this._timers.splice(i, 1);
+    }
+
+    /** True while `ws` is still one of the live workspaces. */
+    _workspaceAlive(ws) {
+        if (!ws) return false;
+        const wsm = global.workspace_manager;
+        for (let i = 0; i < wsm.get_n_workspaces(); i++) {
+            if (wsm.get_workspace_by_index(i) === ws) return true;
+        }
+        return false;
+    }
+
     _onSize(_wm, actor, change) {
-        if (!this._settings.get_boolean('enable-maximize-to-workspace')) return;
         const win = actor.meta_window;
         if (!win || !_isNormal(win)) return;
 
-        if (change === Meta.SizeChange.MAXIMIZE)
+        if (change === Meta.SizeChange.MAXIMIZE) {
+            // Only the outbound move is opt-in. A window already parked on its
+            // own workspace must still be able to come home afterwards, even if
+            // the setting was switched off in the meantime — otherwise it is
+            // stranded there for good.
+            if (!this._settings.get_boolean('enable-maximize-to-workspace')) return;
             this._handleMaximize(win);
-        else if (change === Meta.SizeChange.UNMAXIMIZE)
+        } else if (change === Meta.SizeChange.UNMAXIMIZE) {
             this._handleUnmaximize(win);
+        }
     }
 
     _handleMaximize(win) {
@@ -154,10 +210,10 @@ class MaximizeToWorkspace {
         if (ti === ci) return;
 
         this._moved.add(win);
-        this._origin.set(win, ci);
+        this._origin.set(win, cws);
         win.change_workspace_by_index(ti, false);
         const id = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 50, () => {
-            this._timers.splice(this._timers.indexOf(id), 1);
+            this._untrackTimer(id);
             const ws = wsm.get_workspace_by_index(ti);
             if (ws) { ws.activate(global.get_current_time()); win.activate(global.get_current_time()); }
             return GLib.SOURCE_REMOVE;
@@ -166,26 +222,24 @@ class MaximizeToWorkspace {
     }
 
     _handleUnmaximize(win) {
-        if (!this._origin.has(win)) return;
+        const originWs = this._origin.get(win);
+        if (!originWs) return;
 
-        const wsm = global.workspace_manager;
-        const originIdx = this._origin.get(win);
         this._origin.delete(win);
         this._moved.delete(win);
 
-        // Origin may have been removed (e.g. user closed all its windows).
-        if (originIdx >= wsm.get_n_workspaces()) return;
-        const originWs = wsm.get_workspace_by_index(originIdx);
-        if (!originWs) return;
+        // The origin may be gone entirely (user closed all its windows and
+        // mutter reaped it), in which case leave the window where it is.
+        if (!this._workspaceAlive(originWs)) return;
+        if (win.get_workspace() === originWs) return;
 
-        const currentIdx = win.get_workspace().index();
-        if (currentIdx === originIdx) return;
-
-        win.change_workspace_by_index(originIdx, false);
+        win.change_workspace(originWs);
         const id = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 50, () => {
-            this._timers.splice(this._timers.indexOf(id), 1);
-            const ws = wsm.get_workspace_by_index(originIdx);
-            if (ws) { ws.activate(global.get_current_time()); win.activate(global.get_current_time()); }
+            this._untrackTimer(id);
+            if (this._workspaceAlive(originWs)) {
+                originWs.activate(global.get_current_time());
+                win.activate(global.get_current_time());
+            }
             return GLib.SOURCE_REMOVE;
         });
         this._timers.push(id);
@@ -212,7 +266,6 @@ class StageSidebar {
         this._swapTimer = null;
         this._visible = false;
         this._hovered = false;
-        this._animating = false;
         this._hoveredIdx = -1;
         this._keybindingAdded = false;
 
@@ -220,11 +273,31 @@ class StageSidebar {
         this._scaleFactor = 1;
         this._themeClass = '';     // '' (dark default) or 'light'
 
-        // Group tracking (for 'groups' mode)
-        this._groups = [];
-        this._activeGroupId = null;
+        // Group tracking (for 'groups' mode). Every group carries the workspace
+        // it belongs to, so stages on one workspace can never pull in or
+        // minimize windows living on another.
+        this._groups = [];          // [{ id, ws, windows: Set }]
+        this._activeIds = new Map();   // Meta.Workspace → active group id
         this._nextGid = 0;
-        this._swapping = false;
+
+        // Windows whose next minimize/unminimize signal was caused by us during
+        // a stage swap. Consuming the exact window is what keeps the swap from
+        // being mistaken for the user parking a window — the old code used a
+        // 400ms time window, which lost the race on slow compositor animations.
+        this._expectMinimize = new Set();
+        this._expectUnminimize = new Set();
+
+        this._signature = null;     // fingerprint of what is currently rendered
+
+        // Chrome registration state — the panel is re-registered when its
+        // struts setting changes (see _applyChrome).
+        this._chromeAdded = false;
+        this._chromeStruts = false;
+
+        // win → { content, aw, ah, ox, oy, … }: a still captured while the window
+        // was last on screen, used only when its actor is unusable at draw time.
+        // Insertion-ordered and capped at MAX_SNAPSHOTS (oldest evicted).
+        this._snapshots = new Map();
     }
 
     // ── Signal & timer tracking ─────────────────────────────────────────
@@ -241,14 +314,20 @@ class StageSidebar {
     }
 
     _disconnectCardSigs() {
-        this._cardSigs.splice(0).forEach(s => s.o.disconnect(s.i));
+        this._cardSigs.splice(0).forEach(s => {
+            try { s.o.disconnect(s.i); } catch (_) { /* card already destroyed */ }
+        });
     }
 
     // ── Settings getters ──
-    get _PANEL_W() { return this._settings.get_int('sidebar-width'); }
+    // Lengths the user sets in "pixels" are logical units, exactly like CSS px,
+    // so they are scaled to stage (physical) coordinates here. Without this the
+    // sidebar was half its intended width on a 2× display while thumbnails were
+    // full size — they could never fit.
+    get _PANEL_W() { return this._settings.get_int('sidebar-width') * this._scaleFactor; }
     get _SLIDE_MS() { return this._settings.get_int('animation-duration'); }
     get _HIDE_DELAY_MS() { return this._settings.get_int('auto-hide-delay'); }
-    get _EDGE_W() { return this._settings.get_int('edge-trigger-width'); }
+    get _EDGE_W() { return this._settings.get_int('edge-trigger-width') * this._scaleFactor; }
     get _BASE_SCALE() { return this._settings.get_int('card-base-scale') / 100.0; }
     get _PERSP_ANGLE() { return this._settings.get_int('perspective-angle'); }
 
@@ -261,6 +340,7 @@ class StageSidebar {
         this._addKeybinding();
         if (!this._settings.get_boolean('sidebar-auto-hide'))
             this._show();
+        this._syncEdge();
     }
 
     disable() {
@@ -273,32 +353,47 @@ class StageSidebar {
         // Keybinding before signals so the wm doesn't keep a stale handler.
         this._removeKeybinding();
         // Signals next — disconnect everything we connected (EGO-L-003).
-        this._sigs.splice(0).forEach(s => s.o.disconnect(s.i));
+        // Each disconnect is guarded individually: while the shell tears an
+        // extension down, a tracked object can already be finalized, and one
+        // throw escaping this loop used to abandon every step below it — leaving
+        // the panel and edge chrome behind on screen (including over the lock
+        // screen, since extensions are disabled on lock).
+        this._sigs.splice(0).forEach(s => {
+            try { s.o.disconnect(s.i); } catch (_) { /* already finalized */ }
+        });
         this._disconnectCardSigs();
         // Then preview + card content (cards live inside _box).
         this._destroyPreview();
         this._safeDestroyContent();
         this._cards = [];
         this._groups = [];
-        this._activeGroupId = null;
+        this._activeIds.clear();
+        this._expectMinimize.clear();
+        this._expectUnminimize.clear();
+        this._snapshots.clear();
+        this._signature = null;
         // Explicit destroy for every actor created in _build() (EGO-L-002).
         // Destroy children before parents so set_child(null) calls don't dangle.
         if (this._box) {
-            this._box.destroy();
+            try { this._box.destroy(); } catch (_) { /* already gone */ }
             this._box = null;
         }
         if (this._scroll) {
-            this._scroll.destroy();
+            try { this._scroll.destroy(); } catch (_) { /* already gone */ }
             this._scroll = null;
         }
         if (this._panel) {
-            Main.layoutManager.removeChrome(this._panel);
-            this._panel.destroy();
+            try {
+                Main.layoutManager.removeChrome(this._panel);
+                this._panel.destroy();
+            } catch (_) { /* already gone */ }
             this._panel = null;
         }
         if (this._edge) {
-            Main.layoutManager.removeChrome(this._edge);
-            this._edge.destroy();
+            try {
+                Main.layoutManager.removeChrome(this._edge);
+                this._edge.destroy();
+            } catch (_) { /* already gone */ }
             this._edge = null;
         }
     }
@@ -312,9 +407,11 @@ class StageSidebar {
         const edgeW = this._EDGE_W;
         const panelH = mon.height - topH;
 
-        // Edge trigger
+        // Edge trigger. Reactive by necessity, so it is kept hidden whenever it
+        // isn't needed (see _syncEdge) — otherwise this strip would eat clicks
+        // along the very edge of the screen, including window resize grabs.
         this._edge = new St.Widget({
-            reactive: true, track_hover: true,
+            reactive: true,
             style: 'background-color: transparent;',
         });
         this._edge.set_size(edgeW, panelH);
@@ -324,71 +421,205 @@ class StageSidebar {
             if (!this._fullscreen()) this._show();
         });
 
-        // Panel container — fully transparent, cards have their own backgrounds
+        // Panel container — fully transparent, cards have their own backgrounds.
+        //
+        // reactive MUST stay false here (and on the scroll view below). The panel
+        // is full-monitor-height chrome drawn above the window group, so a
+        // reactive panel silently swallows every click and scroll landing in its
+        // column — the window underneath is visible through the transparency but
+        // cannot be interacted with. Only the cards are reactive; Clutter still
+        // recurses into the children of a non-reactive parent when picking, and
+        // crossing/scroll events raised on a card bubble up to the handlers
+        // installed here, so hover, auto-hide and wheel scrolling all keep
+        // working while the empty space around the cards passes input through.
         this._panel = new St.Widget({
-            reactive: true, track_hover: true,
+            reactive: false,
             style: 'background-color: transparent;',
         });
         this._panel.set_size(panelW, panelH);
         this._panel.set_position(mon.x - panelW, mon.y + topH);
         this._visible = false;
-        Main.layoutManager.addChrome(this._panel, { trackFullscreen: false });
+        this._applyChrome();
 
         // ScrollView → BoxLayout
         this._scroll = new St.ScrollView({
+            reactive: false,
             overlay_scrollbars: true,
             hscrollbar_policy: St.PolicyType.NEVER,
-            vscrollbar_policy: St.PolicyType.NEVER,
+            // EXTERNAL, not NEVER. NEVER means "this direction does not scroll" —
+            // the adjustment gets no range, so `upper - page_size` is 0 and the
+            // wheel handler below can never move it. EXTERNAL keeps the range and
+            // just leaves the scrollbar undrawn, which is what GNOME's own
+            // date-menu sections use.
+            vscrollbar_policy: St.PolicyType.EXTERNAL,
             clip_to_allocation: true,
         });
         this._scroll.set_size(panelW, panelH);
         this._panel.add_child(this._scroll);
 
+        // Padding/spacing are logical lengths like everything else, so they are
+        // scaled rather than hardcoded into the style string.
+        const sf = this._scaleFactor;
+        // The card column IS reactive, unlike the panel and scroll view around
+        // it. This is the deliberate middle ground: a wheel event anywhere over
+        // the column scrolls — including the blank space between cards, which
+        // otherwise stalled the gesture — while everything outside the column
+        // still passes clicks straight through to the window underneath.
         this._box = new St.BoxLayout({
-            vertical: true,
+            reactive: true,
             x_align: Clutter.ActorAlign.CENTER,
             y_align: Clutter.ActorAlign.START,
-            style: 'padding: 40px 0px; spacing: 10px;',
+            style: `padding: ${Math.round(24 * sf)}px 0px; spacing: ${Math.round(10 * sf)}px;`,
         });
+        this._setVertical(this._box);
         this._scroll.set_child(this._box);
 
-        this._sig(this._scroll, 'scroll-event', (_actor, event) => {
-            const adj = this._scroll.vadjustment;
-            // Smooth-scroll devices (touchpads, hi-res mice) report a delta;
-            // legacy mice only report a discrete direction. Fall back so
-            // wheel scrolling still works on those devices.
-            let dy = 0;
-            try {
-                const [, sdy] = event.get_scroll_delta();
-                dy = sdy;
-            } catch (_) { dy = 0; }
-            if (dy === 0) {
-                const dir = event.get_scroll_direction();
-                if (dir === Clutter.ScrollDirection.UP) dy = -1;
-                else if (dir === Clutter.ScrollDirection.DOWN) dy = 1;
-            }
-            adj.value = Math.max(0, Math.min(adj.upper - adj.page_size, adj.value + dy * 55));
-            return Clutter.EVENT_STOP;
-        });
+        // Bound on the column, on each card (see _wireCardEvents) and on the
+        // scroll view. Never rely on one alone: the scroll view is not reactive,
+        // so it only ever sees an event bubbled up from a reactive descendant.
+        this._sig(this._box, 'scroll-event', (_actor, event) => this._onScrollEvent(event));
+        this._sig(this._scroll, 'scroll-event', (_actor, event) => this._onScrollEvent(event));
 
+        // These fire for events bubbling up from the reactive cards, since the
+        // panel itself is not pickable any more.
         this._sig(this._panel, 'enter-event', () => {
             this._hovered = true;
             this._killHideTimer();
+            return Clutter.EVENT_PROPAGATE;
         });
-        this._sig(this._panel, 'leave-event', () => {
+        this._sig(this._panel, 'leave-event', (_actor, event) => {
+            // Moving from one card to the next emits a leave/enter pair that
+            // both bubble up here. Ignore the leave when the pointer is only
+            // travelling to another actor inside the panel, otherwise the
+            // preview and the card scales get torn down mid-gesture.
+            if (this._insidePanel(this._crossingRelated(event)))
+                return Clutter.EVENT_PROPAGATE;
+
             this._hovered = false;
             this._hoveredIdx = -1;
+            this._killHoverTimer();
             this._resetAllCardScales();
             this._destroyPreview();
             if (this._settings.get_boolean('sidebar-auto-hide'))
                 this._scheduleHide();
+            return Clutter.EVENT_PROPAGATE;
         });
     }
 
-    // ── Layout rebuild (multi-monitor / scale change) ────────────────────
+    /**
+     * Whether the sidebar should reserve space in the work area right now.
+     *
+     * A strut is geometry-based and cannot animate: `_updateRegions()` derives it
+     * from the panel's allocation and explicitly ignores the actor's visibility.
+     * So it is only coherent while the sidebar is genuinely parked on screen —
+     * with auto-hide on, every reveal would resize every window.
+     */
+    _wantStruts() {
+        return this._settings.get_boolean('sidebar-reserve-space') &&
+               this._settings.get_boolean('enable-stage-sidebar') &&
+               !this._settings.get_boolean('sidebar-auto-hide') &&
+               this._visible && !this._fullscreen();
+    }
+
+    /**
+     * (Re)register the panel as chrome with the struts setting it needs now.
+     *
+     * `addChrome()` throws on an already-tracked actor, so switching the
+     * parameter means untracking first. Only done when the answer actually
+     * changes — re-adding chrome reflows every window.
+     */
+    _applyChrome() {
+        if (!this._panel) return;
+        const wanted = this._wantStruts();
+        if (this._chromeAdded && this._chromeStruts === wanted) return;
+
+        if (this._chromeAdded) {
+            try { Main.layoutManager.removeChrome(this._panel); }
+            catch (_) { /* not tracked */ }
+        }
+        Main.layoutManager.addChrome(this._panel, {
+            trackFullscreen: false,
+            affectsStruts: wanted,
+        });
+        this._chromeAdded = true;
+        this._chromeStruts = wanted;
+    }
+
+    /**
+     * Scroll the card list. Bound on the scroll view *and* on every card, so it
+     * works whether or not crossing/scroll events bubble to a non-reactive
+     * ancestor. Returning EVENT_STOP from the card stops the duplicate, so the
+     * two bindings can never both move the adjustment for one event.
+     */
+    _onScrollEvent(event) {
+        const adj = this._scroll?.vadjustment;
+        if (!adj) return Clutter.EVENT_PROPAGATE;
+
+        // Smooth-scroll devices (touchpads, hi-res mice) report a delta; legacy
+        // mice only report a discrete direction. Fall back so wheel scrolling
+        // still works on those devices.
+        let dy = 0;
+        try {
+            const [, sdy] = event.get_scroll_delta();
+            dy = sdy;
+        } catch (_) { dy = 0; }
+        if (dy === 0) {
+            const dir = event.get_scroll_direction();
+            if (dir === Clutter.ScrollDirection.UP) dy = -1;
+            else if (dir === Clutter.ScrollDirection.DOWN) dy = 1;
+        }
+        // A smooth-scroll gesture ends with a zero-delta event; let it through
+        // instead of swallowing it.
+        if (dy === 0) return Clutter.EVENT_PROPAGATE;
+
+        const step = SCROLL_STEP * this._scaleFactor;
+        const max = Math.max(0, adj.upper - adj.page_size);
+        adj.value = Math.max(0, Math.min(max, adj.value + dy * step));
+        return Clutter.EVENT_STOP;
+    }
+
+    /** The actor a crossing event is travelling to/from, if the event exposes one. */
+    _crossingRelated(event) {
+        try { return event ? event.get_related() : null; }
+        catch (_) { return null; }
+    }
+
+    _insidePanel(actor) {
+        if (!actor || !this._panel) return false;
+        try { return actor === this._panel || this._panel.contains(actor); }
+        catch (_) { return false; }
+    }
+
+    /**
+     * St.BoxLayout grew an `orientation` property in GNOME 48 and `vertical` is
+     * deprecated from that release on. Set whichever the running shell offers so
+     * the extension stays quiet on 48+ without breaking 46/47.
+     */
+    _setVertical(box) {
+        if ('orientation' in St.BoxLayout.prototype)
+            box.orientation = Clutter.Orientation.VERTICAL;
+        else
+            box.vertical = true;
+    }
+
+    /**
+     * The edge trigger is reactive, so it is only shown when it is actually
+     * needed: while the sidebar is off screen, enabled, and not suppressed by a
+     * fullscreen window. Otherwise it would keep stealing input along the screen
+     * edge for no reason.
+     */
+    _syncEdge() {
+        if (!this._edge) return;
+        const wanted = this._settings.get_boolean('enable-stage-sidebar') &&
+                       !this._visible && !this._fullscreen();
+        if (wanted) this._edge.show();
+        else this._edge.hide();
+    }
+
+    // ── Layout rebuild (monitor / scale / size setting change) ───────────
 
     _rebuildLayout() {
-        if (!this._panel || !this._edge) return;
+        if (!this._panel || !this._edge || !this._scroll) return;
         const mon = Main.layoutManager.primaryMonitor;
         const topH = Main.panel ? Main.panel.height : 0;
         const panelW = this._PANEL_W;
@@ -398,11 +629,15 @@ class StageSidebar {
         this._edge.set_size(edgeW, panelH);
         this._edge.set_position(mon.x, mon.y + topH);
 
+        // Any slide in flight was aimed at the old width; drop it before
+        // repositioning or the panel lands at a stale offset — a narrower
+        // sidebar would otherwise leave a strip of itself parked on screen.
+        this._panel.remove_all_transitions();
         this._panel.set_size(panelW, panelH);
-        // Place panel at correct off/on-screen X depending on visibility.
         const x = this._visible ? mon.x : mon.x - panelW;
         this._panel.set_position(x, mon.y + topH);
         this._scroll.set_size(panelW, panelH);
+        this._syncEdge();
 
         if (this._visible) this._refresh();
     }
@@ -442,7 +677,12 @@ class StageSidebar {
         sig(global.display, 'notify::focus-window', () => this._scheduleRefresh());
         sig(global.workspace_manager, 'active-workspace-changed', () => this._initGroups());
         sig(global.workspace_manager, 'workspace-added', () => this._scheduleRefresh());
-        sig(global.workspace_manager, 'workspace-removed', () => this._scheduleRefresh());
+        sig(global.workspace_manager, 'workspace-removed', () => {
+            // Stages belonging to a workspace that no longer exists would keep
+            // their windows alive in the map forever.
+            this._pruneDeadWorkspaces();
+            this._scheduleRefresh();
+        });
         sig(global.display, 'in-fullscreen-changed', () => this._onFullscreen());
 
         // Multi-monitor: reposition panel/edge when monitors change.
@@ -462,17 +702,35 @@ class StageSidebar {
         });
 
         sig(this._settings, 'changed::enable-stage-sidebar', () => {
-            if (!this._settings.get_boolean('enable-stage-sidebar') && this._visible) this._hide();
+            if (!this._settings.get_boolean('enable-stage-sidebar')) {
+                if (this._visible) this._hide();
+            } else if (!this._settings.get_boolean('sidebar-auto-hide')) {
+                this._show();
+            }
+            this._syncEdge();
+            this._applyChrome();
         });
+        sig(this._settings, 'changed::sidebar-reserve-space', () => this._applyChrome());
         sig(this._settings, 'changed::sidebar-mode', () => {
+            // Switching back into 'groups' needs the stage state for the current
+            // workspace to exist before anything can be rendered.
+            this._initGroups();
             if (this._visible) this._refresh();
         });
+
+        // Geometry settings: the panel actor has to be resized, not just
+        // re-aimed, or its slide target stops matching its actual width.
+        sig(this._settings, 'changed::sidebar-width', () => this._rebuildLayout());
+        sig(this._settings, 'changed::edge-trigger-width', () => this._rebuildLayout());
         sig(this._settings, 'changed::sidebar-auto-hide', () => {
             if (this._settings.get_boolean('sidebar-auto-hide')) {
                 if (!this._hovered) this._scheduleHide();
             } else {
                 this._show();
             }
+            // Struts are incompatible with auto-hide, so this toggle can change
+            // the answer even when visibility does not.
+            this._applyChrome();
         });
         sig(this._settings, 'changed::show-app-icons', () => {
             if (this._visible) this._refresh();
@@ -490,20 +748,47 @@ class StageSidebar {
 
     // ── Group management (for 'groups' mode) ─────────────────────────────
 
-    _initGroups() {
-        const ws = global.workspace_manager.get_active_workspace();
-        const allWins = ws.list_windows().filter(w => _isNormal(w));
+    _activeWs() {
+        return global.workspace_manager.get_active_workspace();
+    }
 
-        this._groups = [];
-        this._nextGid = 0;
-        this._activeGroupId = null;
-        this._swapping = false;
+    /** Groups belonging to one workspace. */
+    _groupsFor(ws) {
+        return this._groups.filter(g => g.ws === ws);
+    }
+
+    /**
+     * Bring the active workspace's stages up to date. Called on enable and on
+     * every workspace switch.
+     *
+     * A workspace is seeded from its current window state only the FIRST time it
+     * becomes active. On later visits the arrangement the user built is left
+     * alone — re-deriving it (what this used to do unconditionally) collapsed
+     * every parked window of the same app back into a single stage, so switching
+     * workspace and back silently destroyed the user's stages.
+     */
+    _initGroups() {
+        this._pruneDeadWorkspaces();
+        this._reapMovedWindows();
+        const ws = this._activeWs();
+        if (!ws) return;
+
+        if (this._groupsFor(ws).length === 0)
+            this._seedGroups(ws);
+        else
+            this._adoptStrayWindows(ws);
+
+        if (this._visible) this._refresh();
+    }
+
+    _seedGroups(ws) {
+        const allWins = ws.list_windows().filter(w => _isNormal(w));
 
         const visible = allWins.filter(w => !w.minimized);
         if (visible.length > 0) {
-            const g = { id: this._nextGid++, windows: new Set(visible) };
+            const g = { id: this._nextGid++, ws, windows: new Set(visible) };
             this._groups.push(g);
-            this._activeGroupId = g.id;
+            this._activeIds.set(ws, g.id);
         }
 
         const tracker = Shell.WindowTracker.get_default();
@@ -515,38 +800,151 @@ class StageSidebar {
             byApp.get(key).push(win);
         }
         for (const [, wins] of byApp) {
-            this._groups.push({ id: this._nextGid++, windows: new Set(wins) });
+            this._groups.push({ id: this._nextGid++, ws, windows: new Set(wins) });
         }
-
-        if (this._visible) this._refresh();
     }
 
-    _getActiveGroup() {
-        return this._groups.find(g => g.id === this._activeGroupId) || null;
+    /** Fold windows that appeared on `ws` while it was off screen into its stages. */
+    _adoptStrayWindows(ws) {
+        const known = new Set();
+        for (const g of this._groupsFor(ws)) {
+            for (const win of g.windows) known.add(win);
+        }
+
+        const strays = ws.list_windows().filter(w => _isNormal(w) && !known.has(w));
+        if (strays.length === 0) return;
+
+        const visible = strays.filter(w => !w.minimized);
+        if (visible.length > 0) {
+            const active = this._ensureActiveGroup(ws);
+            for (const win of visible) active.windows.add(win);
+        }
+        for (const win of strays.filter(w => w.minimized))
+            this._groups.push({ id: this._nextGid++, ws, windows: new Set([win]) });
+    }
+
+    /** Forget stages whose workspace no longer exists. */
+    _pruneDeadWorkspaces() {
+        const wsm = global.workspace_manager;
+        const live = new Set();
+        for (let i = 0; i < wsm.get_n_workspaces(); i++)
+            live.add(wsm.get_workspace_by_index(i));
+
+        this._groups = this._groups.filter(g => live.has(g.ws));
+        for (const ws of [...this._activeIds.keys()]) {
+            if (!live.has(ws)) this._activeIds.delete(ws);
+        }
+    }
+
+    _getActiveGroup(ws = this._activeWs()) {
+        const id = this._activeIds.get(ws);
+        if (id === undefined) return null;
+        return this._groups.find(g => g.id === id) || null;
+    }
+
+    _ensureActiveGroup(ws = this._activeWs()) {
+        let active = this._getActiveGroup(ws);
+        if (!active) {
+            active = { id: this._nextGid++, ws, windows: new Set() };
+            this._groups.push(active);
+            this._activeIds.set(ws, active.id);
+        }
+        return active;
     }
 
     _getInactiveGroups() {
-        return this._groups.filter(g => g.id !== this._activeGroupId && g.windows.size > 0);
+        const ws = this._activeWs();
+        const activeId = this._activeIds.get(ws);
+        return this._groups.filter(g =>
+            g.ws === ws && g.id !== activeId && this._groupWindows(g).length > 0);
+    }
+
+    /**
+     * The windows of `group` that still live on its workspace, most recently
+     * used first. Windows the user dragged to another workspace are skipped
+     * rather than being minimized or cloned from the wrong stage.
+     */
+    _groupWindows(group) {
+        return [...group.windows]
+            .filter(w => {
+                try { return w.get_workspace() === group.ws; }
+                catch (_) { return false; }
+            })
+            .sort((a, b) => (b.get_user_time() || 0) - (a.get_user_time() || 0));
     }
 
     _findGroupForWindow(win) {
         return this._groups.find(g => g.windows.has(win)) || null;
     }
 
+    _isActiveGroup(group) {
+        return !!group && this._activeIds.get(group.ws) === group.id;
+    }
+
+    _workspaceOf(win) {
+        try { return win.get_workspace(); }
+        catch (_) { return null; }
+    }
+
+    /**
+     * Drop `win` from a stage belonging to a workspace it no longer lives on.
+     *
+     * Windows can change workspace at any time (dragged in the overview, or
+     * moved by MaximizeToWorkspace). Without this the old stage keeps the
+     * window, and the handlers below then add it to its new workspace's stage as
+     * well — leaving it a member of two stages at once, which makes
+     * _findGroupForWindow() answer for whichever happens to come first.
+     */
+    _evictIfMoved(win) {
+        const group = this._findGroupForWindow(win);
+        if (!group) return;
+        const ws = this._workspaceOf(win);
+        if (ws && group.ws !== ws) {
+            group.windows.delete(win);
+            this._cleanupEmptyGroups();
+        }
+    }
+
+    /** Sweep every stage for windows that have since changed workspace. */
+    _reapMovedWindows() {
+        for (const group of this._groups) {
+            for (const win of [...group.windows]) {
+                if (this._workspaceOf(win) !== group.ws) group.windows.delete(win);
+            }
+        }
+        this._cleanupEmptyGroups();
+    }
+
     _cleanupEmptyGroups() {
         this._groups = this._groups.filter(g => g.windows.size > 0);
-        if (this._activeGroupId !== null && !this._groups.find(g => g.id === this._activeGroupId)) {
-            this._activeGroupId = null;
+        for (const [ws, id] of [...this._activeIds]) {
+            if (!this._groups.some(g => g.id === id)) this._activeIds.delete(ws);
         }
     }
 
     _onWindowMinimize(win) {
-        if (this._swapping || !_isNormal(win)) return;
+        if (!_isNormal(win)) return;
+        // Our own swap minimized this one — consume it, it is not the user
+        // parking a window. (The swap already captured its snapshot.)
+        if (this._expectMinimize.delete(win)) return;
+
+        // A minimize we did not cause: grab a still before the actor goes quiet.
+        // Best-effort — the compositor may already have unmapped it, in which
+        // case the icon fallback covers the card.
+        this._captureSnapshot(win);
+
         if (this._settings.get_string('sidebar-mode') === 'groups') {
+            const ws = this._workspaceOf(win);
+            this._evictIfMoved(win);
             const group = this._findGroupForWindow(win);
-            if (group && group.id === this._activeGroupId) {
+            if (!group) {
+                // Held by no stage — it either just changed workspace or was
+                // never tracked. Park it as its own stage on the workspace it
+                // actually lives on, so a card for it exists somewhere.
+                if (ws) this._groups.push({ id: this._nextGid++, ws, windows: new Set([win]) });
+            } else if (this._isActiveGroup(group)) {
                 group.windows.delete(win);
-                this._groups.push({ id: this._nextGid++, windows: new Set([win]) });
+                this._groups.push({ id: this._nextGid++, ws: group.ws, windows: new Set([win]) });
                 this._cleanupEmptyGroups();
             }
         }
@@ -554,19 +952,18 @@ class StageSidebar {
     }
 
     _onWindowUnminimize(win) {
-        if (this._swapping || !_isNormal(win)) return;
+        if (!_isNormal(win)) return;
+        // The window is live again, so its cached still is now stale.
+        this._dropSnapshot(win);
+        if (this._expectUnminimize.delete(win)) return;
+
         if (this._settings.get_string('sidebar-mode') === 'groups') {
+            const ws = this._workspaceOf(win);
+            if (!ws) return;
+            this._evictIfMoved(win);
             const group = this._findGroupForWindow(win);
-            if (group && group.id !== this._activeGroupId) {
-                group.windows.delete(win);
-            }
-            let active = this._getActiveGroup();
-            if (!active) {
-                active = { id: this._nextGid++, windows: new Set() };
-                this._groups.push(active);
-                this._activeGroupId = active.id;
-            }
-            active.windows.add(win);
+            if (group && !this._isActiveGroup(group)) group.windows.delete(win);
+            this._ensureActiveGroup(ws).windows.add(win);
             this._cleanupEmptyGroups();
         }
         this._scheduleRefresh();
@@ -575,18 +972,19 @@ class StageSidebar {
     _onWindowMap(win) {
         if (!_isNormal(win)) return;
         if (this._settings.get_string('sidebar-mode') === 'groups') {
-            let active = this._getActiveGroup();
-            if (!active) {
-                active = { id: this._nextGid++, windows: new Set() };
-                this._groups.push(active);
-                this._activeGroupId = active.id;
-            }
-            active.windows.add(win);
+            // A window that opens on another workspace belongs to THAT
+            // workspace's stages. Adding it to the stage currently on screen
+            // made later swaps minimize windows the user could not see.
+            const ws = win.get_workspace();
+            if (ws) this._ensureActiveGroup(ws).windows.add(win);
         }
         this._scheduleRefresh();
     }
 
     _onWindowDestroy(win) {
+        this._expectMinimize.delete(win);
+        this._expectUnminimize.delete(win);
+        this._dropSnapshot(win);
         for (const group of this._groups) {
             group.windows.delete(win);
         }
@@ -595,41 +993,48 @@ class StageSidebar {
     }
 
     _swapToGroup(targetGroup) {
-        if (this._swapping) return;
-        if (targetGroup.id === this._activeGroupId) return;
+        const ws = this._activeWs();
+        if (!targetGroup || targetGroup.ws !== ws) return;
+        if (targetGroup.id === this._activeIds.get(ws)) return;
 
-        this._swapping = true;
         this._destroyPreview();
 
-        const activeGroup = this._getActiveGroup();
-
+        const activeGroup = this._getActiveGroup(ws);
         if (activeGroup) {
-            for (const win of activeGroup.windows) {
+            for (const win of this._groupWindows(activeGroup)) {
                 if (!win.minimized) {
-                    try { win.minimize(); } catch (_) { /* */ }
+                    // Freeze how it looks now: once minimized its actor stops
+                    // producing frames and a live clone would go blank.
+                    this._captureSnapshot(win);
+                    this._expectMinimize.add(win);
+                    try { win.minimize(); }
+                    catch (_) { this._expectMinimize.delete(win); }
                 }
             }
         }
 
-        for (const win of targetGroup.windows) {
+        const targetWins = this._groupWindows(targetGroup);
+        for (const win of targetWins) {
             if (win.minimized) {
-                try { win.unminimize(); } catch (_) { /* */ }
+                this._expectUnminimize.add(win);
+                try { win.unminimize(); }
+                catch (_) { this._expectUnminimize.delete(win); }
             }
         }
 
-        const sorted = [...targetGroup.windows].sort((a, b) =>
-            (b.get_user_time() || 0) - (a.get_user_time() || 0)
-        );
-        if (sorted.length > 0) {
-            sorted[0].activate(global.get_current_time());
+        if (targetWins.length > 0) {
+            targetWins[0].activate(global.get_current_time());
         }
 
-        this._activeGroupId = targetGroup.id;
+        this._activeIds.set(ws, targetGroup.id);
 
+        // Safety net only: a compositor that refuses a minimize would otherwise
+        // leave a stale expectation behind that swallows the user's next one.
         this._killSwapTimer();
-        this._swapTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 400, () => {
+        this._swapTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 2000, () => {
             this._swapTimer = null;
-            this._swapping = false;
+            this._expectMinimize.clear();
+            this._expectUnminimize.clear();
             return GLib.SOURCE_REMOVE;
         });
 
@@ -660,14 +1065,21 @@ class StageSidebar {
             this._destroyPreview();
             if (this._visible) {
                 this._visible = false;
-                this._animating = false;
-                this._panel.remove_all_transitions();
-                this._panel.set_position(Main.layoutManager.primaryMonitor.x - this._PANEL_W, this._panel.y);
+                if (this._panel) {
+                    this._panel.remove_all_transitions();
+                    this._panel.set_position(
+                        Main.layoutManager.primaryMonitor.x - this._PANEL_W, this._panel.y);
+                }
             }
-            this._edge?.hide();
+            this._syncEdge();
+            this._applyChrome();
         } else {
-            if (this._settings.get_boolean('enable-stage-sidebar'))
-                this._edge?.show();
+            this._syncEdge();
+            // An always-visible sidebar has to come back on its own; it used to
+            // stay hidden until the user happened to brush the screen edge.
+            if (this._settings.get_boolean('enable-stage-sidebar') &&
+                !this._settings.get_boolean('sidebar-auto-hide'))
+                this._show();
         }
     }
 
@@ -698,37 +1110,52 @@ class StageSidebar {
 
     // ── Show / Hide ──
 
+    // An in-flight slide is never a reason to refuse. `_visible` already means
+    // "shown or showing", so re-entry is a harmless no-op while a call in the
+    // opposite direction interrupts the transition and re-aims it. Gating on a
+    // separate `_animating` flag meant a pointer arriving back at the edge
+    // mid-slide-out was dropped, and no further crossing event ever came to
+    // retry — the sidebar simply stayed hidden.
     _show() {
-        if (this._visible || this._animating) return;
+        if (this._visible || !this._panel) return;
         if (!this._settings.get_boolean('enable-stage-sidebar') || this._fullscreen()) return;
 
         this._visible = true;
-        this._animating = true;
         this._killHideTimer();
         this._refresh();
+        this._syncEdge();
 
         this._panel.remove_all_transitions();
         this._panel.ease({
             x: Main.layoutManager.primaryMonitor.x,
             duration: this._SLIDE_MS,
             mode: Clutter.AnimationMode.EASE_OUT_QUAD,
-            onComplete: () => { this._animating = false; },
+            // Struts are claimed only once the panel has settled: the shell
+            // recomputes them from the allocation on every frame, so claiming
+            // mid-slide would resize every window repeatedly. An interrupted
+            // transition never fires this, which is exactly what we want.
+            onComplete: () => this._applyChrome(),
         });
     }
 
     _hide() {
-        if (!this._visible || this._animating) return;
+        if (!this._visible || !this._panel) return;
 
         this._visible = false;
-        this._animating = true;
         this._destroyPreview();
+        this._syncEdge();
+        // Give the space back before moving, so windows reflow once rather than
+        // tracking the panel across the screen.
+        this._applyChrome();
+        // Drop the render fingerprint so the next reveal rebuilds and replays
+        // the staggered entrance animation instead of showing stale cards.
+        this._signature = null;
 
         this._panel.remove_all_transitions();
         this._panel.ease({
             x: Main.layoutManager.primaryMonitor.x - this._PANEL_W,
             duration: this._SLIDE_MS,
             mode: Clutter.AnimationMode.EASE_OUT_QUAD,
-            onComplete: () => { this._animating = false; },
         });
     }
 
@@ -758,7 +1185,21 @@ class StageSidebar {
     // ── Render ──────────────────────────────────────────────────────────
 
     _refresh() {
-        if (!this._settings.get_boolean('enable-stage-sidebar')) return;
+        if (!this._settings.get_boolean('enable-stage-sidebar') || !this._box) return;
+
+        // Nothing to redraw? Then don't — every rebuild throws away and recreates
+        // a window clone per thumbnail, and this runs on every focus change.
+        const signature = this._renderSignature();
+        if (signature === this._signature) return;
+        this._signature = signature;
+
+        // The cards about to be destroyed may be under the pointer, in which case
+        // no leave-event will ever arrive for them: tear down the hover state
+        // here or a preview is orphaned on screen and `_hovered` stays stuck
+        // true, which blocks every later debounced refresh.
+        this._killHoverTimer();
+        this._destroyPreview();
+        this._hovered = false;
 
         // Disconnect signals from the cards we're about to destroy
         // (EGO-L-003: every connect needs a paired disconnect).
@@ -779,26 +1220,85 @@ class StageSidebar {
         this._animateCardsEntrance();
     }
 
+    /**
+     * Fingerprint of everything _refresh() would draw. Covers the appearance
+     * settings and the exact window membership of each rendered card, so a
+     * refresh is skipped only when the result would be pixel-identical.
+     */
+    _renderSignature() {
+        const mode = this._settings.get_string('sidebar-mode');
+        const parts = [
+            mode, this._scaleFactor, this._themeClass, this._PANEL_W,
+            this._BASE_SCALE, this._PERSP_ANGLE,
+            this._settings.get_boolean('show-app-icons') ? 1 : 0,
+            this._settings.get_boolean('show-group-count') ? 1 : 0,
+        ];
+
+        // Window ids alone are not enough now that a card takes its shape from the
+        // window it fronts: a resize changes the card without changing membership.
+        // Bucketed so a drag-resize doesn't rebuild on every pixel.
+        const ids = wins => {
+            const shape = wins.length > 0
+                ? Math.round((this._windowAspect(wins[0]) ?? 0) * 20)
+                : 0;
+            return `${wins.map(w => w.get_id()).join('.')}@${shape}`;
+        };
+
+        if (mode === 'workspaces') {
+            const wsm = global.workspace_manager;
+            const activeIdx = wsm.get_active_workspace_index();
+            parts.push(activeIdx, this._settings.get_boolean('show-workspace-current') ? 1 : 0);
+            for (let i = 0; i < wsm.get_n_workspaces(); i++) {
+                const ws = wsm.get_workspace_by_index(i);
+                parts.push(`${i}:${ids(ws.list_windows().filter(w => _isNormal(w)))}`);
+            }
+        } else if (mode === 'apps') {
+            const groups = _groupByApp(this._activeWs(), global.display.get_focus_window());
+            for (const g of groups)
+                parts.push(`${g.app ? g.app.get_id() : '?'}:${ids(g.windows)}`);
+        } else {
+            for (const g of this._getInactiveGroups())
+                parts.push(`${g.id}:${ids(this._groupWindows(g))}`);
+        }
+        return parts.join('|');
+    }
+
     _refreshGroups() {
-        const inactive = this._getInactiveGroups().slice(0, MAX_GROUPS);
-        for (const group of inactive) {
+        const all = this._getInactiveGroups();
+        for (const group of all.slice(0, MAX_GROUPS)) {
             try {
                 const card = this._makeGroupCard(group);
                 if (card) { this._box.add_child(card); this._cards.push(card); }
-            } catch (e) { console.error(`[StageManager] group card: ${e.message}`); }
+            } catch (e) { console.error(`[stage-manager] group card: ${e.message}`); }
         }
+        this._addOverflowLabel(all.length - MAX_GROUPS);
     }
 
     _refreshApps() {
-        const activeWs = global.workspace_manager.get_active_workspace();
         const focusedWin = global.display.get_focus_window();
-        const groups = _groupByApp(activeWs, focusedWin).slice(0, MAX_GROUPS);
-        for (const group of groups) {
+        const all = _groupByApp(this._activeWs(), focusedWin);
+        for (const group of all.slice(0, MAX_GROUPS)) {
             try {
                 const card = this._makeAppCard(group);
                 if (card) { this._box.add_child(card); this._cards.push(card); }
-            } catch (e) { console.error(`[StageManager] app card: ${e.message}`); }
+            } catch (e) { console.error(`[stage-manager] app card: ${e.message}`); }
         }
+        this._addOverflowLabel(all.length - MAX_GROUPS);
+    }
+
+    /**
+     * Tell the user when stages exist beyond MAX_GROUPS instead of dropping them
+     * silently. Not pushed onto `_cards` — it is a label, not a target, and it
+     * must stay out of the bell-curve/hover bookkeeping.
+     */
+    _addOverflowLabel(hidden) {
+        if (hidden <= 0 || !this._box) return;
+        this._box.add_child(new St.Label({
+            text: `+${hidden}`,
+            reactive: false,
+            x_align: Clutter.ActorAlign.CENTER,
+            style_class: this._cls('stage-overflow'),
+        }));
     }
 
     _refreshWorkspaces() {
@@ -814,7 +1314,7 @@ class StageSidebar {
             try {
                 const card = this._makeWorkspaceCard(ws, wins, i, i === activeIdx);
                 if (card) { this._box.add_child(card); this._cards.push(card); }
-            } catch (e) { console.error(`[StageManager] ws card: ${e.message}`); }
+            } catch (e) { console.error(`[stage-manager] ws card: ${e.message}`); }
         }
     }
 
@@ -838,15 +1338,14 @@ class StageSidebar {
             card.translation_y = 24;
             card.set_scale(base * 0.82, base * 0.82);
 
-            // Perspective on the thumb (not the card)
-            const thumb = card._thumb;
-            if (thumb) {
-                thumb.set_pivot_point(0.0, 0.5);
-                thumb.rotation_angle_y = angle;
-            }
+            // Perspective goes on the CARD, not on the thumbnail inside it. The
+            // pill background belongs to the card and is drawn at its
+            // allocation, so rotating only the child made the window content
+            // project outside the background that is meant to contain it.
+            card.rotation_angle_y = angle;
 
             card.ease({
-                opacity: 190,
+                opacity: CARD_REST_OPACITY,
                 translation_y: 0,
                 scale_x: base,
                 scale_y: base,
@@ -862,13 +1361,18 @@ class StageSidebar {
     /**
      * Create a card wrapper with a frosted-glass pill background.
      * Visual bg lives in stylesheet.css; the panel is fully transparent.
+     *
+     * This is the only reactive actor in the sidebar — the panel around it
+     * deliberately passes input through (see _build).
      */
     _wrapCard() {
-        return new St.BoxLayout({
-            vertical: true, reactive: true,
+        const card = new St.BoxLayout({
+            reactive: true,
             x_align: Clutter.ActorAlign.CENTER,
             style_class: this._cls('stage-card'),
         });
+        this._setVertical(card);
+        return card;
     }
 
     /**
@@ -882,9 +1386,7 @@ class StageSidebar {
     }
 
     _makeGroupCard(group) {
-        const windows = [...group.windows].sort((a, b) =>
-            (b.get_user_time() || 0) - (a.get_user_time() || 0)
-        );
+        const windows = this._groupWindows(group);
         if (windows.length === 0) return null;
 
         const card = this._wrapCard();
@@ -954,7 +1456,6 @@ class StageSidebar {
     }
 
     _activateApp(group) {
-        if (this._animating) return;
         const { windows } = group;
         if (windows.length === 0) return;
         for (const win of windows) { if (win.minimized) win.unminimize(); }
@@ -963,15 +1464,171 @@ class StageSidebar {
         this._scheduleRefresh();
     }
 
+    /**
+     * An aspect-correct clone of `win`, fitted inside `maxW`×`maxH`.
+     *
+     * Two things matter here. The compositor actor is larger than the window:
+     * it carries the client-side-decoration shadow margins, so it is clipped to
+     * the frame rect first, otherwise every thumbnail gets a fat transparent
+     * border. And the result is scaled uniformly rather than stretched to the
+     * thumbnail box, which used to squash every window to 170×110 regardless of
+     * its real shape.
+     *
+     * `maxScale` caps magnification — thumbnails happily blow a small window up
+     * to fill the card, but the preview stays at 1:1 so it never looks blurry.
+     *
+     * The **whole** compositor actor is shown, scaled to fit and never cropped.
+     * An earlier version clipped to `get_frame_rect()` to trim the CSD shadow
+     * margins, but that needs the actor position and the frame rect to share a
+     * coordinate space; where they don't, the clip lands on the wrong region and
+     * the card shows only part of the app. A few percent of shadow border is a
+     * much better trade than a cropped window.
+     *
+     * Returns a sized actor, or null when the window can't be cloned.
+     */
+    _makeWindowClone(win, maxW, maxH, maxScale = Infinity) {
+        // A live clone is always preferred: it costs no extra memory and keeps
+        // repainting. GNOME's own alt-tab switcher clones window actors exactly
+        // like this with no special case for minimized windows, so parked stages
+        // render fine too. The cached still is only a fallback for when the
+        // actor has gone away or reports no usable size.
+        const geom = this._windowGeometry(win) ?? this._snapshots.get(win);
+        if (!geom) return null;
+
+        const { aw, ah } = geom;
+        const scale = Math.min(maxW / aw, maxH / ah, maxScale);
+
+        try {
+            const inner = geom.content
+                ? new St.Widget({ reactive: false, content: geom.content })
+                : new Clutter.Clone({ source: geom.actor, reactive: false });
+            inner.set_size(Math.round(aw * scale), Math.round(ah * scale));
+            return inner;
+        } catch (_) {
+            return null;
+        }
+    }
+
+    /** Size of `win`'s compositor actor — the whole thing, shadow included. */
+    _windowGeometry(win) {
+        const actor = win.get_compositor_private?.();
+        if (!actor) return null;
+
+        let aw = 0, ah = 0;
+        try { [aw, ah] = actor.get_size(); } catch (_) { return null; }
+        if (!(aw > 0) || !(ah > 0)) return null;
+
+        return { aw, ah, actor, content: null };
+    }
+
+    /**
+     * Freeze `win`'s current appearance as a last-resort thumbnail source, for
+     * the case where its actor is gone by the time a card is drawn.
+     *
+     * Must be called while the window is still on screen — `paint_to_content()`
+     * needs a mapped actor with a live buffer. The clip is left null and the
+     * frame trimming is applied at draw time, matching the live-clone path.
+     *
+     * Each still is a full-resolution offscreen texture, so the cache is capped
+     * and evicts oldest-first rather than growing with every window ever parked.
+     */
+    _captureSnapshot(win) {
+        const geom = this._windowGeometry(win);
+        if (!geom) return;
+        if (typeof geom.actor.paint_to_content !== 'function') return;
+
+        try {
+            const content = geom.actor.paint_to_content(null);
+            if (!content) return;
+            this._snapshots.delete(win);   // re-insert so it counts as newest
+            this._snapshots.set(win, { aw: geom.aw, ah: geom.ah, actor: null, content });
+            while (this._snapshots.size > MAX_SNAPSHOTS)
+                this._snapshots.delete(this._snapshots.keys().next().value);
+        } catch (_) { /* nothing usable to cache; icon fallback covers it */ }
+    }
+
+    _dropSnapshot(win) {
+        this._snapshots.delete(win);
+    }
+
+    /**
+     * Thumbnail size for a stack of `count` windows, derived from the sidebar
+     * width rather than hardcoded.
+     *
+     * THUMB_W alone does not fit: a three-deep stack fans out by
+     * 2 × STACK_H and the card adds 2 × CARD_PAD_X, which together overflowed
+     * the default 220px sidebar — and the card's rounded background is drawn at
+     * its allocation, so the thumbnail visibly spilled outside the pill.
+     *
+     * Because the fan-out is subtracted from the same budget, every card ends up
+     * the same total width whatever its stack depth.
+     */
+    /** Clamp an aspect ratio into the range a card can sensibly display. */
+    _clampAspect(ratio) {
+        if (!(ratio > 0)) return null;
+        return Math.min(THUMB_ASPECT_MAX, Math.max(THUMB_ASPECT_MIN, ratio));
+    }
+
+    /**
+     * Shape of what will actually be drawn, so the window fills its card.
+     * The actor's own size is authoritative because the full actor is what gets
+     * cloned; the frame rect is only a fallback for a window with no actor yet.
+     */
+    _windowAspect(win) {
+        const geom = this._windowGeometry(win) ?? this._snapshots.get(win);
+        if (geom) return this._clampAspect(geom.aw / geom.ah);
+        try {
+            const r = win.get_frame_rect();
+            if (r && r.width > 0 && r.height > 0)
+                return this._clampAspect(r.width / r.height);
+        } catch (_) { /* unavailable */ }
+        return null;
+    }
+
+    /** Shape of the display — what a maximized window looks like. */
+    _monitorAspect() {
+        const mon = Main.layoutManager.primaryMonitor;
+        return (mon && this._clampAspect(mon.width / mon.height)) ??
+               this._clampAspect(THUMB_W / THUMB_H);
+    }
+
+    _thumbSize(count, aspect = null) {
+        const sf = this._scaleFactor;
+        const layers = Math.min(Math.max(count, 1), MAX_STACK);
+        const perspective = 1 + (this._PERSP_ANGLE / 45) * PERSP_HEADROOM;
+        const budget = (this._PANEL_W - CARD_MARGIN * sf) / perspective - 2 * CARD_PAD_X * sf;
+
+        // The fan-out is a fraction of the thumbnail rather than a fixed offset,
+        // so solving `w + (layers-1)·w·k ≤ budget` always has a solution. With a
+        // fixed offset, a narrow sidebar had no width that satisfied both the
+        // fit and the minimum thumbnail size.
+        const k = STACK_H / THUMB_W;
+        const fitted = budget / (1 + (layers - 1) * k);
+
+        // No upper cap: a wider sidebar is a request for bigger cards.
+        const w = Math.round(Math.max(MIN_THUMB_W * sf, fitted));
+        const ratio = aspect ?? this._monitorAspect();
+        return [w, Math.round(w / ratio)];
+    }
+
+    /** Per-layer stack offsets, kept proportional to the thumbnail size. */
+    _stackStep(thumbW) {
+        return [thumbW * (STACK_H / THUMB_W), thumbW * (STACK_V / THUMB_W)];
+    }
+
     _makeStackedThumb(windows) {
         const sf = this._scaleFactor;
-        const tw = THUMB_W * sf;
-        const th = THUMB_H * sf;
-        const sh = STACK_H * sf;
-        const sv = STACK_V * sf;
+        // The card takes its shape from the window it fronts, falling back to the
+        // display's shape for an empty stage. Nothing here is a fixed aspect.
+        const aspect = windows.length > 0 ? this._windowAspect(windows[0]) : null;
+        const [tw, th] = this._thumbSize(windows.length, aspect);
+        const [sh, sv] = this._stackStep(tw);
         const n = Math.min(windows.length, MAX_STACK);
-        const totalH = (n - 1) * sh;
-        const totalV = (n - 1) * sv;
+        // An empty stage still renders one empty slot; `n - 1` would otherwise
+        // give the container a negative fan-out and shrink it below the layer.
+        const layers = Math.max(n, 1);
+        const totalH = (layers - 1) * sh;
+        const totalV = (layers - 1) * sv;
         const container = new St.Widget({ reactive: false });
         container.set_size(tw + totalH, th + totalV);
 
@@ -991,15 +1648,12 @@ class StageSidebar {
             layer.set_size(tw, th);
             layer.set_position(x, y);
 
-            const actor = win.get_compositor_private?.();
-            if (actor) {
-                try {
-                    const clone = new Clutter.Clone({
-                        source: actor, reactive: false,
-                        width: tw, height: th,
-                    });
-                    layer.add_child(clone);
-                } catch (_) { this._addIconFallback(layer, win, tw, th); }
+            const content = this._makeWindowClone(win, tw, th);
+            if (content) {
+                content.set_position(
+                    Math.round((tw - content.width) / 2),
+                    Math.round((th - content.height) / 2));
+                layer.add_child(content);
             } else {
                 this._addIconFallback(layer, win, tw, th);
             }
@@ -1042,14 +1696,20 @@ class StageSidebar {
         card.add_child(thumb);
         card._thumb = thumb;
 
+        // %d is substituted rather than interpolated so translators keep control
+        // of word order.
+        const wsName = isCurrent
+            ? _('Workspace %d (current)').replace('%d', `${wsIndex + 1}`)
+            : _('Workspace %d').replace('%d', `${wsIndex + 1}`);
         card.add_child(new St.Label({
-            text: isCurrent ? `Workspace ${wsIndex + 1} (current)` : `Workspace ${wsIndex + 1}`,
+            text: wsName,
             x_align: Clutter.ActorAlign.CENTER,
             style_class: this._cls(isCurrent ? 'stage-ws-label-current' : 'stage-ws-label'),
         }));
         if (wins.length > 0) {
             card.add_child(new St.Label({
-                text: `${wins.length} window${wins.length > 1 ? 's' : ''}`,
+                text: ngettext('%d window', '%d windows', wins.length)
+                    .replace('%d', `${wins.length}`),
                 x_align: Clutter.ActorAlign.CENTER,
                 style_class: this._cls('stage-ws-meta'),
             }));
@@ -1071,22 +1731,25 @@ class StageSidebar {
     // ── Bell curve scaling ──────────────────────────────────────────────
 
     /**
-     * Reset all cards to resting state.
+     * Ease all cards back to their resting state.
      * Scale + opacity on card, perspective rotation on THUMB only.
+     *
+     * This eases rather than snapping: it runs right after a card's own
+     * leave-event has already started easing, and setting the values outright
+     * cancelled that mid-flight, which is what made the cards visibly jump when
+     * the pointer left the sidebar.
      */
     _resetAllCardScales() {
         const base = this._BASE_SCALE;
         const angle = this._PERSP_ANGLE;
         for (const card of this._cards) {
-            card.remove_all_transitions();
-            card.set_scale(base, base);
-            card.set_opacity(190);
-            // Perspective on thumb — consistent direction for all cards
-            const thumb = card._thumb;
-            if (thumb) {
-                thumb.remove_all_transitions();
-                thumb.rotation_angle_y = angle;
-            }
+            card.ease({
+                scale_x: base, scale_y: base,
+                opacity: CARD_REST_OPACITY,
+                rotation_angle_y: angle,
+                duration: 200,
+                mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+            });
         }
     }
 
@@ -1103,31 +1766,28 @@ class StageSidebar {
             const dist = Math.abs(i - hoveredIdx);
             const factor = _bellCurve(dist, BELL_SIGMA);
             const s = base + (1.0 - base) * factor;
-            const op = Math.round(190 + 65 * factor);
-            // Thumb perspective: hovered = flat, far = full angle
+            const op = Math.round(
+                CARD_REST_OPACITY + (CARD_HOVER_OPACITY - CARD_REST_OPACITY) * factor);
+            // Perspective: hovered card goes flat, distant ones keep full angle.
             const rot = angle * (1.0 - factor);
 
             this._cards[i].ease({
                 scale_x: s, scale_y: s,
                 opacity: op,
+                rotation_angle_y: rot,
                 duration: 180,
                 mode: Clutter.AnimationMode.EASE_OUT_QUAD,
             });
-
-            const thumb = this._cards[i]._thumb;
-            if (thumb) {
-                thumb.ease({
-                    rotation_angle_y: rot,
-                    duration: 180,
-                    mode: Clutter.AnimationMode.EASE_OUT_QUAD,
-                });
-            }
         }
     }
 
     // ── Card events ─────────────────────────────────────────────────────
 
     _wireCardEvents(card, thumb, windows, cardIdx) {
+        // Cards are the only reactive actors in the sidebar, so the wheel has to
+        // be handled here — not just on the (non-reactive) scroll view.
+        this._cardSig(card, 'scroll-event', (_actor, event) => this._onScrollEvent(event));
+
         this._cardSig(card, 'enter-event', () => {
             this._hovered = true;
             this._killHideTimer();
@@ -1151,28 +1811,9 @@ class StageSidebar {
             });
         });
 
-        this._cardSig(card, 'leave-event', () => {
+        this._cardSig(card, 'leave-event', (_actor, event) => {
             this._hoveredIdx = -1;
-
-            // Reset all cards
-            const base = this._BASE_SCALE;
-            const angle = this._PERSP_ANGLE;
-            for (const c of this._cards) {
-                c.ease({
-                    scale_x: base, scale_y: base,
-                    opacity: 190,
-                    duration: 200,
-                    mode: Clutter.AnimationMode.EASE_OUT_QUAD,
-                });
-                const t = c._thumb;
-                if (t) {
-                    t.ease({
-                        rotation_angle_y: angle,
-                        duration: 200,
-                        mode: Clutter.AnimationMode.EASE_OUT_QUAD,
-                    });
-                }
-            }
+            this._resetAllCardScales();
 
             // Restore base style classes
             const front = thumb._frontLayer;
@@ -1182,6 +1823,17 @@ class StageSidebar {
 
             this._killHoverTimer();
             this._destroyPreview();
+
+            // Auto-hide is driven from the cards as well as from the panel: the
+            // cards are the only reactive actors in the sidebar now, so relying
+            // solely on the panel's own crossing events would make hiding depend
+            // on those events bubbling up to a non-reactive ancestor. Both paths
+            // are idempotent, so running both is harmless.
+            if (!this._insidePanel(this._crossingRelated(event))) {
+                this._hovered = false;
+                if (this._settings.get_boolean('sidebar-auto-hide'))
+                    this._scheduleHide();
+            }
         });
     }
 
@@ -1210,31 +1862,28 @@ class StageSidebar {
         }
 
         // Layout: tile all windows vertically
-        const maxPreviewW = Math.min(mon.width * 0.32, 500);
-        const padding = 8;
-        const gap = 6;
-        const maxPerWin = cloneable.length;
+        // Monitor-relative, with the absolute cap in logical units so the preview
+        // is the same physical size at any display density.
+        const sf = this._scaleFactor;
+        const maxPreviewW = Math.min(mon.width * 0.32, 500 * sf);
+        const padding = 8 * sf;
+        const gap = 6 * sf;
+        const shown = Math.min(cloneable.length, 4);
+        const maxWinH = (mon.height * 0.45 - padding * 2 - gap * (shown - 1)) / shown;
         const clones = [];
         let maxCloneW = 0;
         let totalH = padding * 2;
 
         for (const w of cloneable.slice(0, 4)) {
-            const actor = w.get_compositor_private();
-            if (!actor) continue;
-            const rect = w.get_frame_rect();
-            if (rect.width === 0) continue;
-
-            const maxWinH = (mon.height * 0.45 - padding * 2 - gap * (Math.min(maxPerWin, 4) - 1)) / Math.min(maxPerWin, 4);
-            const s = Math.min((maxPreviewW - padding * 2) / rect.width, maxWinH / rect.height, 1.0);
-            const cw = rect.width * s;
-            const ch = rect.height * s;
-
-            try {
-                const clone = new Clutter.Clone({ source: actor, width: cw, height: ch });
-                clones.push({ clone, w: cw, h: ch });
-                totalH += ch + gap;
-                maxCloneW = Math.max(maxCloneW, cw);
-            } catch (_) { /* skip */ }
+            // Shares the thumbnail clone helper, so previews keep their aspect
+            // ratio too. The old code derived a scale from the frame rect but
+            // then stretched the whole actor into it. Capped at 1:1 so a small
+            // window is never magnified into blur.
+            const holder = this._makeWindowClone(w, maxPreviewW - padding * 2, maxWinH, 1.0);
+            if (!holder) continue;
+            clones.push(holder);
+            totalH += holder.height + gap;
+            maxCloneW = Math.max(maxCloneW, holder.width);
         }
 
         if (clones.length === 0) {
@@ -1246,20 +1895,21 @@ class StageSidebar {
         const previewW = maxCloneW + padding * 2;
         const previewH = totalH;
 
-        let py = Math.max(mon.y + topH + 8, Math.min(cardY, mon.y + mon.height - previewH - 20));
+        const py = Math.max(mon.y + topH + 8 * sf,
+            Math.min(cardY, mon.y + mon.height - previewH - 20 * sf));
 
         this._preview = new St.Widget({
             style_class: this._cls('stage-preview'),
             reactive: false,
         });
         this._preview.set_size(previewW, previewH);
-        this._preview.set_position(mon.x + this._PANEL_W + 8, py);
+        this._preview.set_position(mon.x + this._PANEL_W + 8 * sf, py);
 
         let yOff = padding;
-        for (const { clone, w, h } of clones) {
-            clone.set_position(padding + (maxCloneW - w) / 2, yOff);
-            this._preview.add_child(clone);
-            yOff += h + gap;
+        for (const holder of clones) {
+            holder.set_position(padding + (maxCloneW - holder.width) / 2, yOff);
+            this._preview.add_child(holder);
+            yOff += holder.height + gap;
         }
 
         Main.layoutManager.addChrome(this._preview, { trackFullscreen: false });
@@ -1296,7 +1946,7 @@ class StageSidebar {
         let yOff = 14 * sf;
         const names = [...seenApps.values()].map(a => a.get_name()).join(', ');
         const title = new St.Label({
-            text: names || 'Application',
+            text: names || _('Application'),
             style_class: this._cls('stage-preview-title'),
         });
         title.set_position(14 * sf, yOff);
@@ -1316,7 +1966,8 @@ class StageSidebar {
         }
 
         this._preview.add_child(new St.Label({
-            text: `${windows.length} window${windows.length > 1 ? 's' : ''} (minimized)`,
+            text: ngettext('%d window (minimized)', '%d windows (minimized)', windows.length)
+                .replace('%d', `${windows.length}`),
             style_class: this._cls('stage-preview-meta'),
             x: 14 * sf, y: previewH - 24 * sf,
         }));
@@ -1371,8 +2022,10 @@ export default class StageManagerExtension extends Extension {
     }
 
     disable() {
-        this._side.disable();
-        this._max.disable();
+        // Null-guarded: if enable() threw part-way through, one of these is
+        // still unset and an unguarded call would throw again out of disable().
+        if (this._side) this._side.disable();
+        if (this._max) this._max.disable();
         this._side = null;
         this._max = null;
         this._settings = null;

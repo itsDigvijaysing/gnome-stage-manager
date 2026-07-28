@@ -14,11 +14,12 @@ Group windows into stages — only one group is visible at a time, others appear
 - **Maximize to Workspace** — Optionally move maximized windows to their own workspace (disabled by default).
 - **Bell-Curve Hover Animation** — Hovered card scales up smoothly; only 1-2 neighbors are affected (tight sigma).
 - **3D Perspective** — Cards have a configurable Y-axis rotation for a natural depth look, consistent direction for all cards.
-- **Stacked Thumbnails** — Groups with multiple windows show fanned-out card stacks with visible back layers.
+- **Stacked Thumbnails** — Groups with multiple windows show fanned-out card stacks with visible back layers, scaled so the stack always fits the sidebar.
 - **Window Count Badge** — Optional badge showing how many windows are in each group.
 - **Live Previews** — Hover a card to see a larger preview of all windows in the group, tiled vertically.
 - **Icon Fallback** — Minimized windows that can't be cloned show app icon grids instead.
-- **Transparent Sidebar** — No dark bar; each card has its own frosted-glass pill background.
+- **Transparent Sidebar** — No dark bar; each card has its own frosted-glass pill background, and the empty space around the cards passes clicks straight through to the window underneath.
+- **Adaptive Cards** — Thumbnails take their size from the sidebar width and their shape from the window they show, so they fit any display density and any window aspect.
 - **Auto-hide** — Off by default (macOS behavior: always visible). Toggle on for hover-to-reveal.
 - **Fullscreen Aware** — Sidebar hides instantly when any window goes fullscreen.
 - **App Icons** — Each card shows app icons below the thumbnail.
@@ -28,13 +29,13 @@ Group windows into stages — only one group is visible at a time, others appear
 
 ## Screenshots
 
-<!-- Add your screenshots here -->
-<!-- ![Sidebar with Multiple Groups](assets/sidebar.png)
-![Live Preview on Hover](assets/sidebar_only.png) -->
+![Sidebar with multiple stages](assets/sidebar.png)
+
+![The sidebar on its own](assets/sidebar_only.png)
 
 ## Requirements
 
-- GNOME Shell 45 through 50 (Ubuntu 26.04 LTS supported)
+- GNOME Shell 46 through 50 (Ubuntu 26.04 LTS supported)
 - Wayland or X11
 
 ## Installation
@@ -77,6 +78,17 @@ gnome-extensions enable stage-manager@gnome-stage-manager
 
 Or use the **Extension Manager** app to toggle it on.
 
+## Development
+
+```bash
+make test      # offline logic tests (needs node) — see tests/README.md
+make pack      # build dist/<uuid>.shell-extension.zip for extensions.gnome.org
+make pot       # regenerate po/stage-manager.pot after changing any UI string
+```
+
+Translations are welcome — start from `po/stage-manager.pot` and drop the
+resulting `.po` into a pull request.
+
 ## Configuration
 
 Open preferences via:
@@ -95,6 +107,7 @@ Or click the gear icon in Extension Manager.
 | Enable Stage Sidebar | On | Show the left-side sidebar |
 | Sidebar Content | Groups | Groups (Stage Manager), Apps (per-app focus), or Workspaces |
 | Auto-hide Sidebar | Off | Off = always visible (macOS default). On = hover to reveal |
+| Reserve Space for Sidebar | Off | Maximized windows stop at the sidebar instead of being covered (needs auto-hide off) |
 | Show App Icons | On | Display app icons below thumbnails |
 | Show Window Count Badge | On | Show number of windows on group thumbnails |
 | Show Current Workspace | On | In workspace mode, also show the current workspace card |
@@ -117,7 +130,11 @@ Or click the gear icon in Extension Manager.
 1. All visible windows on the current workspace form the **active group**.
 2. When you manually minimize a window, it splits into its own **inactive group** in the sidebar.
 3. Click a sidebar card to **swap**: the active group minimizes, the target group unminimizes and comes to the foreground.
-4. New windows automatically join the active group.
+4. New windows join the active group **of the workspace they open on**.
+
+Stages are **per workspace**, like Stage Manager's own per-Space behaviour: each
+workspace keeps its own arrangement, and switching away and back leaves it
+intact. A window you drag to another workspace moves to that workspace's stages.
 
 ### Apps Mode
 

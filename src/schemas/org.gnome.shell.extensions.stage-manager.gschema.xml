@@ -32,7 +32,13 @@
         <key name="sidebar-auto-hide" type="b">
             <default>false</default>
             <summary>Auto-hide Sidebar</summary>
-            <description>When off (default): sidebar is always visible and hides only when windows overlap it (macOS behavior). When on: sidebar uses hover-to-reveal.</description>
+            <description>When off (default): the sidebar stays visible, drawn over your windows; the empty space around the cards passes clicks through to whatever is underneath. When on: the sidebar stays off screen and is revealed by moving the pointer to the left edge.</description>
+        </key>
+
+        <key name="sidebar-reserve-space" type="b">
+            <default>false</default>
+            <summary>Reserve Space for the Sidebar</summary>
+            <description>Shrink the work area so maximized windows stop underneath the sidebar instead of being covered by it, the way macOS shifts the stage across. Only applies when auto-hide is off, because a reserved strut cannot animate.</description>
         </key>
 
         <key name="auto-hide-delay" type="i">

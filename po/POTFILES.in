@@ -1,0 +1,3 @@
+src/extension.js
+src/prefs.js
+src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml

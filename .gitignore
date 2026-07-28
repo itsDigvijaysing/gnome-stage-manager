@@ -5,3 +5,4 @@ src/schemas/*.compiled
 node_modules/
 .eslintcache
 CLAUDE.md
+tests/ext-under-test.mjs
