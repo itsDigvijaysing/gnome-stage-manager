@@ -1,8 +1,8 @@
-# Stage Manager for GNOME
+# Stage Manager for Linux
 
 A macOS Stage Manager-like window management extension for GNOME Shell.
 
-Group windows into stages — only one group is visible at a time, others appear as stacked thumbnail cards in a left sidebar. Click a card to swap stages. Supports per-app mode, workspace mode, bell-curve hover animations, and 3D perspective.
+Group windows into stages: only one group is visible at a time, others appear as stacked thumbnail cards in a left sidebar. Click a card to swap stages. Supports per-app mode, workspace mode, bell-curve hover animations, and 3D perspective.
 
 ![Stage Manager Sidebar](assets/sidebar.png)
 
