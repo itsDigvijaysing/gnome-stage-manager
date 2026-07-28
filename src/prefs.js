@@ -108,6 +108,20 @@ export default class StageManagerPreferences extends ExtensionPreferences {
         settings.bind('show-workspace-current', showCurrentWsSwitch, 'active', Gio.SettingsBindFlags.DEFAULT);
         sideGroup.add(showCurrentWsSwitch);
 
+        // Smart Visibility
+        const smartGroup = new Adw.PreferencesGroup({
+            title: _('Smart Visibility'),
+            description: _('Automatically show the sidebar based on desktop state'),
+        });
+        behaviorPage.add(smartGroup);
+
+        const emptyWsSwitch = new Adw.SwitchRow({
+            title: _('Show on Empty Desktop'),
+            subtitle: _('Always show sidebar when all windows on the current workspace are minimized'),
+        });
+        settings.bind('show-on-empty-workspace', emptyWsSwitch, 'active', Gio.SettingsBindFlags.DEFAULT);
+        smartGroup.add(emptyWsSwitch);
+
         // Shortcuts
         const shortcutGroup = new Adw.PreferencesGroup({
             title: _('Shortcuts'),

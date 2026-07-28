@@ -340,6 +340,8 @@ class StageSidebar {
         this._addKeybinding();
         if (!this._settings.get_boolean('sidebar-auto-hide'))
             this._show();
+        else if (this._shouldForceShow())
+            this._show();
         this._syncEdge();
     }
 
@@ -500,7 +502,7 @@ class StageSidebar {
             this._killHoverTimer();
             this._resetAllCardScales();
             this._destroyPreview();
-            if (this._settings.get_boolean('sidebar-auto-hide'))
+            if (this._settings.get_boolean('sidebar-auto-hide') && !this._shouldForceShow())
                 this._scheduleHide();
             return Clutter.EVENT_PROPAGATE;
         });
@@ -724,13 +726,17 @@ class StageSidebar {
         sig(this._settings, 'changed::edge-trigger-width', () => this._rebuildLayout());
         sig(this._settings, 'changed::sidebar-auto-hide', () => {
             if (this._settings.get_boolean('sidebar-auto-hide')) {
-                if (!this._hovered) this._scheduleHide();
+                if (!this._hovered && !this._shouldForceShow()) this._scheduleHide();
+                else if (this._shouldForceShow()) this._show();
             } else {
                 this._show();
             }
             // Struts are incompatible with auto-hide, so this toggle can change
             // the answer even when visibility does not.
             this._applyChrome();
+        });
+        sig(this._settings, 'changed::show-on-empty-workspace', () => {
+            this._syncForceShow();
         });
         sig(this._settings, 'changed::show-app-icons', () => {
             if (this._visible) this._refresh();
@@ -779,6 +785,7 @@ class StageSidebar {
             this._adoptStrayWindows(ws);
 
         if (this._visible) this._refresh();
+        this._syncForceShow();
     }
 
     _seedGroups(ws) {
@@ -949,6 +956,7 @@ class StageSidebar {
             }
         }
         this._scheduleRefresh();
+        this._syncForceShow();
     }
 
     _onWindowUnminimize(win) {
@@ -967,6 +975,7 @@ class StageSidebar {
             this._cleanupEmptyGroups();
         }
         this._scheduleRefresh();
+        this._syncForceShow();
     }
 
     _onWindowMap(win) {
@@ -979,6 +988,7 @@ class StageSidebar {
             if (ws) this._ensureActiveGroup(ws).windows.add(win);
         }
         this._scheduleRefresh();
+        this._syncForceShow();
     }
 
     _onWindowDestroy(win) {
@@ -990,6 +1000,7 @@ class StageSidebar {
         }
         this._cleanupEmptyGroups();
         this._scheduleRefresh();
+        this._syncForceShow();
     }
 
     _swapToGroup(targetGroup) {
@@ -1049,7 +1060,7 @@ class StageSidebar {
             return GLib.SOURCE_REMOVE;
         });
 
-        if (this._settings.get_boolean('sidebar-auto-hide'))
+        if (this._settings.get_boolean('sidebar-auto-hide') && !this._shouldForceShow())
             this._scheduleHide();
     }
 
@@ -1078,7 +1089,7 @@ class StageSidebar {
             // An always-visible sidebar has to come back on its own; it used to
             // stay hidden until the user happened to brush the screen edge.
             if (this._settings.get_boolean('enable-stage-sidebar') &&
-                !this._settings.get_boolean('sidebar-auto-hide'))
+                (!this._settings.get_boolean('sidebar-auto-hide') || this._shouldForceShow()))
                 this._show();
         }
     }
@@ -1160,10 +1171,12 @@ class StageSidebar {
     }
 
     _scheduleHide() {
+        // Never hide when force-show is active (empty desktop override).
+        if (this._shouldForceShow()) return;
         this._killHideTimer();
         this._hideTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, this._HIDE_DELAY_MS, () => {
             this._hideTimer = null;
-            if (!this._hovered) this._hide();
+            if (!this._hovered && !this._shouldForceShow()) this._hide();
             return GLib.SOURCE_REMOVE;
         });
     }
@@ -2006,6 +2019,53 @@ class StageSidebar {
 
     _killSwapTimer() {
         if (this._swapTimer) { GLib.source_remove(this._swapTimer); this._swapTimer = null; }
+    }
+
+    // ── Show-on-empty-workspace ──────────────────────────────────────────
+
+    /**
+     * Whether the active workspace has any visible (non-minimized) normal
+     * windows. Returns false when every window is minimized, i.e. the user
+     * is looking at bare wallpaper.
+     */
+    _wsHasVisibleWindows() {
+        const ws = this._activeWs();
+        if (!ws) return false;
+        return ws.list_windows().some(w => _isNormal(w) && !w.minimized);
+    }
+
+    /**
+     * Whether the sidebar should be force-shown right now, overriding
+     * auto-hide. True only when ALL of:
+     *   1. The 'show-on-empty-workspace' setting is on.
+     *   2. The sidebar is enabled.
+     *   3. The active workspace has no visible (non-minimized) normal windows.
+     * Works in all 3 sidebar modes (groups, apps, workspaces).
+     */
+    _shouldForceShow() {
+        return this._settings.get_boolean('show-on-empty-workspace') &&
+               this._settings.get_boolean('enable-stage-sidebar') &&
+               !this._wsHasVisibleWindows();
+    }
+
+    /**
+     * Re-evaluate whether force-show should kick in or recede. Called on
+     * every state change that could flip the answer: workspace switch,
+     * minimize, unminimize, window map/destroy, and setting toggle.
+     */
+    _syncForceShow() {
+        if (!this._settings.get_boolean('enable-stage-sidebar')) return;
+        if (this._fullscreen()) return;
+
+        if (this._shouldForceShow()) {
+            // Empty desktop — make sure sidebar is visible.
+            this._killHideTimer();
+            if (!this._visible) this._show();
+        } else if (this._settings.get_boolean('sidebar-auto-hide') &&
+                   this._visible && !this._hovered) {
+            // Desktop is no longer empty and auto-hide is on — recede.
+            this._scheduleHide();
+        }
     }
 }
 

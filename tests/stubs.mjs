@@ -330,6 +330,7 @@ const DEFAULTS = {
     'perspective-angle': 22,
     'show-group-count': true,
     'show-workspace-current': true,
+    'show-on-empty-workspace': true,
     'toggle-sidebar': [],
 };
 
