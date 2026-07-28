@@ -35,6 +35,12 @@
             <description>When off (default): the sidebar stays visible, drawn over your windows; the empty space around the cards passes clicks through to whatever is underneath. When on: the sidebar stays off screen and is revealed by moving the pointer to the left edge.</description>
         </key>
 
+        <key name="show-on-empty-workspace" type="b">
+            <default>true</default>
+            <summary>Show on Empty Desktop</summary>
+            <description>When enabled and in Groups mode, always show the sidebar when all windows on the current workspace are minimized (desktop is empty). Auto-hide resumes once the user interacts with a card and windows become visible again.</description>
+        </key>
+
         <key name="sidebar-reserve-space" type="b">
             <default>false</default>
             <summary>Reserve Space for the Sidebar</summary>
