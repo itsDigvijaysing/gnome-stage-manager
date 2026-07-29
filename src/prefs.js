@@ -203,10 +203,7 @@ export default class StageManagerPreferences extends ExtensionPreferences {
         logRow.set_child(scrollWin);
         logGroup.add(logRow);
 
-        // Deliberately NOT loaded on open. Reading the journal means spawning
-        // `journalctl`, and EGO reviewers reasonably object to an extension
-        // running an external binary unprompted — so it only happens when the
-        // user asks for it with the button below.
+        // Not loaded on open — spawning `journalctl` unprompted is an EGO reviewer objection.
         logView.get_buffer().set_text(
             _('Press Refresh to load recent log messages.'), -1);
 
@@ -285,9 +282,7 @@ export default class StageManagerPreferences extends ExtensionPreferences {
     }
 
     _captureShortcut(parent, settings, key) {
-        // Adw.MessageDialog is deprecated since libadwaita 1.6 (GNOME 47) in
-        // favour of Adw.AlertDialog, which arrived in 1.5 (GNOME 46). Prefer the
-        // new class where it exists and keep the old one as the fallback.
+        // Adw.MessageDialog is deprecated in favor of Adw.AlertDialog (1.6+) — prefer it when available.
         const useAlert = typeof Adw.AlertDialog === 'function';
         const dialog = useAlert
             ? new Adw.AlertDialog({
@@ -338,20 +333,13 @@ export default class StageManagerPreferences extends ExtensionPreferences {
         return Config.PACKAGE_VERSION || _('unknown');
     }
 
-    /**
-     * Read this extension's recent log lines out of the journal.
-     *
-     * Only ever called from the Refresh button. There is no GIO API for reading
-     * the systemd journal, so a subprocess is unavoidable; it runs in the prefs
-     * process (never the shell), reads only, and is spawned asynchronously.
-     */
+    /** Read this extension's recent log lines out of the journal (Refresh button
+     *  only) — no GIO API for the journal, so an async read-only subprocess is unavoidable. */
     _loadLogs(textView) {
         const buf = textView.get_buffer();
         let proc;
         try {
-            // Matches both the extension's own '[stage-manager] …' lines and the
-            // shell's own errors, which quote the UUID. A plain 'stage-manager'
-            // pattern missed every hand-written log line.
+            // Matches both '[stage-manager] …' lines and the shell's own UUID-quoted errors.
             proc = Gio.Subprocess.new(
                 ['journalctl', '--user', '-b', '--no-pager', '-n', '50',
                  '-g', 'stage.?manager'],
