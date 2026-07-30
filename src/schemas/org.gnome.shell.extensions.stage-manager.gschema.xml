@@ -99,5 +99,28 @@
             <description>Keyboard shortcut to toggle the stage sidebar visibility. Empty array means no shortcut is bound.</description>
         </key>
 
+        <key name="sidebar-layout" type="s">
+            <default>'stack'</default>
+            <choices>
+                <choice value="stack"/>
+                <choice value="arc"/>
+            </choices>
+            <summary>Sidebar Layout</summary>
+            <description>Vertical stack (default) or a left-edge arc/carousel arrangement of cards.</description>
+        </key>
+
+        <key name="arc-angle-step" type="i">
+            <default>16</default>
+            <range min="8" max="30"/>
+            <summary>Arc Angle Step</summary>
+            <description>Degrees between adjacent cards when sidebar-layout is 'arc'. Smaller values show more cards at once.</description>
+        </key>
+
+        <key name="app-merge-map" type="s">
+            <default>'{}'</default>
+            <summary>App Merge Map (internal)</summary>
+            <description>Internal JSON map of appId to merge-group key, used by the 'apps' sidebar-mode's drag-to-merge feature. Not intended for manual editing.</description>
+        </key>
+
     </schema>
 </schemalist>
