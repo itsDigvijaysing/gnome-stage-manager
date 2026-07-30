@@ -54,10 +54,15 @@ export default class StageManagerPreferences extends ExtensionPreferences {
         // Sidebar mode — 3 options
         const modeRow = new Adw.ActionRow({
             title: _('Sidebar Content'),
-            subtitle: _('Groups = Stage Manager (swap), Apps = per-app (focus), Workspaces'),
+            subtitle: _('Groups = Stage Manager (swap), Apps = per-app (focus), Workspaces, All Windows'),
         });
-        const modeKeys = ['groups', 'apps', 'workspaces'];
-        const modeLabels = [_('Groups (Stage Manager)'), _('Apps (per-app focus)'), _('Workspaces')];
+        const modeKeys = ['groups', 'apps', 'workspaces', 'all-windows'];
+        const modeLabels = [
+            _('Groups (Stage Manager)'),
+            _('Apps (per-app focus)'),
+            _('Workspaces'),
+            _('All Windows (every workspace)'),
+        ];
         const modeDropdown = new Gtk.DropDown({
             model: Gtk.StringList.new(modeLabels),
             valign: Gtk.Align.CENTER,
@@ -111,12 +116,13 @@ export default class StageManagerPreferences extends ExtensionPreferences {
         // Shortcuts
         const shortcutGroup = new Adw.PreferencesGroup({
             title: _('Shortcuts'),
-            description: _('Keyboard shortcuts for the sidebar (none set by default)'),
+            description: _('No shortcut is set by default. Click Set to choose one — it takes effect immediately, no restart needed.'),
         });
         behaviorPage.add(shortcutGroup);
 
         this._addShortcutRow(shortcutGroup, settings, 'toggle-sidebar',
-            _('Toggle Sidebar'), _('Show or hide the stage sidebar'));
+            _('Toggle Sidebar'),
+            _('Reveal or hide the sidebar without moving the mouse to the screen edge'));
 
         // ── Appearance Page ──
         const lookPage = new Adw.PreferencesPage({

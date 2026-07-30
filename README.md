@@ -16,7 +16,8 @@ Group windows into stages: only one group is visible at a time, others appear as
 
 - **Stage Manager Groups** — Windows you use together stay grouped. Only the active group is visible; inactive groups appear as stacked thumbnail cards in a left sidebar.
 - **One-Click Swap** — Click any sidebar card to swap stages: the active group minimizes, the clicked group comes to the foreground.
-- **3 Sidebar Modes** — Groups (Stage Manager swap), Apps (per-app focus), Workspaces (switch workspaces).
+- **4 Sidebar Modes** — Groups (Stage Manager swap), Apps (per-app focus), Workspaces (switch workspaces), All Windows (every window on every workspace).
+- **Keyboard Shortcut** — Optional shortcut to reveal/hide the sidebar without moving the mouse to the screen edge. Set it in Preferences → Behavior → Shortcuts; it applies immediately.
 - **Maximize to Workspace** — Optionally move maximized windows to their own workspace (disabled by default).
 - **Bell-Curve Hover Animation** — Hovered card scales up smoothly; only 1-2 neighbors are affected (tight sigma).
 - **3D Perspective** — Cards have a configurable Y-axis rotation for a natural depth look, consistent direction for all cards.
@@ -111,7 +112,7 @@ Or click the gear icon in Extension Manager.
 |---------|---------|-------------|
 | Enable Maximize to Workspace | Off | Maximized windows get their own workspace |
 | Enable Stage Sidebar | On | Show the left-side sidebar |
-| Sidebar Content | Groups | Groups (Stage Manager), Apps (per-app focus), or Workspaces |
+| Sidebar Content | Groups | Groups (Stage Manager), Apps (per-app focus), Workspaces, or All Windows |
 | Auto-hide Sidebar | Off | Off = always visible (macOS default). On = hover to reveal |
 | Reserve Space for Sidebar | Off | Maximized windows stop at the sidebar instead of being covered (needs auto-hide off) |
 | Show App Icons | On | Display app icons below thumbnails |
@@ -149,6 +150,24 @@ Windows are grouped by application. Click a sidebar card to focus that app's win
 ### Workspaces Mode
 
 Each workspace is shown as a sidebar card. Click to switch workspaces.
+
+### All Windows Mode
+
+Every open window on every workspace gets its own card, grouped under a workspace
+heading — including minimized windows, which are otherwise unreachable without
+switching workspaces first. The window you are currently focused on is left out,
+since it is already in front of you.
+
+Clicking a card just activates that window; GNOME switches to its workspace for
+you. This mode never minimizes, regroups or moves anything, so your stages are
+left exactly as they were.
+
+### Keyboard Shortcut
+
+No shortcut is bound by default. Set one under **Preferences → Behavior →
+Shortcuts → Toggle Sidebar** and it takes effect immediately — no restart or
+re-login needed. Useful with *Auto-hide Sidebar* on, so the sidebar appears on a
+keypress instead of a mouse trip to the screen edge.
 
 ## Debugging
 

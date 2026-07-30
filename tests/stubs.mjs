@@ -46,6 +46,21 @@ class FakeActor {
         return id;
     }
     disconnect(id) { this._handlers?.delete(id); }
+    // Models GJS's connectObject()/disconnectObject(): every connection made
+    // with a given tracking object is disconnected together, in one call.
+    connectObject(sig, cb, trackingObj) {
+        const id = this.connect(sig, cb);
+        this._tracked ??= new Map();
+        const ids = this._tracked.get(trackingObj) ?? [];
+        ids.push(id);
+        this._tracked.set(trackingObj, ids);
+    }
+    disconnectObject(trackingObj) {
+        const ids = this._tracked?.get(trackingObj);
+        if (!ids) return;
+        ids.forEach(id => this.disconnect(id));
+        this._tracked.delete(trackingObj);
+    }
     emit(sig, ...args) {
         let ret;
         for (const h of this._handlers?.values() ?? [])
@@ -62,7 +77,9 @@ export const Clutter = {
     ActorAlign: { CENTER: 0, START: 1 },
     AnimationMode: { EASE_OUT_QUAD: 0, EASE_OUT_CUBIC: 1 },
     Orientation: { HORIZONTAL: 0, VERTICAL: 1 },
-    ScrollDirection: { UP: 0, DOWN: 1 },
+    // Real Clutter values — SMOOTH must not collide with UP/DOWN or the
+    // delta-vs-direction branch in _onScrollEvent() is untested.
+    ScrollDirection: { UP: 0, DOWN: 1, LEFT: 2, RIGHT: 3, SMOOTH: 4 },
     PolicyType: { NEVER: 0 },
     EVENT_STOP: true,
     EVENT_PROPAGATE: false,
@@ -74,8 +91,8 @@ export const St = {
     // comparing against it silently passes either way.
     PolicyType: { ALWAYS: 0, AUTOMATIC: 1, NEVER: 2, EXTERNAL: 3 },
     SystemColorScheme: { DEFAULT: 0, PREFER_DARK: 1, PREFER_LIGHT: 2 },
-    ThemeContext: { get_for_stage: () => ({ scale_factor: 1, connect: () => 1, disconnect: () => {} }) },
-    Settings: { get: () => ({ color_scheme: 0, connect: () => 1, disconnect: () => {} }) },
+    ThemeContext: { get_for_stage: () => ({ scale_factor: 1, connect: () => 1, disconnect: () => {}, connectObject: () => {}, disconnectObject: () => {} }) },
+    Settings: { get: () => ({ color_scheme: 0, connect: () => 1, disconnect: () => {}, connectObject: () => {}, disconnectObject: () => {} }) },
     Widget: class Widget extends FakeActor {},
     BoxLayout: class BoxLayout extends FakeActor {},
     ScrollView: class ScrollView extends FakeActor {
@@ -223,6 +240,21 @@ class Emitter {
         if (!this._h.has(id)) throw new Error(`${this.name}: disconnect of unknown id ${id}`);
         this._h.delete(id);
     }
+    // Models GJS's connectObject()/disconnectObject(): every connection made
+    // with a given tracking object is disconnected together, in one call.
+    connectObject(sig, cb, trackingObj) {
+        const id = this.connect(sig, cb);
+        this._tracked ??= new Map();
+        const ids = this._tracked.get(trackingObj) ?? [];
+        ids.push(id);
+        this._tracked.set(trackingObj, ids);
+    }
+    disconnectObject(trackingObj) {
+        const ids = this._tracked?.get(trackingObj);
+        if (!ids) return;
+        ids.forEach(id => this.disconnect(id));
+        this._tracked.delete(trackingObj);
+    }
     emit(sig, ...args) {
         for (const { sig: s, cb } of [...this._h.values()])
             if (s === sig) cb(this, ...args);
@@ -262,12 +294,22 @@ export function deliver(sidebar, wins) {
     }
 }
 
+/** Which window `global.display.get_focus_window()` reports. */
+let focusedWindow = null;
+
+/** Set the focused window (modes that hide "what you're already looking at"
+ *  depend on it). Pass null for "nothing focused". */
+export function setFocus(win) {
+    focusedWindow = win ?? null;
+}
+
 /** Full isolation between tests: no leaked handlers, no leaked timers. */
 export function resetHarness() {
     windowManager.clear();
     display.clear();
     wsmEmitter.clear();
     clock.reset();
+    focusedWindow = null;
 }
 
 export const Shell = {
@@ -298,6 +340,8 @@ export const Main = {
         removeChrome: () => {},
         connect: () => 1,
         disconnect: () => {},
+        connectObject: () => {},
+        disconnectObject: () => {},
     },
     wm: { addKeybinding: () => 1, removeKeybinding: () => {} },
 };
@@ -344,6 +388,8 @@ export function makeSettings(overrides = {}) {
         set: (k, v) => { values[k] = v; em.emit(`changed::${k}`); },
         connect: (s, cb) => em.connect(s, cb),
         disconnect: id => em.disconnect(id),
+        connectObject: (s, cb, t) => em.connectObject(s, cb, t),
+        disconnectObject: t => em.disconnectObject(t),
         _emitter: em,
     };
 }
@@ -355,9 +401,11 @@ export function installGlobals() {
         workspace_manager: Object.assign(wsm, {
             connect: (s, cb) => wsmEmitter.connect(s, cb),
             disconnect: id => wsmEmitter.disconnect(id),
+            connectObject: (s, cb, t) => wsmEmitter.connectObject(s, cb, t),
+            disconnectObject: t => wsmEmitter.disconnectObject(t),
         }),
         display: Object.assign(display, {
-            get_focus_window: () => null,
+            get_focus_window: () => focusedWindow,
             get_monitor_in_fullscreen: () => false,
         }),
         stage: {},

@@ -1,5 +1,5 @@
 UUID = stage-manager@gnome-stage-manager
-VERSION = 1.4.0
+VERSION = 1.4.1
 EXTENSION_DIR = $(HOME)/.local/share/gnome-shell/extensions/$(UUID)
 SRC_DIR = src
 SCHEMAS_DIR = $(SRC_DIR)/schemas

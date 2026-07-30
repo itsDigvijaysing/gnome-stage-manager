@@ -6,41 +6,41 @@
 #, fuzzy
 msgid ""
 msgstr ""
-"Project-Id-Version: Stage Manager 1.4.0\n"
+"Project-Id-Version: Stage Manager 1.4.1\n"
 "Report-Msgid-Bugs-To: https://github.com/itsdigvijaysing/gnome-stage-manager/"
 "issues\n"
-"POT-Creation-Date: 2026-07-28 10:17+0530\n"
+"POT-Creation-Date: 2026-07-30 03:14+0530\n"
 "PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
 "Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
 "Language-Team: LANGUAGE <LL@li.org>\n"
 "Language: \n"
 "MIME-Version: 1.0\n"
-"Content-Type: text/plain; charset=CHARSET\n"
+"Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
 "Plural-Forms: nplurals=INTEGER; plural=EXPRESSION;\n"
 
-#: src/extension.js:1702
-#, javascript-format
-msgid "Workspace %d (current)"
-msgstr ""
-
-#: src/extension.js:1703
+#: src/extension.js:1192 src/extension.js:1585
 #, javascript-format
 msgid "Workspace %d"
 msgstr ""
 
-#: src/extension.js:1711
+#: src/extension.js:1584
+#, javascript-format
+msgid "Workspace %d (current)"
+msgstr ""
+
+#: src/extension.js:1593
 #, javascript-format
 msgid "%d window"
 msgid_plural "%d windows"
 msgstr[0] ""
 msgstr[1] ""
 
-#: src/extension.js:1949
+#: src/extension.js:1808
 msgid "Application"
 msgstr ""
 
-#: src/extension.js:1969
+#: src/extension.js:1828
 #, javascript-format
 msgid "%d window (minimized)"
 msgid_plural "%d windows (minimized)"
@@ -89,231 +89,239 @@ msgid "Sidebar Content"
 msgstr ""
 
 #: src/prefs.js:57
-msgid "Groups = Stage Manager (swap), Apps = per-app (focus), Workspaces"
+msgid ""
+"Groups = Stage Manager (swap), Apps = per-app (focus), Workspaces, All "
+"Windows"
 msgstr ""
 
-#: src/prefs.js:60
+#: src/prefs.js:61
 msgid "Groups (Stage Manager)"
 msgstr ""
 
-#: src/prefs.js:60
+#: src/prefs.js:62
 msgid "Apps (per-app focus)"
 msgstr ""
 
-#: src/prefs.js:60
+#: src/prefs.js:63
 msgid "Workspaces"
 msgstr ""
 
-#: src/prefs.js:77
+#: src/prefs.js:64
+msgid "All Windows (every workspace)"
+msgstr ""
+
+#: src/prefs.js:82
 #: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:34
 msgid "Auto-hide Sidebar"
 msgstr ""
 
-#: src/prefs.js:78
+#: src/prefs.js:83
 msgid "Off = always visible (macOS default). On = hover to reveal."
 msgstr ""
 
-#: src/prefs.js:84
+#: src/prefs.js:89
 msgid "Reserve Space for Sidebar"
 msgstr ""
 
-#: src/prefs.js:85
+#: src/prefs.js:90
 msgid ""
 "Maximized windows stop at the sidebar instead of being covered. Needs auto-"
 "hide off."
 msgstr ""
 
-#: src/prefs.js:91
+#: src/prefs.js:96
 msgid "Show App Icons"
 msgstr ""
 
-#: src/prefs.js:92
+#: src/prefs.js:97
 msgid "Display app icon below each thumbnail"
 msgstr ""
 
-#: src/prefs.js:98
+#: src/prefs.js:103
 msgid "Show Window Count Badge"
 msgstr ""
 
-#: src/prefs.js:99
+#: src/prefs.js:104
 msgid "Show number of windows on group thumbnails"
 msgstr ""
 
-#: src/prefs.js:105
+#: src/prefs.js:110
 #: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:92
 msgid "Show Current Workspace"
 msgstr ""
 
-#: src/prefs.js:106
+#: src/prefs.js:111
 msgid "In workspace mode, also show the current workspace card"
 msgstr ""
 
-#: src/prefs.js:113
+#: src/prefs.js:118
 msgid "Shortcuts"
 msgstr ""
 
-#: src/prefs.js:114
-msgid "Keyboard shortcuts for the sidebar (none set by default)"
+#: src/prefs.js:119
+msgid ""
+"No shortcut is set by default. Click Set to choose one — it takes effect "
+"immediately, no restart needed."
 msgstr ""
 
-#: src/prefs.js:119
+#: src/prefs.js:124
 msgid "Toggle Sidebar"
 msgstr ""
 
-#: src/prefs.js:119
-msgid "Show or hide the stage sidebar"
+#: src/prefs.js:125
+msgid "Reveal or hide the sidebar without moving the mouse to the screen edge"
 msgstr ""
 
-#: src/prefs.js:123
+#: src/prefs.js:129
 msgid "Appearance"
 msgstr ""
 
-#: src/prefs.js:128
+#: src/prefs.js:134
 msgid "Dimensions"
 msgstr ""
 
-#: src/prefs.js:132
+#: src/prefs.js:138
 #: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:21
 msgid "Sidebar Width"
 msgstr ""
 
-#: src/prefs.js:132
+#: src/prefs.js:138
 msgid "Width in pixels"
 msgstr ""
 
-#: src/prefs.js:134
+#: src/prefs.js:140
 #: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:54
 msgid "Edge Trigger Width"
 msgstr ""
 
-#: src/prefs.js:134
+#: src/prefs.js:140
 msgid "Hot zone at screen edge (pixels)"
 msgstr ""
 
-#: src/prefs.js:136
+#: src/prefs.js:142
 msgid "Cards"
 msgstr ""
 
-#: src/prefs.js:140
+#: src/prefs.js:146
 #: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:73
 msgid "Card Base Scale"
 msgstr ""
 
-#: src/prefs.js:140
+#: src/prefs.js:146
 msgid "Default card size percentage (40-100)"
 msgstr ""
 
-#: src/prefs.js:142
+#: src/prefs.js:148
 #: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:80
 msgid "Perspective Angle"
 msgstr ""
 
-#: src/prefs.js:142
+#: src/prefs.js:148
 msgid "3D rotation in degrees (0 = flat)"
 msgstr ""
 
-#: src/prefs.js:144
+#: src/prefs.js:150
 msgid "Animation"
 msgstr ""
 
-#: src/prefs.js:148
+#: src/prefs.js:154
 #: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:28
 msgid "Animation Duration"
 msgstr ""
 
-#: src/prefs.js:148
+#: src/prefs.js:154
 msgid "Slide speed in milliseconds"
 msgstr ""
 
-#: src/prefs.js:150
+#: src/prefs.js:156
 msgid "Hide Delay"
 msgstr ""
 
-#: src/prefs.js:150
+#: src/prefs.js:156
 msgid "Delay before hiding after mouse leaves (ms)"
 msgstr ""
 
-#: src/prefs.js:154
+#: src/prefs.js:160
 msgid "About"
 msgstr ""
 
-#: src/prefs.js:159
+#: src/prefs.js:165
 msgid "Stage Manager"
 msgstr ""
 
-#: src/prefs.js:163
+#: src/prefs.js:169
 msgid "Version"
 msgstr ""
 
-#: src/prefs.js:169
+#: src/prefs.js:175
 msgid "GNOME Shell"
 msgstr ""
 
-#: src/prefs.js:175
+#: src/prefs.js:181
 msgid "Session Type"
 msgstr ""
 
-#: src/prefs.js:176 src/prefs.js:338
+#: src/prefs.js:182 src/prefs.js:339
 msgid "unknown"
 msgstr ""
 
-#: src/prefs.js:182
+#: src/prefs.js:188
 msgid "Extension Logs"
 msgstr ""
 
-#: src/prefs.js:183
+#: src/prefs.js:189
 msgid "Recent errors from this extension (for bug reports)"
 msgstr ""
 
-#: src/prefs.js:211
+#: src/prefs.js:214
 msgid "Press Refresh to load recent log messages."
 msgstr ""
 
-#: src/prefs.js:214
+#: src/prefs.js:217
 msgid "Refresh Logs"
 msgstr ""
 
-#: src/prefs.js:216
+#: src/prefs.js:219
 msgid "Refresh"
 msgstr ""
 
-#: src/prefs.js:224
+#: src/prefs.js:227
 msgid "Copy Logs"
 msgstr ""
 
-#: src/prefs.js:226
+#: src/prefs.js:229
 msgid "Copy to Clipboard"
 msgstr ""
 
-#: src/prefs.js:257
+#: src/prefs.js:260
 msgid "Disabled"
 msgstr ""
 
-#: src/prefs.js:269
+#: src/prefs.js:272
 msgid "Set"
 msgstr ""
 
-#: src/prefs.js:277
+#: src/prefs.js:280
 msgid "Clear shortcut"
 msgstr ""
 
-#: src/prefs.js:294 src/prefs.js:300
+#: src/prefs.js:295 src/prefs.js:301
 msgid "Press shortcut"
 msgstr ""
 
-#: src/prefs.js:295 src/prefs.js:301
+#: src/prefs.js:296 src/prefs.js:302
 msgid "Press the key combination you want to use, or Escape to cancel."
 msgstr ""
 
-#: src/prefs.js:303
+#: src/prefs.js:304
 msgid "Cancel"
 msgstr ""
 
-#: src/prefs.js:361
+#: src/prefs.js:355
 msgid "Could not load logs. Run manually:"
 msgstr ""
 
-#: src/prefs.js:370
+#: src/prefs.js:364
 msgid "No recent logs found."
 msgstr ""
 
@@ -389,7 +397,8 @@ msgstr ""
 #: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:67
 msgid ""
 "What to show in sidebar cards. 'groups' = stage manager (swap groups), "
-"'apps' = per-app (just focus), 'workspaces' = other workspaces."
+"'apps' = per-app (just focus), 'workspaces' = other workspaces, 'all-"
+"windows' = every window on every workspace (click to activate)."
 msgstr ""
 
 #: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:74

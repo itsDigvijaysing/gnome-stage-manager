@@ -51,14 +51,11 @@ function _isNormal(win) {
 }
 
 function _nullCloneSources(actor) {
-    try {
-        if (actor instanceof Clutter.Clone) {
-            try { actor.set_source(null); } catch (_e) { /* */ }
-        }
-        const children = actor.get_children ? actor.get_children() : [];
-        for (const child of children)
-            _nullCloneSources(child);
-    } catch (_e) { /* actor already gone */ }
+    if (!actor) return;
+    if (actor instanceof Clutter.Clone)
+        actor.set_source(null);
+    for (const child of actor.get_children?.() ?? [])
+        _nullCloneSources(child);
 }
 
 function _bellCurve(dist, sigma) {
@@ -101,7 +98,7 @@ function _groupByApp(workspace, focusedWindow) {
 class MaximizeToWorkspace {
     constructor(settings) {
         this._settings = settings;
-        this._sigs = [];
+        this._sigSources = new Set();
         this._timers = [];
         this._moved = new Set();
         // win → origin Meta.Workspace, never an index — mutter reaps empty
@@ -112,30 +109,26 @@ class MaximizeToWorkspace {
     enable() {
         this._sig(global.window_manager, 'size-change', this._onSize.bind(this));
         this._sig(global.window_manager, 'destroy', (_wm, actor) => {
-            try {
-                const w = actor.meta_window;
-                if (w) {
-                    this._moved.delete(w);
-                    this._origin.delete(w);
-                }
-            } catch (_) { /* */ }
+            const w = actor?.meta_window;
+            if (w) {
+                this._moved.delete(w);
+                this._origin.delete(w);
+            }
         });
     }
 
     disable() {
-        // Each disconnect/remove is guarded individually — one throw mid-loop
-        // would otherwise abandon every remaining cleanup step.
-        this._sigs.splice(0).forEach(s => {
-            try { s.o.disconnect(s.i); } catch (_) { /* already finalized */ }
-        });
-        this._timers.splice(0).forEach(id => {
-            try { GLib.source_remove(id); } catch (_) { /* already fired */ }
-        });
+        this._sigSources.forEach(o => o.disconnectObject(this));
+        this._sigSources.clear();
+        this._timers.splice(0).forEach(id => GLib.source_remove(id));
         this._moved.clear();
         this._origin.clear();
     }
 
-    _sig(o, s, cb) { this._sigs.push({ o, i: o.connect(s, cb) }); }
+    _sig(o, s, cb) {
+        o.connectObject(s, cb, this);
+        this._sigSources.add(o);
+    }
 
     /** Drop a fired timer from tracking without disturbing the others. */
     _untrackTimer(id) {
@@ -232,8 +225,8 @@ class MaximizeToWorkspace {
 class StageSidebar {
     constructor(settings) {
         this._settings = settings;
-        this._sigs = [];        // persistent signals (cleared in disable)
-        this._cardSigs = [];    // per-card signals (cleared each refresh)
+        this._sigSources = new Set();      // persistent signal sources (cleared in disable)
+        this._cardSigSources = new Set();  // per-card signal sources (cleared each refresh)
         this._cards = [];
         this._panel = null;
         this._edge = null;
@@ -278,20 +271,22 @@ class StageSidebar {
 
     // ── Signal & timer tracking ─────────────────────────────────────────
     // Every signal MUST flow through _sig()/_cardSig() so it can be disconnected
-    // in disable() — shexli (EGO-L-003) flags untracked .connect() calls.
+    // in disable() (EGO-L-003) — both route through connectObject(), tracked
+    // per-source so disable() can call disconnectObject(this) on each source.
 
     _sig(obj, signal, cb) {
-        this._sigs.push({ o: obj, i: obj.connect(signal, cb) });
+        obj.connectObject(signal, cb, this);
+        this._sigSources.add(obj);
     }
 
     _cardSig(obj, signal, cb) {
-        this._cardSigs.push({ o: obj, i: obj.connect(signal, cb) });
+        obj.connectObject(signal, cb, this);
+        this._cardSigSources.add(obj);
     }
 
     _disconnectCardSigs() {
-        this._cardSigs.splice(0).forEach(s => {
-            try { s.o.disconnect(s.i); } catch (_) { /* card already destroyed */ }
-        });
+        this._cardSigSources.forEach(o => o.disconnectObject(this));
+        this._cardSigSources.clear();
     }
 
     // ── Settings getters ──
@@ -325,11 +320,9 @@ class StageSidebar {
         this._killSwapTimer();
         // Keybinding before signals so the wm doesn't keep a stale handler.
         this._removeKeybinding();
-        // Signals next (EGO-L-003). Each disconnect is guarded individually — one
-        // throw here used to abandon every step below it, leaving chrome on screen.
-        this._sigs.splice(0).forEach(s => {
-            try { s.o.disconnect(s.i); } catch (_) { /* already finalized */ }
-        });
+        // Signals next (EGO-L-003).
+        this._sigSources.forEach(o => o.disconnectObject(this));
+        this._sigSources.clear();
         this._disconnectCardSigs();
         // Then preview + card content (cards live inside _box).
         this._destroyPreview();
@@ -344,25 +337,21 @@ class StageSidebar {
         // Explicit destroy for every actor created in _build() (EGO-L-002).
         // Destroy children before parents so set_child(null) calls don't dangle.
         if (this._box) {
-            try { this._box.destroy(); } catch (_) { /* already gone */ }
+            this._box.destroy();
             this._box = null;
         }
         if (this._scroll) {
-            try { this._scroll.destroy(); } catch (_) { /* already gone */ }
+            this._scroll.destroy();
             this._scroll = null;
         }
         if (this._panel) {
-            try {
-                Main.layoutManager.removeChrome(this._panel);
-                this._panel.destroy();
-            } catch (_) { /* already gone */ }
+            Main.layoutManager.removeChrome(this._panel);
+            this._panel.destroy();
             this._panel = null;
         }
         if (this._edge) {
-            try {
-                Main.layoutManager.removeChrome(this._edge);
-                this._edge.destroy();
-            } catch (_) { /* already gone */ }
+            Main.layoutManager.removeChrome(this._edge);
+            this._edge.destroy();
             this._edge = null;
         }
     }
@@ -469,10 +458,8 @@ class StageSidebar {
         const wanted = this._wantStruts();
         if (this._chromeAdded && this._chromeStruts === wanted) return;
 
-        if (this._chromeAdded) {
-            try { Main.layoutManager.removeChrome(this._panel); }
-            catch (_) { /* not tracked */ }
-        }
+        if (this._chromeAdded)
+            Main.layoutManager.removeChrome(this._panel);
         Main.layoutManager.addChrome(this._panel, {
             trackFullscreen: false,
             affectsStruts: wanted,
@@ -488,18 +475,17 @@ class StageSidebar {
         if (!adj) return Clutter.EVENT_PROPAGATE;
 
         // Smooth-scroll devices (touchpads, hi-res mice) report a delta; legacy
-        // mice only report a discrete direction. Fall back so wheel scrolling
-        // still works on those devices.
+        // mice only report a discrete direction. get_scroll_delta() is only
+        // meaningful for SMOOTH, so branch on the direction instead of probing
+        // it — the shape GNOME's own scroll handlers use.
         let dy = 0;
-        try {
-            const [, sdy] = event.get_scroll_delta();
-            dy = sdy;
-        } catch (_) { dy = 0; }
-        if (dy === 0) {
-            const dir = event.get_scroll_direction();
-            if (dir === Clutter.ScrollDirection.UP) dy = -1;
-            else if (dir === Clutter.ScrollDirection.DOWN) dy = 1;
-        }
+        const dir = event.get_scroll_direction();
+        if (dir === Clutter.ScrollDirection.SMOOTH)
+            [, dy] = event.get_scroll_delta();
+        else if (dir === Clutter.ScrollDirection.UP)
+            dy = -1;
+        else if (dir === Clutter.ScrollDirection.DOWN)
+            dy = 1;
         // A smooth-scroll gesture ends with a zero-delta event; let it through
         // instead of swallowing it.
         if (dy === 0) return Clutter.EVENT_PROPAGATE;
@@ -512,14 +498,12 @@ class StageSidebar {
 
     /** The actor a crossing event is travelling to/from, if the event exposes one. */
     _crossingRelated(event) {
-        try { return event ? event.get_related() : null; }
-        catch (_) { return null; }
+        return event?.get_related() ?? null;
     }
 
     _insidePanel(actor) {
         if (!actor || !this._panel) return false;
-        try { return actor === this._panel || this._panel.contains(actor); }
-        catch (_) { return false; }
+        return actor === this._panel || this._panel.contains(actor);
     }
 
     /** `vertical` is deprecated in favor of `orientation` on GNOME 48+ — set
@@ -766,10 +750,7 @@ class StageSidebar {
      *  dragged elsewhere is skipped rather than minimized/cloned from the wrong stage. */
     _groupWindows(group) {
         return [...group.windows]
-            .filter(w => {
-                try { return w.get_workspace() === group.ws; }
-                catch (_) { return false; }
-            })
+            .filter(w => w.get_workspace() === group.ws)
             .sort((a, b) => (b.get_user_time() || 0) - (a.get_user_time() || 0));
     }
 
@@ -782,8 +763,7 @@ class StageSidebar {
     }
 
     _workspaceOf(win) {
-        try { return win.get_workspace(); }
-        catch (_) { return null; }
+        return win.get_workspace();
     }
 
     /** Drop `win` from a stage whose workspace it no longer lives on — otherwise
@@ -896,8 +876,7 @@ class StageSidebar {
                     // producing frames and a live clone would go blank.
                     this._captureSnapshot(win);
                     this._expectMinimize.add(win);
-                    try { win.minimize(); }
-                    catch (_) { this._expectMinimize.delete(win); }
+                    win.minimize();
                 }
             }
         }
@@ -906,8 +885,7 @@ class StageSidebar {
         for (const win of targetWins) {
             if (win.minimized) {
                 this._expectUnminimize.add(win);
-                try { win.unminimize(); }
-                catch (_) { this._expectUnminimize.delete(win); }
+                win.unminimize();
             }
         }
 
@@ -944,8 +922,10 @@ class StageSidebar {
     // ── Fullscreen ──
 
     _fullscreen() {
-        try { return global.display.get_monitor_in_fullscreen(Main.layoutManager.primaryMonitor.index); }
-        catch (_) { return false; }
+        // primaryMonitor is briefly null while monitors are being reconfigured.
+        const mon = Main.layoutManager.primaryMonitor;
+        if (!mon) return false;
+        return global.display.get_monitor_in_fullscreen(mon.index);
     }
 
     _onFullscreen() {
@@ -1088,6 +1068,8 @@ class StageSidebar {
             this._refreshWorkspaces();
         else if (mode === 'apps')
             this._refreshApps();
+        else if (mode === 'all-windows')
+            this._refreshAllWindows();
         else
             this._refreshGroups();
 
@@ -1126,6 +1108,20 @@ class StageSidebar {
             const groups = _groupByApp(this._activeWs(), global.display.get_focus_window());
             for (const g of groups)
                 parts.push(`${g.app ? g.app.get_id() : '?'}:${ids(g.windows)}`);
+        } else if (mode === 'all-windows') {
+            // Every window is its own card here, so each one's shape matters —
+            // ids() only buckets the front window's aspect.
+            const wsm = global.workspace_manager;
+            const focused = global.display.get_focus_window();
+            const winSig = w =>
+                `${w.get_id()}@${Math.round((this._windowAspect(w) ?? 0) * 20)}`;
+            parts.push(focused ? focused.get_id() : 0);
+            for (let i = 0; i < wsm.get_n_workspaces(); i++) {
+                const ws = wsm.get_workspace_by_index(i);
+                if (!ws) continue;
+                const wins = ws.list_windows().filter(w => _isNormal(w) && w !== focused);
+                parts.push(`${i}:${wins.map(winSig).join('.')}`);
+            }
         } else {
             for (const g of this._getInactiveGroups())
                 parts.push(`${g.id}:${ids(this._groupWindows(g))}`);
@@ -1136,10 +1132,8 @@ class StageSidebar {
     _refreshGroups() {
         const all = this._getInactiveGroups();
         for (const group of all.slice(0, MAX_GROUPS)) {
-            try {
-                const card = this._makeGroupCard(group);
-                if (card) { this._box.add_child(card); this._cards.push(card); }
-            } catch (e) { console.error(`[stage-manager] group card: ${e.message}`); }
+            const card = this._makeGroupCard(group);
+            if (card) { this._box.add_child(card); this._cards.push(card); }
         }
         this._addOverflowLabel(all.length - MAX_GROUPS);
     }
@@ -1148,12 +1142,98 @@ class StageSidebar {
         const focusedWin = global.display.get_focus_window();
         const all = _groupByApp(this._activeWs(), focusedWin);
         for (const group of all.slice(0, MAX_GROUPS)) {
-            try {
-                const card = this._makeAppCard(group);
-                if (card) { this._box.add_child(card); this._cards.push(card); }
-            } catch (e) { console.error(`[stage-manager] app card: ${e.message}`); }
+            const card = this._makeAppCard(group);
+            if (card) { this._box.add_child(card); this._cards.push(card); }
         }
         this._addOverflowLabel(all.length - MAX_GROUPS);
+    }
+
+    /** Every window on every workspace, one card each, under a workspace header.
+     *  Deliberately READ-ONLY: it never minimizes, regroups or moves a window, so
+     *  the workspace-scoped stage model is untouched. Clicking just activates the
+     *  window and lets mutter switch workspace itself. */
+    _refreshAllWindows() {
+        const wsm = global.workspace_manager;
+        const focused = global.display.get_focus_window();
+        const n = wsm.get_n_workspaces();
+        let shown = 0;
+        let total = 0;
+
+        for (let i = 0; i < n; i++) {
+            const ws = wsm.get_workspace_by_index(i);
+            if (!ws) continue;
+            // The focused window is already in front of you — showing it would
+            // just be a card of what you are looking at.
+            const wins = ws.list_windows()
+                .filter(w => _isNormal(w) && w !== focused)
+                .sort((a, b) => (b.get_user_time() || 0) - (a.get_user_time() || 0));
+            total += wins.length;
+            if (wins.length === 0) continue;
+
+            // Header only when at least one of this workspace's cards will fit,
+            // or an empty heading is left dangling at the cap.
+            if (shown >= MAX_GROUPS) continue;
+            this._addWorkspaceHeader(i);
+
+            for (const win of wins) {
+                if (shown >= MAX_GROUPS) break;
+                const card = this._makeWindowCard(win);
+                if (card) { this._box.add_child(card); this._cards.push(card); shown++; }
+            }
+        }
+        this._addOverflowLabel(total - shown);
+    }
+
+    /** Workspace heading in all-windows mode. Not pushed to `_cards` — it is a
+     *  label, not a hover/bell-curve target (same rule as the overflow label). */
+    _addWorkspaceHeader(wsIndex) {
+        if (!this._box) return;
+        this._box.add_child(new St.Label({
+            text: _('Workspace %d').replace('%d', `${wsIndex + 1}`),
+            reactive: false,
+            x_align: Clutter.ActorAlign.CENTER,
+            style_class: this._cls('stage-ws-header'),
+        }));
+    }
+
+    /** A single-window card for all-windows mode. */
+    _makeWindowCard(win) {
+        const windows = [win];
+        const card = this._wrapCard();
+        const thumb = this._makeStackedThumb(windows);
+        card.add_child(thumb);
+        card._thumb = thumb;
+
+        if (this._settings.get_boolean('show-app-icons')) {
+            const app = Shell.WindowTracker.get_default().get_window_app(win);
+            if (app) {
+                const iconBox = new St.BoxLayout({
+                    x_align: Clutter.ActorAlign.CENTER,
+                    style: 'margin-top: 5px;',
+                });
+                iconBox.add_child(app.create_icon_texture(ICON_SIZE));
+                card.add_child(iconBox);
+            }
+        }
+
+        card.set_pivot_point(0.5, 0.5);
+        const idx = this._cards.length;
+        this._wireCardEvents(card, thumb, windows, idx);
+        this._cardSig(card, 'button-release-event', () => {
+            this._destroyPreview();
+            this._activateWindow(win);
+            return Clutter.EVENT_STOP;
+        });
+        return card;
+    }
+
+    /** Bring one window to the front. mutter switches to its workspace itself,
+     *  so no window is ever moved between workspaces here. */
+    _activateWindow(win) {
+        if (win.minimized) win.unminimize();
+        win.activate(global.get_current_time());
+        if (this._settings.get_boolean('sidebar-auto-hide')) this._scheduleHide();
+        this._scheduleRefresh();
     }
 
     /** Show "+N" for stages beyond MAX_GROUPS instead of dropping them silently.
@@ -1178,10 +1258,8 @@ class StageSidebar {
             const ws = wsm.get_workspace_by_index(i);
             const wins = ws.list_windows().filter(w => _isNormal(w));
             if (wins.length === 0 && i !== activeIdx) continue;
-            try {
-                const card = this._makeWorkspaceCard(ws, wins, i, i === activeIdx);
-                if (card) { this._box.add_child(card); this._cards.push(card); }
-            } catch (e) { console.error(`[stage-manager] ws card: ${e.message}`); }
+            const card = this._makeWorkspaceCard(ws, wins, i, i === activeIdx);
+            if (card) { this._box.add_child(card); this._cards.push(card); }
         }
     }
 
@@ -1332,15 +1410,11 @@ class StageSidebar {
         const { aw, ah } = geom;
         const scale = Math.min(maxW / aw, maxH / ah, maxScale);
 
-        try {
-            const inner = geom.content
-                ? new St.Widget({ reactive: false, content: geom.content })
-                : new Clutter.Clone({ source: geom.actor, reactive: false });
-            inner.set_size(Math.round(aw * scale), Math.round(ah * scale));
-            return inner;
-        } catch (_) {
-            return null;
-        }
+        const inner = geom.content
+            ? new St.Widget({ reactive: false, content: geom.content })
+            : new Clutter.Clone({ source: geom.actor, reactive: false });
+        inner.set_size(Math.round(aw * scale), Math.round(ah * scale));
+        return inner;
     }
 
     /** Size of `win`'s compositor actor — the whole thing, shadow included. */
@@ -1348,8 +1422,7 @@ class StageSidebar {
         const actor = win.get_compositor_private?.();
         if (!actor) return null;
 
-        let aw = 0, ah = 0;
-        try { [aw, ah] = actor.get_size(); } catch (_) { return null; }
+        const [aw, ah] = actor.get_size();
         if (!(aw > 0) || !(ah > 0)) return null;
 
         return { aw, ah, actor, content: null };
@@ -1363,14 +1436,14 @@ class StageSidebar {
         if (!geom) return;
         if (typeof geom.actor.paint_to_content !== 'function') return;
 
-        try {
-            const content = geom.actor.paint_to_content(null);
-            if (!content) return;
-            this._snapshots.delete(win);   // re-insert so it counts as newest
-            this._snapshots.set(win, { aw: geom.aw, ah: geom.ah, actor: null, content });
-            while (this._snapshots.size > MAX_SNAPSHOTS)
-                this._snapshots.delete(this._snapshots.keys().next().value);
-        } catch (_) { /* nothing usable to cache; icon fallback covers it */ }
+        // Returns null when the actor has no drawable buffer; the icon
+        // fallback covers that case.
+        const content = geom.actor.paint_to_content(null);
+        if (!content) return;
+        this._snapshots.delete(win);   // re-insert so it counts as newest
+        this._snapshots.set(win, { aw: geom.aw, ah: geom.ah, actor: null, content });
+        while (this._snapshots.size > MAX_SNAPSHOTS)
+            this._snapshots.delete(this._snapshots.keys().next().value);
     }
 
     _dropSnapshot(win) {
@@ -1388,11 +1461,9 @@ class StageSidebar {
     _windowAspect(win) {
         const geom = this._windowGeometry(win) ?? this._snapshots.get(win);
         if (geom) return this._clampAspect(geom.aw / geom.ah);
-        try {
-            const r = win.get_frame_rect();
-            if (r && r.width > 0 && r.height > 0)
-                return this._clampAspect(r.width / r.height);
-        } catch (_) { /* unavailable */ }
+        const r = win.get_frame_rect();
+        if (r && r.width > 0 && r.height > 0)
+            return this._clampAspect(r.width / r.height);
         return null;
     }
 
@@ -1644,13 +1715,10 @@ class StageSidebar {
 
         const mon = Main.layoutManager.primaryMonitor;
         const topH = Main.panel ? Main.panel.height : 0;
-        let [, cardY] = [0, 0];
-        try { [, cardY] = card.get_transformed_position(); } catch (_) { return; }
+        const [, cardY] = card.get_transformed_position();
 
         // Collect windows that have compositor actors (cloneable)
-        const cloneable = windows.filter(w => {
-            try { return !!w.get_compositor_private(); } catch (_) { return false; }
-        });
+        const cloneable = windows.filter(w => !!w.get_compositor_private());
 
         if (cloneable.length === 0) {
             this._showIconPreview(windows, cardY);

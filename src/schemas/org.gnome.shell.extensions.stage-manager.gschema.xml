@@ -64,7 +64,7 @@
         <key name="sidebar-mode" type="s">
             <default>'groups'</default>
             <summary>Sidebar Mode</summary>
-            <description>What to show in sidebar cards. 'groups' = stage manager (swap groups), 'apps' = per-app (just focus), 'workspaces' = other workspaces.</description>
+            <description>What to show in sidebar cards. 'groups' = stage manager (swap groups), 'apps' = per-app (just focus), 'workspaces' = other workspaces, 'all-windows' = every window on every workspace (click to activate).</description>
         </key>
 
         <key name="card-base-scale" type="i">

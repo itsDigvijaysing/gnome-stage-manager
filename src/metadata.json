@@ -4,7 +4,7 @@
     "uuid": "stage-manager@gnome-stage-manager",
     "url": "https://github.com/itsdigvijaysing/gnome-stage-manager",
     "shell-version": ["46", "47", "48", "49", "50"],
-    "version-name": "1.4.0",
+    "version-name": "1.4.1",
     "settings-schema": "org.gnome.shell.extensions.stage-manager",
     "gettext-domain": "stage-manager"
 }

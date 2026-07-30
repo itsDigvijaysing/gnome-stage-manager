@@ -97,6 +97,15 @@ StScrollBar StButton#vhandle:hover {
     font-size: 10px;
 }
 
+/* Workspace heading above each group of cards in all-windows mode. */
+.stage-ws-header {
+    margin-top: 10px;
+    margin-bottom: 2px;
+    color: rgba(255, 255, 255, 0.5);
+    font-size: 10px;
+    font-weight: bold;
+}
+
 /* Shown when more stages exist than the sidebar draws. */
 .stage-overflow {
     margin-top: 4px;
@@ -144,6 +153,10 @@ StScrollBar StButton#vhandle:hover {
 
 .stage-ws-label.light {
     color: rgba(20, 20, 25, 0.7);
+}
+
+.stage-ws-header.light {
+    color: rgba(20, 20, 25, 0.55);
 }
 
 .stage-ws-label-current.light {

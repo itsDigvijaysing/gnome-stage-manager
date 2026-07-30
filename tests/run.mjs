@@ -6,8 +6,9 @@
  */
 import assert from 'node:assert/strict';
 import {
-    Meta, St, clock, wsm, windowManager,
+    Meta, St, Clutter, clock, wsm, windowManager,
     FakeWindow, makeWindowActor, makeSettings, installGlobals, deliver, resetHarness,
+    setFocus,
 } from './stubs.mjs';
 
 installGlobals();
@@ -541,6 +542,43 @@ test('a legacy mouse reporting no delta still scrolls by direction', () => {
     assert.ok(adj.value > 0, 'discrete-direction fallback did not scroll');
 });
 
+test('a touchpad SMOOTH event scrolls by its delta', () => {
+    wsm.reset(1);
+    const sidebar = makeSidebar(makeSettings());
+    sidebar._build();
+    sidebar._scroll.setContentHeight(2000, 800);
+    const adj = sidebar._scroll.vadjustment;
+
+    // SMOOTH is the only direction for which get_scroll_delta() is meaningful,
+    // so the handler must read the delta on this branch and nowhere else.
+    const smoothDown = {
+        get_scroll_direction: () => Clutter.ScrollDirection.SMOOTH,
+        get_scroll_delta: () => [0, 1],
+    };
+    const ret = sidebar._scroll.emit('scroll-event', smoothDown);
+
+    assert.ok(adj.value > 0, 'a smooth-scroll delta did not move the adjustment');
+    assert.equal(ret, Clutter.EVENT_STOP, 'a consumed scroll must stop propagating');
+});
+
+test('a gesture-end zero-delta SMOOTH event is not swallowed', () => {
+    wsm.reset(1);
+    const sidebar = makeSidebar(makeSettings());
+    sidebar._build();
+    sidebar._scroll.setContentHeight(2000, 800);
+    const adj = sidebar._scroll.vadjustment;
+
+    const gestureEnd = {
+        get_scroll_direction: () => Clutter.ScrollDirection.SMOOTH,
+        get_scroll_delta: () => [0, 0],
+    };
+    const ret = sidebar._scroll.emit('scroll-event', gestureEnd);
+
+    assert.equal(adj.value, 0, 'a zero-delta event must not move the adjustment');
+    assert.equal(ret, Clutter.EVENT_PROPAGATE,
+        'swallowing the gesture-end event stalls the next gesture');
+});
+
 /* ═══ dynamic: shape follows the window, size follows the display ═════ */
 
 test('thumbnail shape follows the window it shows, not a fixed ratio', () => {
@@ -840,9 +878,9 @@ test('#8 unmaximize still returns the window when the feature is toggled off mid
     } finally { mtw.disable(); }
 });
 
-/* ═══ #9 — teardown must be total even if a disconnect throws ════════ */
+/* ═══ #9 — disable() tears down every actor and signal source ════════ */
 
-test('#9 disable() completes teardown even when a disconnect throws', () => {
+test('#9 disable() destroys every actor and disconnects every signal source', () => {
     wsm.reset(1);
     const sidebar = makeSidebar(makeSettings());
     const destroyed = [];
@@ -858,14 +896,18 @@ test('#9 disable() completes teardown even when a disconnect throws', () => {
     sidebar._safeDestroyContent = () => {};
     sidebar._removeKeybinding = () => {};
 
-    // A finalised GObject: disconnect throws, exactly as during shell shutdown.
-    sidebar._sigs.push({ o: { disconnect() { throw new Error('instance not owned'); } }, i: 1 });
-    sidebar._cardSigs.push({ o: { disconnect() { throw new Error('instance not owned'); } }, i: 2 });
+    // Stands in for a real signal source: disable() must call disconnectObject()
+    // on it, passing the sidebar itself as the tracking object.
+    const disconnectedWith = [];
+    sidebar._sigSources.add({ disconnectObject(owner) { disconnectedWith.push(owner); } });
 
     sidebar.disable();
 
     assert.deepEqual(destroyed.sort(), ['box', 'edge', 'panel', 'scroll'],
-        'teardown aborted midway — chrome actors left on screen');
+        'teardown left a chrome actor on screen');
+    assert.deepEqual(disconnectedWith, [sidebar],
+        'disable() must call disconnectObject(this) on every tracked signal source');
+    assert.equal(sidebar._sigSources.size, 0, 'signal sources must be cleared after disable()');
 });
 
 /* ═══ #12 — timer bookkeeping must not untrack the wrong id ══════════ */
@@ -923,6 +965,163 @@ test('#18 resizing a card\'s window changes the fingerprint (its shape follows i
     parked._frame = { x: 0, y: 0, width: 900, height: 1600 };   // rotated to portrait
     assert.notEqual(sidebar._renderSignature(), before,
         'card shape follows the window, so a reshape must invalidate the fingerprint');
+});
+
+/* ═══ all-windows mode — every window, every workspace, read-only ═════ */
+
+/** A sidebar in all-windows mode with a real _box, ready to render. */
+function allWindowsSidebar(overrides = {}) {
+    const sidebar = makeSidebar(makeSettings({ 'sidebar-mode': 'all-windows', ...overrides }));
+    sidebar._box = new St.BoxLayout();
+    return sidebar;
+}
+
+test('all-windows shows windows from every workspace, not just the active one', () => {
+    const [ws0, ws1, ws2] = wsm.reset(3);
+    wsm.setActive(ws0);
+    const a = new FakeWindow('appA');
+    const b = new FakeWindow('appB');
+    const c = new FakeWindow('appC');
+    ws0.adopt(a); ws1.adopt(b); ws2.adopt(c);
+
+    const sidebar = allWindowsSidebar();
+    sidebar._refreshAllWindows();
+
+    assert.equal(sidebar._cards.length, 3,
+        'expected one card per window across all three workspaces');
+});
+
+test('all-windows includes minimized windows — that is the point of the mode', () => {
+    const [ws0, ws1] = wsm.reset(2);
+    wsm.setActive(ws0);
+    const parked = new FakeWindow('appParked', { minimized: true });
+    ws1.adopt(parked);
+
+    const sidebar = allWindowsSidebar();
+    sidebar._refreshAllWindows();
+
+    assert.equal(sidebar._cards.length, 1,
+        'a minimized window on another workspace must still get a card');
+});
+
+test('all-windows hides the focused window (already in front of you)', () => {
+    const [ws0] = wsm.reset(1);
+    wsm.setActive(ws0);
+    const focused = new FakeWindow('appFocused');
+    const other = new FakeWindow('appOther');
+    ws0.adopt(focused); ws0.adopt(other);
+    setFocus(focused);
+
+    const sidebar = allWindowsSidebar();
+    sidebar._refreshAllWindows();
+
+    assert.equal(sidebar._cards.length, 1, 'only the non-focused window should get a card');
+});
+
+test('all-windows emits no header for a workspace with nothing to show', () => {
+    const [ws0, ws1] = wsm.reset(2);
+    wsm.setActive(ws0);
+    ws0.adopt(new FakeWindow('appA'));
+    // ws1 deliberately left empty.
+
+    const sidebar = allWindowsSidebar();
+    sidebar._refreshAllWindows();
+
+    const headers = sidebar._box.get_children()
+        .filter(c => typeof c.text === 'string' && c.text.startsWith('Workspace'));
+    assert.equal(headers.length, 1, 'an empty workspace must not leave a dangling header');
+});
+
+test('all-windows caps cards and reports the remainder', () => {
+    const [ws0] = wsm.reset(1);
+    wsm.setActive(ws0);
+    for (let i = 0; i < 12; i++) ws0.adopt(new FakeWindow(`app${i}`));
+
+    const sidebar = allWindowsSidebar();
+    sidebar._refreshAllWindows();
+
+    assert.equal(sidebar._cards.length, 8, 'must not build a clone for every window');
+    const overflow = sidebar._box.get_children().find(c => /^\+\d+$/.test(c.text ?? ''));
+    assert.ok(overflow, 'expected an overflow marker');
+    assert.equal(overflow.text, '+4', '12 windows minus the 8 drawn');
+});
+
+test('all-windows headers are not hover targets', () => {
+    const [ws0, ws1] = wsm.reset(2);
+    wsm.setActive(ws0);
+    ws0.adopt(new FakeWindow('appA'));
+    ws1.adopt(new FakeWindow('appB'));
+
+    const sidebar = allWindowsSidebar();
+    sidebar._refreshAllWindows();
+
+    // 2 headers + 2 cards in the column, but only the cards are bell-curve targets.
+    assert.equal(sidebar._cards.length, 2, 'headers must never be pushed to _cards');
+    assert.ok(sidebar._box.get_children().length > sidebar._cards.length,
+        'headers should still be present in the column');
+});
+
+test('activating from all-windows never minimizes or regroups anything', () => {
+    const [ws0, ws1] = wsm.reset(2);
+    wsm.setActive(ws0);
+    const here = new FakeWindow('appHere');
+    const there = new FakeWindow('appThere', { minimized: true });
+    ws0.adopt(here); ws1.adopt(there);
+
+    const sidebar = allWindowsSidebar();
+    sidebar._initGroups();
+    const groupsBefore = JSON.stringify(sidebar._groups.map(g => [...g.windows].map(w => w.get_id())));
+
+    sidebar._activateWindow(there);
+
+    assert.equal(there.minimized, false, 'the target window should be unminimized');
+    assert.equal(there.activated, 1, 'the target window should be activated');
+    assert.equal(here.minimized, false,
+        'the outgoing window must NOT be minimized — all-windows is read-only');
+    assert.equal(
+        JSON.stringify(sidebar._groups.map(g => [...g.windows].map(w => w.get_id()))),
+        groupsBefore,
+        'stage membership must be untouched by an all-windows activation');
+});
+
+test('all-windows fingerprint follows the focused window', () => {
+    const [ws0] = wsm.reset(1);
+    wsm.setActive(ws0);
+    const a = new FakeWindow('appA');
+    const b = new FakeWindow('appB');
+    ws0.adopt(a); ws0.adopt(b);
+
+    const sidebar = allWindowsSidebar();
+    setFocus(a);
+    const withA = sidebar._renderSignature();
+    setFocus(b);
+    assert.notEqual(sidebar._renderSignature(), withA,
+        'a focus change alters which cards are drawn, so it must invalidate the fingerprint');
+});
+
+/* ═══ toggle-sidebar keybinding behaviour ════════════════════════════ */
+
+test('_toggleVisible flips the sidebar and respects the master switch', () => {
+    wsm.reset(1);
+    const settings = makeSettings();
+    const sidebar = makeSidebar(settings);
+    sidebar._build();
+
+    let shown = 0, hidden = 0;
+    sidebar._show = () => { shown++; sidebar._visible = true; };
+    sidebar._hide = () => { hidden++; sidebar._visible = false; };
+
+    sidebar._visible = false;
+    sidebar._toggleVisible();
+    assert.equal(shown, 1, 'toggle from hidden must show');
+
+    sidebar._toggleVisible();
+    assert.equal(hidden, 1, 'toggle from visible must hide');
+
+    // With the extension switched off the shortcut must do nothing at all.
+    settings.set('enable-stage-sidebar', false);
+    sidebar._toggleVisible();
+    assert.equal(shown, 1, 'shortcut must be inert while the sidebar is disabled');
 });
 
 /* ── report ──────────────────────────────────────────────────────────── */
