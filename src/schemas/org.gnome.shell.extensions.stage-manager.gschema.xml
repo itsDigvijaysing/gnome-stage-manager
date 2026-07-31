@@ -38,7 +38,7 @@
         <key name="show-on-empty-workspace" type="b">
             <default>true</default>
             <summary>Show on Empty Desktop</summary>
-            <description>When enabled and in Groups mode, always show the sidebar when all windows on the current workspace are minimized (desktop is empty). Auto-hide resumes once the user interacts with a card and windows become visible again.</description>
+            <description>When enabled, always show the sidebar when all windows on the current workspace are minimized (desktop is empty). Auto-hide resumes once the user interacts with a card and windows become visible again.</description>
         </key>
 
         <key name="sidebar-reserve-space" type="b">
