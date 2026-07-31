@@ -20,16 +20,28 @@ class FakeActor {
         this.width = 0; this.height = 0; this.x = 0; this.y = 0;
         this.children = [];
         this.destroyed = false;
+        this.visible = true;
         this.styleClass = p.style_class ?? null;
         Object.assign(this, p);
     }
     set_size(w, h) { this.width = w; this.height = h; }
     get_size() { return [this.width, this.height]; }
+    // Natural size == set size in this fake — there's no real CSS/layout
+    // engine, so "preferred" and "allocated" are the same thing here.
+    get_preferred_size() { return [this.width, this.height, this.width, this.height]; }
     set_position(x, y) { this.x = x; this.y = y; }
     get_position() { return [this.x, this.y]; }
     add_child(c) { this.children.push(c); c.parent = this; }
     remove_child(c) { this.children = this.children.filter(k => k !== c); }
     get_children() { return [...this.children]; }
+    // sibling === null moves child to the end of the list (top of paint order),
+    // matching real Clutter.Actor.set_child_above_sibling semantics.
+    set_child_above_sibling(child, sibling) {
+        this.children = this.children.filter(k => k !== child);
+        if (sibling === null || sibling === undefined) this.children.push(child);
+        else this.children.splice(this.children.indexOf(sibling) + 1, 0, child);
+    }
+    get_parent() { return this.parent ?? null; }
     destroy_all_children() { this.children.forEach(c => c.destroy()); this.children = []; }
     destroy() { this.destroyed = true; this.parent?.remove_child(this); }
     set_pivot_point() {}
@@ -38,6 +50,8 @@ class FakeActor {
     set_scale() {}
     ease() {}
     remove_all_transitions() {}
+    show() { this.visible = true; }
+    hide() { this.visible = false; }
     // Handlers are recorded so tests can deliver a signal to the real callback.
     connect(sig, cb) {
         this._handlers ??= new Map();
@@ -80,6 +94,7 @@ export const Clutter = {
     // Real Clutter values — SMOOTH must not collide with UP/DOWN or the
     // delta-vs-direction branch in _onScrollEvent() is untested.
     ScrollDirection: { UP: 0, DOWN: 1, LEFT: 2, RIGHT: 3, SMOOTH: 4 },
+    PickMode: { REACTIVE: 0, ALL: 1 },
     PolicyType: { NEVER: 0 },
     EVENT_STOP: true,
     EVENT_PROPAGATE: false,
@@ -123,21 +138,36 @@ export { FakeActor };
 /* ── Controllable clock so tests decide when timers fire ─────────────── */
 
 class Clock {
-    constructor() { this.timers = new Map(); this.next = 1; this.now = 0; }
-    add(ms, cb) { const id = this.next++; this.timers.set(id, { at: this.now + ms, cb }); return id; }
+    constructor() { this.timers = new Map(); this.next = 1; this.now = 0; this._dispatching = new Set(); }
+    add(ms, cb) { const id = this.next++; this.timers.set(id, { at: this.now + ms, ms, cb }); return id; }
+    // Real GLib tolerates a source removing itself while its own callback is
+    // still dispatching (e.g. _hidePanel() calling _cancelHide() on the very
+    // hide-timer whose callback invoked it) — only a *stale* id from an
+    // earlier, already-finished tick is a genuine bug worth throwing on.
     remove(id) {
+        if (this._dispatching.has(id)) return;
         if (!this.timers.has(id))
             throw new Error(`source_remove on unknown/already-removed id ${id}`);
         this.timers.delete(id);
     }
+    // A callback returning GLib.SOURCE_CONTINUE (true) is re-armed under the
+    // same id at now+ms, mirroring a real repeating GLib.timeout_add — the
+    // snapshot in [...this.timers] means a timer re-armed mid-loop can't
+    // refire within the same advance() call.
     advance(ms) {
         this.now += ms;
         for (const [id, t] of [...this.timers]) {
-            if (t.at <= this.now) { this.timers.delete(id); t.cb(); }
+            if (t.at <= this.now && this.timers.has(id)) {
+                this.timers.delete(id);
+                this._dispatching.add(id);
+                const ret = t.cb();
+                this._dispatching.delete(id);
+                if (ret === true) this.timers.set(id, { at: this.now + t.ms, ms: t.ms, cb: t.cb });
+            }
         }
     }
     get pending() { return this.timers.size; }
-    reset() { this.timers.clear(); this.now = 0; }
+    reset() { this.timers.clear(); this._dispatching.clear(); this.now = 0; }
 }
 
 export const clock = new Clock();
@@ -145,6 +175,7 @@ export const clock = new Clock();
 export const GLib = {
     PRIORITY_DEFAULT: 0,
     SOURCE_REMOVE: false,
+    SOURCE_CONTINUE: true,
     timeout_add: (_prio, ms, cb) => clock.add(ms, cb),
     source_remove: id => clock.remove(id),
 };
@@ -266,6 +297,7 @@ class Emitter {
 export const windowManager = new Emitter('window_manager');
 export const display = new Emitter('display');
 export const wsmEmitter = new Emitter('workspace_manager');
+export const stage = new Emitter('stage');
 
 /**
  * A stand-in MetaWindowActor: `size` is the actor including shadow margins, and
@@ -308,6 +340,8 @@ export function resetHarness() {
     windowManager.clear();
     display.clear();
     wsmEmitter.clear();
+    stage.clear();
+    stage._actorAtPos = null;
     clock.reset();
     focusedWindow = null;
 }
@@ -336,6 +370,11 @@ export const Main = {
     panel: { height: 32 },
     layoutManager: {
         primaryMonitor: { x: 0, y: 0, width: 1920, height: 1080, index: 0 },
+        get monitors() { return [Main.layoutManager.primaryMonitor]; },
+        getWorkAreaForMonitor(_idx) {
+            const mon = Main.layoutManager.primaryMonitor;
+            return { x: mon.x, y: mon.y + Main.panel.height, width: mon.width, height: mon.height - Main.panel.height };
+        },
         addChrome: () => {},
         removeChrome: () => {},
         connect: () => 1,
@@ -344,6 +383,7 @@ export const Main = {
         disconnectObject: () => {},
     },
     wm: { addKeybinding: () => 1, removeKeybinding: () => {} },
+    uiGroup: new FakeActor(),
 };
 
 export class Extension {
@@ -375,6 +415,19 @@ const DEFAULTS = {
     'show-group-count': true,
     'show-workspace-current': true,
     'toggle-sidebar': [],
+    'arc-angle-step': 16,
+    'sidebar-layout': 'stack',
+    'app-merge-map': '{}',
+    'arc-panel-position': 'left',
+    'arc-persistent-mode': false,
+    'arc-card-scale': 100,
+    'arc-scroll-speed': 10,
+    'arc-merge-map': '{}',
+    'arc-order-map': '{}',
+    'keybinding-arc-next': [],
+    'keybinding-arc-prev': [],
+    'keybinding-arc-activate': [],
+    'keybinding-arc-close': [],
 };
 
 export function makeSettings(overrides = {}) {
@@ -386,6 +439,7 @@ export function makeSettings(overrides = {}) {
         get_string: k => values[k],
         get_strv: k => values[k],
         set: (k, v) => { values[k] = v; em.emit(`changed::${k}`); },
+        set_string: (k, v) => { values[k] = v; em.emit(`changed::${k}`); },
         connect: (s, cb) => em.connect(s, cb),
         disconnect: id => em.disconnect(id),
         connectObject: (s, cb, t) => em.connectObject(s, cb, t),
@@ -408,7 +462,12 @@ export function installGlobals() {
             get_focus_window: () => focusedWindow,
             get_monitor_in_fullscreen: () => false,
         }),
-        stage: {},
+        stage: Object.assign(stage, {
+            // Tests drive this by setting stage._actorAtPos directly — there's
+            // no real geometry in this fake, so it can't hit-test from x/y.
+            get_actor_at_pos: () => stage._actorAtPos ?? null,
+        }),
+        get_pointer: () => [0, 0],
         get_current_time: () => ++winSeq,
     };
 }

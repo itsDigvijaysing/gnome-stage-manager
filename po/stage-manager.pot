@@ -9,7 +9,7 @@ msgstr ""
 "Project-Id-Version: Stage Manager 1.4.1\n"
 "Report-Msgid-Bugs-To: https://github.com/itsdigvijaysing/gnome-stage-manager/"
 "issues\n"
-"POT-Creation-Date: 2026-07-30 03:14+0530\n"
+"POT-Creation-Date: 2026-07-31 00:47+0530\n"
 "PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
 "Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
 "Language-Team: LANGUAGE <LL@li.org>\n"
@@ -19,28 +19,28 @@ msgstr ""
 "Content-Transfer-Encoding: 8bit\n"
 "Plural-Forms: nplurals=INTEGER; plural=EXPRESSION;\n"
 
-#: src/extension.js:1192 src/extension.js:1585
+#: src/extension.js:1318 src/extension.js:1732
 #, javascript-format
 msgid "Workspace %d"
 msgstr ""
 
-#: src/extension.js:1584
+#: src/extension.js:1731
 #, javascript-format
 msgid "Workspace %d (current)"
 msgstr ""
 
-#: src/extension.js:1593
+#: src/extension.js:1740
 #, javascript-format
 msgid "%d window"
 msgid_plural "%d windows"
 msgstr[0] ""
 msgstr[1] ""
 
-#: src/extension.js:1808
+#: src/extension.js:1955
 msgid "Application"
 msgstr ""
 
-#: src/extension.js:1828
+#: src/extension.js:1975
 #, javascript-format
 msgid "%d window (minimized)"
 msgid_plural "%d windows (minimized)"
@@ -110,218 +110,337 @@ msgstr ""
 msgid "All Windows (every workspace)"
 msgstr ""
 
-#: src/prefs.js:82
+#: src/prefs.js:83
+#: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:108
+msgid "Sidebar Layout"
+msgstr ""
+
+#: src/prefs.js:84
+msgid ""
+"Stack = vertical list (default), Arc = full carousel (see Arc Layout below "
+"for position)"
+msgstr ""
+
+#: src/prefs.js:87
+msgid "Stack"
+msgstr ""
+
+#: src/prefs.js:87
+msgid "Arc"
+msgstr ""
+
+#: src/prefs.js:102
 #: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:34
 msgid "Auto-hide Sidebar"
 msgstr ""
 
-#: src/prefs.js:83
+#: src/prefs.js:103
 msgid "Off = always visible (macOS default). On = hover to reveal."
 msgstr ""
 
-#: src/prefs.js:89
+#: src/prefs.js:109
 msgid "Reserve Space for Sidebar"
 msgstr ""
 
-#: src/prefs.js:90
+#: src/prefs.js:110
 msgid ""
 "Maximized windows stop at the sidebar instead of being covered. Needs auto-"
 "hide off."
 msgstr ""
 
-#: src/prefs.js:96
+#: src/prefs.js:116
 msgid "Show App Icons"
 msgstr ""
 
-#: src/prefs.js:97
+#: src/prefs.js:117
 msgid "Display app icon below each thumbnail"
 msgstr ""
 
-#: src/prefs.js:103
+#: src/prefs.js:123
 msgid "Show Window Count Badge"
 msgstr ""
 
-#: src/prefs.js:104
+#: src/prefs.js:124
 msgid "Show number of windows on group thumbnails"
 msgstr ""
 
-#: src/prefs.js:110
+#: src/prefs.js:130
 #: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:92
 msgid "Show Current Workspace"
 msgstr ""
 
-#: src/prefs.js:111
+#: src/prefs.js:131
 msgid "In workspace mode, also show the current workspace card"
 msgstr ""
 
-#: src/prefs.js:118
+#: src/prefs.js:140
+msgid "Arc Layout"
+msgstr ""
+
+#: src/prefs.js:141
+msgid "Settings for the carousel arrangement (sidebar-layout: Arc, above)"
+msgstr ""
+
+#: src/prefs.js:146
+#: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:132
+msgid "Arc Panel Position"
+msgstr ""
+
+#: src/prefs.js:147
+msgid "Screen edge the arc carousel attaches to"
+msgstr ""
+
+#: src/prefs.js:150
+msgid "Left"
+msgstr ""
+
+#: src/prefs.js:150
+msgid "Right"
+msgstr ""
+
+#: src/prefs.js:150
+msgid "Bottom"
+msgstr ""
+
+#: src/prefs.js:165
+msgid "Persistent Mode"
+msgstr ""
+
+#: src/prefs.js:166
+msgid "Keep the arc carousel shown whenever no window overlaps its area"
+msgstr ""
+
+#: src/prefs.js:172
+#: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:145
+msgid "Arc Card Scale"
+msgstr ""
+
+#: src/prefs.js:172
+msgid "Card size percentage (50-150)"
+msgstr ""
+
+#: src/prefs.js:174
+#: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:152
+msgid "Arc Scroll Speed"
+msgstr ""
+
+#: src/prefs.js:174
+msgid "Momentum-scroll speed (1-20)"
+msgstr ""
+
+#: src/prefs.js:178
 msgid "Shortcuts"
 msgstr ""
 
-#: src/prefs.js:119
+#: src/prefs.js:179
 msgid ""
 "No shortcut is set by default. Click Set to choose one — it takes effect "
 "immediately, no restart needed."
 msgstr ""
 
-#: src/prefs.js:124
+#: src/prefs.js:184
 msgid "Toggle Sidebar"
 msgstr ""
 
-#: src/prefs.js:125
+#: src/prefs.js:185
 msgid "Reveal or hide the sidebar without moving the mouse to the screen edge"
 msgstr ""
 
-#: src/prefs.js:129
+#: src/prefs.js:187
+#: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:170
+msgid "Arc: Next Card"
+msgstr ""
+
+#: src/prefs.js:187
+msgid "Move the arc carousel to the next card"
+msgstr ""
+
+#: src/prefs.js:189
+#: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:176
+msgid "Arc: Previous Card"
+msgstr ""
+
+#: src/prefs.js:189
+msgid "Move the arc carousel to the previous card"
+msgstr ""
+
+#: src/prefs.js:191
+#: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:182
+msgid "Arc: Activate Card"
+msgstr ""
+
+#: src/prefs.js:191
+msgid "Activate the front card of the arc carousel"
+msgstr ""
+
+#: src/prefs.js:193
+#: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:188
+msgid "Arc: Close Front Window"
+msgstr ""
+
+#: src/prefs.js:193
+msgid "Close the front window of the arc carousel's front card"
+msgstr ""
+
+#: src/prefs.js:197
 msgid "Appearance"
 msgstr ""
 
-#: src/prefs.js:134
+#: src/prefs.js:202
 msgid "Dimensions"
 msgstr ""
 
-#: src/prefs.js:138
+#: src/prefs.js:206
 #: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:21
 msgid "Sidebar Width"
 msgstr ""
 
-#: src/prefs.js:138
+#: src/prefs.js:206
 msgid "Width in pixels"
 msgstr ""
 
-#: src/prefs.js:140
+#: src/prefs.js:208
 #: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:54
 msgid "Edge Trigger Width"
 msgstr ""
 
-#: src/prefs.js:140
+#: src/prefs.js:208
 msgid "Hot zone at screen edge (pixels)"
 msgstr ""
 
-#: src/prefs.js:142
+#: src/prefs.js:210
+#: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:115
+msgid "Arc Angle Step"
+msgstr ""
+
+#: src/prefs.js:210
+msgid "Degrees between cards in Arc layout (8-30)"
+msgstr ""
+
+#: src/prefs.js:212
 msgid "Cards"
 msgstr ""
 
-#: src/prefs.js:146
+#: src/prefs.js:216
 #: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:73
 msgid "Card Base Scale"
 msgstr ""
 
-#: src/prefs.js:146
+#: src/prefs.js:216
 msgid "Default card size percentage (40-100)"
 msgstr ""
 
-#: src/prefs.js:148
+#: src/prefs.js:218
 #: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:80
 msgid "Perspective Angle"
 msgstr ""
 
-#: src/prefs.js:148
+#: src/prefs.js:218
 msgid "3D rotation in degrees (0 = flat)"
 msgstr ""
 
-#: src/prefs.js:150
+#: src/prefs.js:220
 msgid "Animation"
 msgstr ""
 
-#: src/prefs.js:154
+#: src/prefs.js:224
 #: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:28
 msgid "Animation Duration"
 msgstr ""
 
-#: src/prefs.js:154
+#: src/prefs.js:224
 msgid "Slide speed in milliseconds"
 msgstr ""
 
-#: src/prefs.js:156
+#: src/prefs.js:226
 msgid "Hide Delay"
 msgstr ""
 
-#: src/prefs.js:156
+#: src/prefs.js:226
 msgid "Delay before hiding after mouse leaves (ms)"
 msgstr ""
 
-#: src/prefs.js:160
+#: src/prefs.js:230
 msgid "About"
 msgstr ""
 
-#: src/prefs.js:165
+#: src/prefs.js:235
 msgid "Stage Manager"
 msgstr ""
 
-#: src/prefs.js:169
+#: src/prefs.js:239
 msgid "Version"
 msgstr ""
 
-#: src/prefs.js:175
+#: src/prefs.js:245
 msgid "GNOME Shell"
 msgstr ""
 
-#: src/prefs.js:181
+#: src/prefs.js:251
 msgid "Session Type"
 msgstr ""
 
-#: src/prefs.js:182 src/prefs.js:339
+#: src/prefs.js:252 src/prefs.js:409
 msgid "unknown"
 msgstr ""
 
-#: src/prefs.js:188
+#: src/prefs.js:258
 msgid "Extension Logs"
 msgstr ""
 
-#: src/prefs.js:189
+#: src/prefs.js:259
 msgid "Recent errors from this extension (for bug reports)"
 msgstr ""
 
-#: src/prefs.js:214
+#: src/prefs.js:284
 msgid "Press Refresh to load recent log messages."
 msgstr ""
 
-#: src/prefs.js:217
+#: src/prefs.js:287
 msgid "Refresh Logs"
 msgstr ""
 
-#: src/prefs.js:219
+#: src/prefs.js:289
 msgid "Refresh"
 msgstr ""
 
-#: src/prefs.js:227
+#: src/prefs.js:297
 msgid "Copy Logs"
 msgstr ""
 
-#: src/prefs.js:229
+#: src/prefs.js:299
 msgid "Copy to Clipboard"
 msgstr ""
 
-#: src/prefs.js:260
+#: src/prefs.js:330
 msgid "Disabled"
 msgstr ""
 
-#: src/prefs.js:272
+#: src/prefs.js:342
 msgid "Set"
 msgstr ""
 
-#: src/prefs.js:280
+#: src/prefs.js:350
 msgid "Clear shortcut"
 msgstr ""
 
-#: src/prefs.js:295 src/prefs.js:301
+#: src/prefs.js:365 src/prefs.js:371
 msgid "Press shortcut"
 msgstr ""
 
-#: src/prefs.js:296 src/prefs.js:302
+#: src/prefs.js:366 src/prefs.js:372
 msgid "Press the key combination you want to use, or Escape to cancel."
 msgstr ""
 
-#: src/prefs.js:304
+#: src/prefs.js:374
 msgid "Cancel"
 msgstr ""
 
-#: src/prefs.js:355
+#: src/prefs.js:425
 msgid "Could not load logs. Run manually:"
 msgstr ""
 
-#: src/prefs.js:364
+#: src/prefs.js:434
 msgid "No recent logs found."
 msgstr ""
 
@@ -432,4 +551,85 @@ msgstr ""
 msgid ""
 "Keyboard shortcut to toggle the stage sidebar visibility. Empty array means "
 "no shortcut is bound."
+msgstr ""
+
+#: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:109
+msgid ""
+"Vertical stack (default) or a full carousel arc layout — see arc-panel-"
+"position for which edge it attaches to."
+msgstr ""
+
+#: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:116
+msgid ""
+"Degrees between adjacent cards when sidebar-layout is 'arc'. Smaller values "
+"show more cards at once."
+msgstr ""
+
+#: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:121
+msgid "App Merge Map (internal)"
+msgstr ""
+
+#: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:122
+msgid ""
+"Internal JSON map of appId to merge-group key, used by the 'apps' sidebar-"
+"mode's drag-to-merge feature. Not intended for manual editing."
+msgstr ""
+
+#: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:133
+msgid "Screen edge the arc sidebar carousel is attached to."
+msgstr ""
+
+#: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:138
+msgid "Arc Persistent Mode"
+msgstr ""
+
+#: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:139
+msgid ""
+"Keep the arc sidebar shown whenever no window overlaps its area, instead of "
+"only on hover."
+msgstr ""
+
+#: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:146
+msgid "Card size percentage for the arc sidebar carousel."
+msgstr ""
+
+#: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:153
+msgid "Momentum-scroll speed for the arc sidebar carousel."
+msgstr ""
+
+#: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:158
+msgid "Arc Merge Map (internal)"
+msgstr ""
+
+#: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:159
+msgid ""
+"Internal JSON map of appId to merge-group key for the arc sidebar's drag-to-"
+"merge gesture. Not intended for manual editing."
+msgstr ""
+
+#: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:164
+msgid "Arc Order Map (internal)"
+msgstr ""
+
+#: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:165
+msgid ""
+"Internal JSON map of merge-group key to display order for the arc sidebar's "
+"drag-to-reorder gesture. Not intended for manual editing."
+msgstr ""
+
+#: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:171
+msgid "Keyboard shortcut to move the arc carousel to the next card."
+msgstr ""
+
+#: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:177
+msgid "Keyboard shortcut to move the arc carousel to the previous card."
+msgstr ""
+
+#: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:183
+msgid "Keyboard shortcut to activate the front card of the arc carousel."
+msgstr ""
+
+#: src/schemas/org.gnome.shell.extensions.stage-manager.gschema.xml:189
+msgid ""
+"Keyboard shortcut to close the front window of the arc carousel's front card."
 msgstr ""

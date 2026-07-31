@@ -8,12 +8,12 @@ import assert from 'node:assert/strict';
 import {
     Meta, St, Clutter, clock, wsm, windowManager,
     FakeWindow, makeWindowActor, makeSettings, installGlobals, deliver, resetHarness,
-    setFocus,
+    setFocus, Main, stage,
 } from './stubs.mjs';
 
 installGlobals();
 
-const { MaximizeToWorkspace, StageSidebar } = await import('./ext-under-test.mjs');
+const { MaximizeToWorkspace, StageSidebar, ArcSidebar, StageManagerExtension, _groupByApp } = await import('./ext-under-test.mjs');
 
 /* ── tiny runner ─────────────────────────────────────────────────────── */
 
@@ -1122,6 +1122,771 @@ test('_toggleVisible flips the sidebar and respects the master switch', () => {
     settings.set('enable-stage-sidebar', false);
     sidebar._toggleVisible();
     assert.equal(shown, 1, 'shortcut must be inert while the sidebar is disabled');
+});
+
+/* ═══ app merge/un-merge — grouping fold ═════════════════════════════ */
+
+test('_groupByApp with an empty merge map behaves exactly as before, plus apps/key fields', () => {
+    wsm.reset(1);
+    const ws = wsm.get_workspace_by_index(0);
+    const a = new FakeWindow('firefox'); ws.adopt(a);
+    const b = new FakeWindow('files');   ws.adopt(b);
+
+    const groups = _groupByApp(ws, null, new Map());
+    assert.equal(groups.length, 2);
+    for (const g of groups) {
+        assert.equal(g.apps.length, 1, 'unmerged group should carry exactly one app');
+        assert.equal(g.key, g.app.get_id(), 'unmerged group key should be its own app id');
+    }
+});
+
+test('_groupByApp folds two apps sharing a merge-map entry into one group', () => {
+    wsm.reset(1);
+    const ws = wsm.get_workspace_by_index(0);
+    const a = new FakeWindow('firefox'); ws.adopt(a);
+    const b = new FakeWindow('files');   ws.adopt(b);
+
+    const mergeMap = new Map([['files', 'firefox']]);
+    const groups = _groupByApp(ws, null, mergeMap);
+
+    assert.equal(groups.length, 1, 'firefox and files should fold into one group');
+    const [g] = groups;
+    assert.equal(g.key, 'firefox');
+    assert.equal(g.apps.length, 2);
+    assert.equal(g.windows.length, 2);
+});
+
+test('_groupByApp merge fold is transitive-safe: a merge chain still resolves to one flat group', () => {
+    wsm.reset(1);
+    const ws = wsm.get_workspace_by_index(0);
+    const a = new FakeWindow('firefox'); ws.adopt(a);
+    const b = new FakeWindow('files');   ws.adopt(b);
+    const c = new FakeWindow('terminal'); ws.adopt(c);
+
+    const mergeMap = new Map([['files', 'firefox'], ['terminal', 'firefox']]);
+    const groups = _groupByApp(ws, null, mergeMap);
+
+    assert.equal(groups.length, 1);
+    assert.equal(groups[0].apps.length, 3);
+});
+
+/* ═══ app merge/un-merge — persistence ═══════════════════════════════ */
+
+test('app-merge-map round-trips through JSON exactly', () => {
+    wsm.reset(1);
+    const settings = makeSettings();
+    const sidebar = makeSidebar(settings);
+    sidebar._appMergeMap = new Map([['files', 'firefox'], ['terminal', 'firefox']]);
+    sidebar._saveAppMergeMap();
+
+    const sidebar2 = makeSidebar(settings);
+    sidebar2._loadAppMergeMap();
+    assert.equal(sidebar2._appMergeMap.get('files'), 'firefox');
+    assert.equal(sidebar2._appMergeMap.get('terminal'), 'firefox');
+});
+
+test('malformed app-merge-map JSON falls back to an empty map, not a thrown error', () => {
+    wsm.reset(1);
+    const settings = makeSettings({ 'app-merge-map': 'not valid json {' });
+    const sidebar = makeSidebar(settings);
+    assert.doesNotThrow(() => sidebar._loadAppMergeMap());
+    assert.equal(sidebar._appMergeMap.size, 0);
+});
+
+test('_mergeApp flattens a chain: merging onto an already-merged group keeps every entry one hop', () => {
+    wsm.reset(1);
+    const sidebar = makeSidebar(makeSettings());
+    sidebar._appMergeMap = new Map();
+    sidebar._saveAppMergeMap = () => {}; // isolate from GSettings for this pure-logic check
+
+    sidebar._mergeApp('files', 'firefox');
+    sidebar._mergeApp('terminal', 'files'); // simulates dragging onto a group whose key later becomes 'files'
+    assert.equal(sidebar._appMergeMap.get('files'), 'firefox');
+    assert.equal(sidebar._appMergeMap.get('terminal'), 'files');
+});
+
+test('_unmergeGroup clears every member app from the merge map', () => {
+    wsm.reset(1);
+    const sidebar = makeSidebar(makeSettings());
+    sidebar._appMergeMap = new Map([['files', 'firefox'], ['terminal', 'firefox']]);
+    sidebar._saveAppMergeMap = () => {};
+
+    sidebar._unmergeGroup({ key: 'firefox', apps: [{ get_id: () => 'firefox' }, { get_id: () => 'files' }, { get_id: () => 'terminal' }] });
+    assert.equal(sidebar._appMergeMap.size, 0);
+});
+
+/* ═══ app merge/un-merge — multi-icon rendering ══════════════════════ */
+
+test('a merged app card shows one icon per member app', () => {
+    wsm.reset(1);
+    const sidebar = makeSidebar(makeSettings({ 'show-app-icons': true }));
+    const appA = { get_id: () => 'firefox', create_icon_texture: s => { const i = new St.Widget(); i.set_size(s, s); return i; } };
+    const appB = { get_id: () => 'files',   create_icon_texture: s => { const i = new St.Widget(); i.set_size(s, s); return i; } };
+    const winA = new FakeWindow('firefox'); winA._ws = wsm.get_workspace_by_index(0);
+    const winB = new FakeWindow('files');   winB._ws = wsm.get_workspace_by_index(0);
+
+    const group = { key: 'firefox', app: appA, apps: [appA, appB], windows: [winA, winB] };
+    const card = sidebar._makeAppCard(group);
+
+    const iconBox = card.get_children().find(c => c !== card._thumb);
+    assert.ok(iconBox, 'expected an icon row for a merged card');
+    assert.equal(iconBox.get_children().length, 2, 'expected one icon per member app');
+});
+
+test('an unmerged app card still shows exactly one icon (no regression)', () => {
+    wsm.reset(1);
+    const sidebar = makeSidebar(makeSettings({ 'show-app-icons': true }));
+    const appA = { get_id: () => 'firefox', create_icon_texture: s => { const i = new St.Widget(); i.set_size(s, s); return i; } };
+    const winA = new FakeWindow('firefox'); winA._ws = wsm.get_workspace_by_index(0);
+
+    const group = { key: 'firefox', app: appA, apps: [appA], windows: [winA] };
+    const card = sidebar._makeAppCard(group);
+    const iconBox = card.get_children().find(c => c !== card._thumb);
+    assert.equal(iconBox.get_children().length, 1);
+});
+
+/* ═══ app merge/un-merge — drag gesture ══════════════════════════════ */
+
+function fakeButtonEvent(button) { return { get_button: () => button }; }
+function fakeMotionEvent(x, y) { return { get_coords: () => [x, y] }; }
+
+test('a click with no movement still activates the app (no regression from drag wiring)', () => {
+    wsm.reset(1);
+    const sidebar = makeSidebar(makeSettings({ 'sidebar-mode': 'apps' }));
+    const ws = wsm.get_workspace_by_index(0);
+    const win = new FakeWindow('firefox'); ws.adopt(win);
+    let activated = false;
+    sidebar._activateApp = () => { activated = true; };
+
+    const group = _groupByApp(ws, null, new Map())[0];
+    const card = sidebar._makeAppCard(group);
+
+    card.emit('button-press-event', fakeButtonEvent(1));
+    card.emit('button-release-event', fakeButtonEvent(1));
+
+    assert.ok(activated, 'a plain click (no drag movement) must still activate the app');
+});
+
+test('dragging one app card onto another commits a merge, and does not activate either', () => {
+    wsm.reset(1);
+    const sidebar = makeSidebar(makeSettings({ 'sidebar-mode': 'apps' }));
+    sidebar._saveAppMergeMap = () => {}; // isolate from GSettings
+    const ws = wsm.get_workspace_by_index(0);
+    const winA = new FakeWindow('firefox'); ws.adopt(winA);
+    const winB = new FakeWindow('files');   ws.adopt(winB);
+    let activated = 0;
+    sidebar._activateApp = () => { activated++; };
+
+    const groups = _groupByApp(ws, null, new Map());
+    const cardA = sidebar._makeAppCard(groups[0]);
+    const cardB = sidebar._makeAppCard(groups[1]);
+
+    cardA.emit('button-press-event', fakeButtonEvent(1));
+    sidebar._onAppDragMotion(fakeMotionEvent(100, 100)); // well past the drag threshold
+    // Clutter's implicit grab delivers release to the card that got the press
+    // (cardA), never to whatever the pointer ends up over — so the drop
+    // target has to be resolved by hit-testing the live pointer position,
+    // which is what stage._actorAtPos stands in for here.
+    stage._actorAtPos = cardB;
+    cardA.emit('button-release-event', fakeButtonEvent(1));
+
+    assert.equal(activated, 0, 'a committed drag must not also activate a card');
+    assert.equal(sidebar._appMergeMap.size, 1, 'expected exactly one merge-map entry');
+});
+
+test('a multi-app drag commits with one settings write, not one per app in the source group', () => {
+    wsm.reset(1);
+    const sidebar = makeSidebar(makeSettings({ 'sidebar-mode': 'apps' }));
+    let saves = 0;
+    sidebar._saveAppMergeMap = () => { saves++; };
+    const ws = wsm.get_workspace_by_index(0);
+    const winA = new FakeWindow('firefox');  ws.adopt(winA);
+    const winB = new FakeWindow('files');    ws.adopt(winB);
+    const winC = new FakeWindow('terminal'); ws.adopt(winC);
+    // firefox and files are already merged into one two-app source group.
+    sidebar._appMergeMap = new Map([['files', 'firefox']]);
+
+    const groups = _groupByApp(ws, null, sidebar._appMergeMap);
+    const source = groups.find(g => g.key === 'firefox');
+    const target = groups.find(g => g.key === 'terminal');
+    assert.equal(source.apps.length, 2, 'test setup: source group should have 2 merged apps');
+
+    sidebar._onDragCommit(source, target);
+
+    // A per-app save (the pre-fix behaviour) would fire twice here — once per
+    // app in the source group — each one a full settings write + sidebar
+    // rebuild for what the user experienced as a single drag gesture.
+    assert.equal(saves, 1, 'one drag gesture should trigger exactly one settings write, not one per merged app');
+});
+
+test('right-click on a merged card un-merges it', () => {
+    wsm.reset(1);
+    const sidebar = makeSidebar(makeSettings({ 'sidebar-mode': 'apps' }));
+    sidebar._saveAppMergeMap = () => {};
+    const ws = wsm.get_workspace_by_index(0);
+    const winA = new FakeWindow('firefox'); ws.adopt(winA);
+    const winB = new FakeWindow('files');   ws.adopt(winB);
+    sidebar._appMergeMap = new Map([['files', 'firefox']]);
+
+    const group = _groupByApp(ws, null, sidebar._appMergeMap)[0];
+    assert.equal(group.apps.length, 2);
+    const card = sidebar._makeAppCard(group);
+
+    card.emit('button-press-event', fakeButtonEvent(3));
+    assert.equal(sidebar._appMergeMap.size, 0, 'right-click should clear the merge');
+});
+
+test('starting a new drag cleans up a stale one that never received a release', () => {
+    wsm.reset(1);
+    const sidebar = makeSidebar(makeSettings({ 'sidebar-mode': 'apps' }));
+    const ws = wsm.get_workspace_by_index(0);
+    const win = new FakeWindow('firefox'); ws.adopt(win);
+    const group = _groupByApp(ws, null, new Map())[0];
+    const card = sidebar._makeAppCard(group);
+
+    sidebar._startAppDragCandidate(group, card);
+    assert.equal(stage.count, 1, 'expected exactly one motion-event handler after starting a drag');
+    sidebar._startAppDragCandidate(group, card); // simulates a second press with no intervening release
+    assert.equal(stage.count, 1, 'starting a new drag must not leak the previous motion-event handler');
+});
+
+/* ═══ ArcSidebar — layout-swap wiring ═════════════════════════════════ */
+
+test('sidebar-layout arc constructs ArcSidebar, not StageSidebar', () => {
+    wsm.reset(1);
+    const settings = makeSettings({ 'sidebar-layout': 'arc' });
+    const ext = new StageManagerExtension();
+    ext._fakeSettings = settings;
+    ext.enable();
+    assert.ok(ext._side instanceof ArcSidebar, 'expected ArcSidebar to be built for arc layout');
+    ext.disable();
+});
+
+test('sidebar-layout stack constructs StageSidebar (unchanged default)', () => {
+    wsm.reset(1);
+    const settings = makeSettings({ 'sidebar-layout': 'stack' });
+    const ext = new StageManagerExtension();
+    ext._fakeSettings = settings;
+    ext.enable();
+    assert.ok(ext._side instanceof StageSidebar, 'expected StageSidebar to be built for stack layout');
+    ext.disable();
+});
+
+test('changing sidebar-layout at runtime swaps the active controller', () => {
+    wsm.reset(1);
+    const settings = makeSettings({ 'sidebar-layout': 'stack' });
+    const ext = new StageManagerExtension();
+    ext._fakeSettings = settings;
+    ext.enable();
+    assert.ok(ext._side instanceof StageSidebar);
+    settings.set_string('sidebar-layout', 'arc');
+    assert.ok(ext._side instanceof ArcSidebar, 'expected swap to ArcSidebar on settings change');
+    ext.disable();
+});
+
+/* ═══ ArcSidebar — _computeGeo() ═══════════════════════════════════════ */
+
+test('_computeGeo left position: arc center sits off the left edge', () => {
+    const settings = makeSettings({ 'arc-panel-position': 'left', 'arc-card-scale': 100 });
+    const arc = new ArcSidebar(settings);
+    arc._scaleFactor = 1;
+    arc._monitor = Main.layoutManager.primaryMonitor;
+    arc._loadConfig();
+    const geo = arc._geo;
+    assert.equal(geo.centerAngle, 0);
+    assert.ok(geo.arcCX < 0, 'left-position arc center should be negative (off-screen left)');
+});
+
+test('_computeGeo right position: arc center sits off the right edge, angle 180', () => {
+    const settings = makeSettings({ 'arc-panel-position': 'right' });
+    const arc = new ArcSidebar(settings);
+    arc._scaleFactor = 1;
+    arc._monitor = Main.layoutManager.primaryMonitor;
+    arc._loadConfig();
+    assert.equal(arc._geo.centerAngle, 180);
+});
+
+test('_computeGeo bottom position: arc center below the workarea, angle -90', () => {
+    const settings = makeSettings({ 'arc-panel-position': 'bottom' });
+    const arc = new ArcSidebar(settings);
+    arc._scaleFactor = 1;
+    arc._monitor = Main.layoutManager.primaryMonitor;
+    arc._loadConfig();
+    assert.equal(arc._geo.centerAngle, -90);
+});
+
+test('_computeGeo radius scales with workarea height and floors at ARC_MIN_RADIUS * scaleFactor', () => {
+    const settings = makeSettings({ 'arc-panel-position': 'left' });
+    const arc = new ArcSidebar(settings);
+    arc._scaleFactor = 2;
+    arc._monitor = { x: 0, y: 0, width: 1920, height: 120, index: 0 };
+    const origGetWA = Main.layoutManager.getWorkAreaForMonitor;
+    Main.layoutManager.getWorkAreaForMonitor = () => ({ x: 0, y: 0, width: 1920, height: 40 });
+    arc._loadConfig();
+    assert.ok(arc._geo.arcR >= 200 * 2, `expected floor at 400, got ${arc._geo.arcR}`);
+    Main.layoutManager.getWorkAreaForMonitor = origGetWA;
+});
+
+test('_computeGeo radius scales normally on a tall workarea (no floor triggered)', () => {
+    const settings = makeSettings({ 'arc-panel-position': 'left' });
+    const arc = new ArcSidebar(settings);
+    arc._scaleFactor = 1;
+    arc._monitor = { x: 0, y: 0, width: 1920, height: 1080, index: 0 };
+    const origGetWA = Main.layoutManager.getWorkAreaForMonitor;
+    Main.layoutManager.getWorkAreaForMonitor = () => ({ x: 0, y: 32, width: 1920, height: 1048 });
+    arc._loadConfig();
+    assert.equal(arc._geo.arcR, Math.round(1048 * 0.48));
+    Main.layoutManager.getWorkAreaForMonitor = origGetWA;
+});
+
+/* ═══ ArcSidebar — data model: _buildGroups(), merge/order persistence ═ */
+
+test('_buildGroups groups windows by app, one group per app with no merge', () => {
+    const [ws0] = wsm.reset(1);
+    wsm.setActive(ws0);
+    const a = new FakeWindow('appA'); ws0.adopt(a);
+    const b = new FakeWindow('appB'); ws0.adopt(b);
+    const arc = new ArcSidebar(makeSettings());
+    arc._loadMergeMap(); arc._loadOrderMap();
+    arc._buildGroups();
+    assert.equal(arc._groups.length, 2);
+    assert.deepEqual(arc._groups.map(g => g.key).sort(), ['appA', 'appB']);
+});
+
+test('_buildGroups folds merged apps into one group with both windows', () => {
+    const [ws0] = wsm.reset(1);
+    wsm.setActive(ws0);
+    const a = new FakeWindow('appA'); ws0.adopt(a);
+    const b = new FakeWindow('appB'); ws0.adopt(b);
+    const settings = makeSettings({ 'arc-merge-map': JSON.stringify({ appA: 'appA|appB', appB: 'appA|appB' }) });
+    const arc = new ArcSidebar(settings);
+    arc._loadMergeMap(); arc._loadOrderMap();
+    arc._buildGroups();
+    assert.equal(arc._groups.length, 1);
+    assert.equal(arc._groups[0].appIds.length, 2);
+    assert.equal(arc._groups[0].windows.length, 2);
+});
+
+test('_buildGroups sorts by order-map, unordered groups go last', () => {
+    const [ws0] = wsm.reset(1);
+    wsm.setActive(ws0);
+    const a = new FakeWindow('appA'); ws0.adopt(a);
+    const b = new FakeWindow('appB'); ws0.adopt(b);
+    const c = new FakeWindow('appC'); ws0.adopt(c);
+    const settings = makeSettings({ 'arc-order-map': JSON.stringify({ appB: 0, appA: 1 }) });
+    const arc = new ArcSidebar(settings);
+    arc._loadMergeMap(); arc._loadOrderMap();
+    arc._buildGroups();
+    assert.deepEqual(arc._groups.map(g => g.key), ['appB', 'appA', 'appC']);
+});
+
+test('_buildGroups promotes the focused window to the front of its group', () => {
+    const [ws0] = wsm.reset(1);
+    wsm.setActive(ws0);
+    const a1 = new FakeWindow('appA'); ws0.adopt(a1);
+    const a2 = new FakeWindow('appA'); ws0.adopt(a2);
+    setFocus(a2);
+    const arc = new ArcSidebar(makeSettings());
+    arc._loadMergeMap(); arc._loadOrderMap();
+    arc._buildGroups();
+    assert.equal(arc._groups[0].windows[0], a2, 'focused window should be first');
+});
+
+test('_loadMergeMap falls back to an empty map on malformed JSON', () => {
+    const arc = new ArcSidebar(makeSettings({ 'arc-merge-map': 'not json' }));
+    arc._loadMergeMap();
+    assert.equal(arc._mergeMap.size, 0);
+});
+
+test('_loadOrderMap falls back to an empty map on malformed JSON', () => {
+    const arc = new ArcSidebar(makeSettings({ 'arc-order-map': '{ broken' }));
+    arc._loadOrderMap();
+    assert.equal(arc._orderMap.size, 0);
+});
+
+test('_mergeApps folds source into target and every member shares the new composite key', () => {
+    const settings = makeSettings();
+    const arc = new ArcSidebar(settings);
+    arc._loadMergeMap();
+    arc._mergeApps('appA', 'appB');
+    assert.equal(arc._mergeMap.get('appA'), arc._mergeMap.get('appB'));
+    assert.equal(JSON.parse(settings.get_string('arc-merge-map'))['appA'], arc._mergeMap.get('appA'));
+});
+
+test('_unmergeApp removes the app and cleans up now-singleton groups', () => {
+    const settings = makeSettings();
+    const arc = new ArcSidebar(settings);
+    arc._loadMergeMap();
+    arc._mergeApps('appA', 'appB');
+    arc._unmergeApp('appA');
+    assert.ok(!arc._mergeMap.has('appA'));
+    assert.ok(!arc._mergeMap.has('appB'), 'the now-singleton former partner should also be cleaned up');
+});
+
+/* ═══ ArcSidebar — card rendering: grid, stack/fan offsets, icon row ═══ */
+
+test('_positionStack lays cards at fixed fan-out offsets scaled by grid scale', () => {
+    const arc = new ArcSidebar(makeSettings());
+    const grid = new St.Widget({});
+    grid._scale = 1;
+    grid._cards = [
+        { card: new St.Widget({}), dim: new St.Widget({}) },
+        { card: new St.Widget({}), dim: new St.Widget({}) },
+    ];
+    arc._positionStack(grid, false);
+    assert.equal(grid._cards[0].card.x, 0);
+    assert.equal(grid._cards[0].card.y, 0);
+    assert.ok(grid._cards[1].card.x > 0, 'second card should be offset horizontally');
+    assert.equal(grid._fanned, false);
+});
+
+test('_positionFan spreads cards along the panel-position axis and returns the total shift', () => {
+    const arc = new ArcSidebar(makeSettings({ 'arc-panel-position': 'left' }));
+    arc._pos = 'left';
+    const grid = new St.Widget({});
+    grid._gridW = 100; grid._gridH = 80;
+    grid._cards = [
+        { card: new St.Widget({}), dim: new St.Widget({}), cW: 100, cH: 80 },
+        { card: new St.Widget({}), dim: new St.Widget({}), cW: 100, cH: 80 },
+    ];
+    const { shift, isBottom } = arc._positionFan(grid);
+    assert.equal(isBottom, false);
+    assert.ok(shift > 0);
+    assert.equal(grid._fanned, true);
+});
+
+test('_positionFan on a single-card grid is a no-op (no divide-by-zero / no shift)', () => {
+    const arc = new ArcSidebar(makeSettings());
+    const grid = new St.Widget({});
+    grid._cards = [{ card: new St.Widget({}), dim: new St.Widget({}), cW: 100, cH: 80 }];
+    const { shift } = arc._positionFan(grid);
+    assert.equal(shift, 0);
+});
+
+test('_buildGrid builds one card per window (capped at 4), front card first in paint order via reversed add', () => {
+    const win1 = new FakeWindow('appA', { actor: makeWindowActor() });
+    const win2 = new FakeWindow('appA', { actor: makeWindowActor() });
+    const group = { app: { get_id: () => 'appA' }, apps: [{ get_id: () => 'appA' }], windows: [win1, win2], appIds: ['appA'], key: 'appA' };
+    const arc = new ArcSidebar(makeSettings());
+    const grid = arc._buildGrid(group, 158, 89, 1);
+    assert.equal(grid._cards.length, 2);
+    assert.equal(grid._cards[0].win, win1);
+});
+
+test('_buildIconRow adds one icon widget per window in the group', () => {
+    const win1 = new FakeWindow('appA', { actor: makeWindowActor() });
+    const group = { app: { get_id: () => 'appA' }, apps: [], windows: [win1], appIds: ['appA'], key: 'appA' };
+    const arc = new ArcSidebar(makeSettings());
+    const grid = arc._buildGrid(group, 158, 89, 1);
+    const container = new St.Widget({});
+    arc._buildIconRow(container, group, 158, 42, 20, 12, 1, grid);
+    assert.equal(container.children.length, 1);
+});
+
+/* ═══ ArcSidebar — _redraw() main render loop ══════════════════════════ */
+
+test('_redraw creates one container per group, positioned along the arc', () => {
+    const [ws0] = wsm.reset(1);
+    wsm.setActive(ws0);
+    const a = new FakeWindow('appA', { actor: makeWindowActor() }); ws0.adopt(a);
+    const b = new FakeWindow('appB', { actor: makeWindowActor() }); ws0.adopt(b);
+    const arc = new ArcSidebar(makeSettings());
+    arc._scaleFactor = 1;
+    arc._monitor = Main.layoutManager.primaryMonitor;
+    arc._loadMergeMap(); arc._loadOrderMap(); arc._loadConfig();
+    arc._panel = new St.Widget({});
+    arc._buildGroups();
+    arc._redraw();
+    assert.equal(arc._containers.length, 2);
+    assert.equal(arc._panel.children.length, 2);
+});
+
+test('_redraw skips a card once its angular offset exceeds ARC_MAX_ANGLE + angleStep', () => {
+    const [ws0] = wsm.reset(1);
+    wsm.setActive(ws0);
+    for (let i = 0; i < 10; i++) ws0.adopt(new FakeWindow(`app${i}`, { actor: makeWindowActor() }));
+    const arc = new ArcSidebar(makeSettings({ 'arc-angle-step': 16 }));
+    arc._scaleFactor = 1;
+    arc._monitor = Main.layoutManager.primaryMonitor;
+    arc._loadMergeMap(); arc._loadOrderMap(); arc._loadConfig();
+    arc._panel = new St.Widget({});
+    arc._offset = 0;
+    arc._buildGroups();
+    arc._redraw();
+    assert.ok(arc._containers.length < 10, `expected some cards culled by MAX_ANGLE, got ${arc._containers.length}`);
+});
+
+test('_redraw clears previous containers and card timers before rebuilding', () => {
+    const [ws0] = wsm.reset(1);
+    wsm.setActive(ws0);
+    ws0.adopt(new FakeWindow('appA', { actor: makeWindowActor() }));
+    const arc = new ArcSidebar(makeSettings());
+    arc._scaleFactor = 1;
+    arc._monitor = Main.layoutManager.primaryMonitor;
+    arc._loadMergeMap(); arc._loadOrderMap(); arc._loadConfig();
+    arc._panel = new St.Widget({});
+    arc._buildGroups();
+    arc._redraw();
+    const firstContainer = arc._containers[0];
+    arc._redraw();
+    assert.ok(firstContainer.destroyed, 'first pass container should be destroyed on second redraw');
+});
+
+test('enable()/disable() cycle leaves zero pending card timers and zero tracked signal sources', () => {
+    const [ws0] = wsm.reset(1);
+    wsm.setActive(ws0);
+    ws0.adopt(new FakeWindow('appA', { actor: makeWindowActor() }));
+    const arc = new ArcSidebar(makeSettings());
+    arc.enable();
+    clock.advance(50); // fire the debounced _scheduleRefresh timer
+    arc.disable();
+    assert.equal(arc._cardTimers.size, 0);
+    assert.equal(clock.pending, 0, 'no timers should remain pending after disable()');
+});
+
+/* ═══ ArcSidebar — drag: merge (outside) vs reorder (inside), un-merge ═ */
+
+test('a press+release below the drag threshold is a plain click (activates the group)', () => {
+    const [ws0] = wsm.reset(1);
+    wsm.setActive(ws0);
+    const a = new FakeWindow('appA'); ws0.adopt(a);
+    const group = { app: a, apps: [], windows: [a], appIds: ['appA'], key: 'appA' };
+    const arc = new ArcSidebar(makeSettings());
+    arc._scaleFactor = 1;
+    arc._activateGroup = (g) => { arc._activated = g; };
+    const container = new St.Widget({});
+    arc._onCardPress(container, group, { get_button: () => 1 });
+    arc._onCardRelease(container, group, 0, { get_button: () => 1 });
+    assert.equal(arc._activated, group);
+    assert.equal(arc._drag, null);
+});
+
+test('dragging past the threshold and releasing outside the panel merges into the focused app', () => {
+    const [ws0] = wsm.reset(1);
+    wsm.setActive(ws0);
+    const source = new FakeWindow('appSource'); ws0.adopt(source);
+    const focused = new FakeWindow('appFocused'); ws0.adopt(focused);
+    setFocus(focused);
+    const sourceApp = { get_id: () => 'appSource', create_icon_texture: () => new St.Widget({}) };
+    const group = { app: sourceApp, apps: [sourceApp], windows: [source], appIds: ['appSource'], key: 'appSource' };
+    const arc = new ArcSidebar(makeSettings());
+    arc._scaleFactor = 1;
+    arc._geo = { visX: 0, visY: 0, panelW: 200, panelH: 800 };
+    arc._loadMergeMap();
+    const container = new St.Widget({});
+    // Press captures its start position from global.get_pointer() (stub default [0,0]);
+    // only override it for the release read, or the drag's start would move too and
+    // the motion delta would cancel out to zero.
+    arc._onCardPress(container, group, { get_button: () => 1 });
+    arc._onDragMotion({ get_coords: () => [9999, 9999] });
+    const origGetPointer = global.get_pointer;
+    global.get_pointer = () => [9999, 9999]; // release point — outside the panel rect
+    try {
+        arc._onCardRelease(container, group, 0, { get_button: () => 1 });
+    } finally { global.get_pointer = origGetPointer; }
+    assert.ok(arc._mergeMap.get('appSource'), 'expected a merge-map entry for the dragged app');
+    assert.equal(arc._mergeMap.get('appSource'), arc._mergeMap.get('appFocused'));
+    assert.equal(arc._drag, null);
+});
+
+test('dragging past the threshold and releasing inside the panel reorders instead of merging', () => {
+    const [ws0] = wsm.reset(1);
+    wsm.setActive(ws0);
+    const a = new FakeWindow('appA'); ws0.adopt(a);
+    const b = new FakeWindow('appB'); ws0.adopt(b);
+    const appAObj = { get_id: () => 'appA', create_icon_texture: () => new St.Widget({}) };
+    const appBObj = { get_id: () => 'appB', create_icon_texture: () => new St.Widget({}) };
+    const groupA = { app: appAObj, apps: [appAObj], windows: [a], appIds: ['appA'], key: 'appA' };
+    const groupB = { app: appBObj, apps: [appBObj], windows: [b], appIds: ['appB'], key: 'appB' };
+    const arc = new ArcSidebar(makeSettings());
+    arc._scaleFactor = 1;
+    arc._geo = { visX: 0, visY: 0, panelW: 200, panelH: 800 };
+    arc._loadMergeMap(); arc._loadOrderMap();
+    arc._groups = [groupA, groupB];
+    const containerA = new St.Widget({}); containerA.set_position(0, 0); containerA.set_size(100, 80);
+    const containerB = new St.Widget({}); containerB.set_position(0, 200); containerB.set_size(100, 80);
+    arc._containers = [containerA, containerB];
+    arc._onCardPress(containerA, groupA, { get_button: () => 1 });
+    arc._onDragMotion({ get_coords: () => [50, 240] });
+    const origGetPointer = global.get_pointer;
+    global.get_pointer = () => [50, 240]; // release point — inside the panel, near containerB
+    try {
+        arc._onCardRelease(containerA, groupA, 0, { get_button: () => 1 });
+    } finally { global.get_pointer = origGetPointer; }
+    assert.equal(arc._orderMap.get('appA'), 1, 'appA should be reordered to appB\'s slot');
+    assert.equal(arc._mergeMap.size, 0, 'a reorder must not also create a merge-map entry');
+});
+
+test('right-click on a merged (multi-app) card un-merges every member app', () => {
+    const settings = makeSettings();
+    const arc = new ArcSidebar(settings);
+    arc._loadMergeMap();
+    arc._mergeApps('appA', 'appB');
+    const group = { apps: [{ get_id: () => 'appA' }, { get_id: () => 'appB' }], appIds: ['appA', 'appB'] };
+    const container = new St.Widget({});
+    const stop = arc._onCardPress(container, group, { get_button: () => 3 });
+    assert.equal(stop, Clutter.EVENT_STOP);
+    assert.equal(arc._mergeMap.size, 0);
+});
+
+test('right-click on a single-app card is not consumed (propagates for a normal click)', () => {
+    const arc = new ArcSidebar(makeSettings());
+    const group = { apps: [{ get_id: () => 'appA' }], appIds: ['appA'] };
+    const container = new St.Widget({});
+    const result = arc._onCardPress(container, group, { get_button: () => 3 });
+    assert.equal(result, Clutter.EVENT_PROPAGATE);
+});
+
+test('_cancelDrag disconnects the stage motion-event listener and clears drag state', () => {
+    const arc = new ArcSidebar(makeSettings());
+    arc._scaleFactor = 1;
+    const group = { app: {}, apps: [], windows: [], appIds: ['appA'], key: 'appA' };
+    const container = new St.Widget({});
+    arc._onCardPress(container, group, { get_button: () => 1 });
+    assert.ok(arc._drag, 'expected a drag candidate after press');
+    arc._cancelDrag();
+    assert.equal(arc._drag, null);
+    assert.equal(stage._tracked?.get(arc)?.length ?? 0, 0, 'stage motion-event should be disconnected');
+});
+
+/* ═══ ArcSidebar — momentum scroll, show/hide, persistent mode ════════ */
+
+test('scrolling accumulates velocity and starts the physics timer, which decays toward zero', () => {
+    const arc = new ArcSidebar(makeSettings({ 'arc-scroll-speed': 10 }));
+    arc._scaleFactor = 1;
+    arc._monitor = Main.layoutManager.primaryMonitor;
+    arc._loadConfig();
+    arc._groups = [{}, {}, {}];
+    arc._redraw = () => {};
+    arc._handleScroll({ get_scroll_direction: () => Clutter.ScrollDirection.DOWN });
+    assert.ok(arc._physicsTimer, 'expected physics timer to start');
+    clock.advance(16);
+    assert.ok(arc._offset > 0, 'offset should have moved after one physics tick');
+});
+
+test('_scrollTo eases offset to a target index and calls onComplete on arrival', () => {
+    const arc = new ArcSidebar(makeSettings());
+    arc._groups = [{}, {}, {}];
+    arc._redraw = () => {};
+    let completed = false;
+    arc._scrollTo(2, () => { completed = true; });
+    for (let i = 0; i < 50 && !completed; i++) clock.advance(16);
+    assert.ok(completed, 'onComplete should fire once the eased scroll reaches its target');
+    assert.equal(Math.round(arc._offset), 2);
+});
+
+test('leaving the panel starts the hide timer, which hides after auto-hide-delay', () => {
+    const arc = new ArcSidebar(makeSettings({ 'auto-hide-delay': 800 }));
+    arc._hideDelay = 800;
+    arc._geo = { visX: 100, visY: 0, hidX: -200, hidY: 0, panelW: 200, panelH: 800 };
+    arc._panel = new St.Widget({});
+    arc._isVisible = true;
+    arc._startHide();
+    assert.ok(arc._hideTimer);
+    clock.advance(800);
+    assert.equal(arc._isVisible, false);
+});
+
+test('persistent mode auto-shows when no window overlaps the panel, hides again when one does', () => {
+    const [ws0] = wsm.reset(1);
+    wsm.setActive(ws0);
+    const settings = makeSettings({ 'arc-persistent-mode': true });
+    const arc = new ArcSidebar(settings);
+    arc._persistEnabled = true;
+    arc._geo = { visX: 0, visY: 0, panelW: 200, panelH: 800 };
+    arc._panel = new St.Widget({});
+    arc._scheduleRefresh = () => {};
+    arc._checkPersistence();
+    assert.equal(arc._isVisible, true, 'no windows overlap -> should auto-show');
+
+    const overlapping = new FakeWindow('appA', { frame: { x: 0, y: 0, width: 100, height: 100 } });
+    ws0.adopt(overlapping);
+    arc._checkPersistence();
+    assert.equal(arc._isVisible, false, 'an overlapping window should auto-hide again');
+});
+
+/* ═══ ArcSidebar — keybindings ══════════════════════════════════════── */
+
+test('_addKeybindings binds the shared toggle plus all four arc-specific keys when non-empty', () => {
+    const settings = makeSettings({
+        'toggle-sidebar': ['<Super>a'],
+        'keybinding-arc-next': ['<Super>Right'],
+    });
+    let bound = [];
+    const origAdd = Main.wm.addKeybinding;
+    Main.wm.addKeybinding = (name) => { bound.push(name); return 1; };
+    const arc = new ArcSidebar(settings);
+    arc._addKeybindings();
+    Main.wm.addKeybinding = origAdd;
+    assert.ok(bound.includes('toggle-sidebar'));
+    assert.ok(bound.includes('keybinding-arc-next'));
+    assert.ok(!bound.includes('keybinding-arc-prev'), 'empty binding should not be registered');
+});
+
+test('_removeKeybindings only removes keys that were actually bound', () => {
+    const settings = makeSettings({ 'toggle-sidebar': ['<Super>a'] });
+    let removed = [];
+    const origAdd = Main.wm.addKeybinding;
+    const origRemove = Main.wm.removeKeybinding;
+    Main.wm.addKeybinding = () => 1;
+    Main.wm.removeKeybinding = (name) => removed.push(name);
+    const arc = new ArcSidebar(settings);
+    arc._addKeybindings();
+    arc._removeKeybindings();
+    Main.wm.addKeybinding = origAdd;
+    Main.wm.removeKeybinding = origRemove;
+    assert.ok(removed.includes('toggle-sidebar'));
+    assert.ok(!removed.includes('keybinding-arc-prev'), 'never-bound key should not be removed');
+});
+
+test('keybinding-arc-next callback advances toward the next card', () => {
+    const settings = makeSettings({ 'keybinding-arc-next': ['<Super>Right'] });
+    let callback = null;
+    const origAdd = Main.wm.addKeybinding;
+    Main.wm.addKeybinding = (name, _s, _f, _m, cb) => { if (name === 'keybinding-arc-next') callback = cb; return 1; };
+    const arc = new ArcSidebar(settings);
+    arc._groups = [{}, {}, {}];
+    arc._offset = 0;
+    let scrolledTo = null;
+    arc._scrollTo = (idx) => { scrolledTo = idx; };
+    arc._addKeybindings();
+    Main.wm.addKeybinding = origAdd;
+    callback();
+    assert.equal(scrolledTo, 1);
+});
+
+test('_toggleVisible shows when hidden and hides when visible', () => {
+    const arc = new ArcSidebar(makeSettings());
+    arc._isVisible = false;
+    let shown = false, hidden = false;
+    arc._showPanel = () => { shown = true; };
+    arc._hidePanel = () => { hidden = true; };
+    arc._toggleVisible();
+    assert.ok(shown);
+    arc._isVisible = true;
+    arc._toggleVisible();
+    assert.ok(hidden);
+});
+
+/* ═══ ArcSidebar — _panel must not clip distant-but-visible cards ═════ */
+
+test('_panel is not clip_to_allocation — cards beyond relIdx=1 legitimately extend past the nominal one-card-wide panel box', () => {
+    // On a real 1920x1080 monitor at scale 1 with default settings, arcR
+    // (~503px, derived from workarea height) is more than double panelW
+    // (~201px, sized for one card) — a card's x drifts by arcR*(1-cos(angle))
+    // as it moves off-center, which already exceeds panelW by relIdx=2-3,
+    // well before the angle-based MAX_ANGLE cull would hide it. If the panel
+    // clips its own allocation, those still-visible-per-the-cull cards render
+    // as partial slivers or vanish entirely — this is what actually happened
+    // on a real monitor (see conversation), not a hypothetical.
+    const arc = new ArcSidebar(makeSettings());
+    arc._scaleFactor = 1;
+    arc._monitor = Main.layoutManager.primaryMonitor;
+    arc._loadMergeMap(); arc._loadOrderMap(); arc._loadConfig();
+    arc._buildUI();
+    assert.equal(arc._panel.clip_to_allocation, false,
+        'clipping the panel to a one-card-wide box hides cards the angle cull already decided to show');
+    arc._destroyUI();
 });
 
 /* ── report ──────────────────────────────────────────────────────────── */

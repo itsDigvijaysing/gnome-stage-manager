@@ -38,6 +38,7 @@ const CARD_HOVER_OPACITY = 255;   // fully opaque at the centre of the bell curv
 // Fallback stills are full-resolution textures, so only a handful are kept.
 const MAX_SNAPSHOTS = 8;
 const KEYBIND_NAME = 'toggle-sidebar';
+const APP_DRAG_THRESHOLD = 18;    // logical px — past this, a press+release is a drag, not a click
 
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -62,8 +63,9 @@ function _bellCurve(dist, sigma) {
     return Math.exp(-(dist * dist) / (2 * sigma * sigma));
 }
 
-/** Group windows by app (for 'apps' sidebar mode). */
-function _groupByApp(workspace, focusedWindow) {
+/** Group windows by app ('apps' mode). Merged apps (drag-to-merge) fold into
+ *  one group; every group carries `key` and `apps` so callers never branch. */
+function _groupByApp(workspace, focusedWindow, mergeMap = new Map()) {
     const tracker = Shell.WindowTracker.get_default();
     const appMap = new Map();
 
@@ -89,7 +91,17 @@ function _groupByApp(workspace, focusedWindow) {
         appMap.get(id).windows.push(win);
     }
 
-    return [...appMap.values()];
+    const byGroup = new Map(); // resolved key -> { apps: [], windows: [] }
+    for (const [appId, entry] of appMap) {
+        const key = mergeMap.get(appId) ?? appId;
+        if (!byGroup.has(key)) byGroup.set(key, { apps: [], windows: [] });
+        const bucket = byGroup.get(key);
+        bucket.apps.push(entry.app);
+        bucket.windows.push(...entry.windows);
+    }
+
+    return [...byGroup.entries()].map(([key, g]) =>
+        ({ key, app: g.apps[0], apps: g.apps, windows: g.windows }));
 }
 
 
@@ -267,12 +279,14 @@ class StageSidebar {
         // win → cached still, used only when the live actor is unusable at draw
         // time. Insertion-ordered, capped at MAX_SNAPSHOTS (oldest evicted).
         this._snapshots = new Map();
+
+        this._appMergeMap = new Map();   // appId -> resolved merge-group key, see _groupByApp
+        this._appDrag = null;            // in-flight drag-to-merge candidate, see _startAppDragCandidate
     }
 
     // ── Signal & timer tracking ─────────────────────────────────────────
-    // Every signal MUST flow through _sig()/_cardSig() so it can be disconnected
-    // in disable() (EGO-L-003) — both route through connectObject(), tracked
-    // per-source so disable() can call disconnectObject(this) on each source.
+    // Every signal must flow through _sig()/_cardSig() (connectObject, tracked
+    // per-source) so disable() can disconnectObject(this) on each (EGO-L-003).
 
     _sig(obj, signal, cb) {
         obj.connectObject(signal, cb, this);
@@ -298,10 +312,33 @@ class StageSidebar {
     get _EDGE_W() { return this._settings.get_int('edge-trigger-width') * this._scaleFactor; }
     get _BASE_SCALE() { return this._settings.get_int('card-base-scale') / 100.0; }
     get _PERSP_ANGLE() { return this._settings.get_int('perspective-angle'); }
+    get _POS() { return this._settings.get_string('stack-panel-position'); }
+    /** Perspective tilt direction — mirrored on the right so cards still
+     *  face into the screen instead of away from it. */
+    get _ROT_SIGN() { return this._POS === 'right' ? -1 : 1; }
+
+    // ── Position-aware geometry (left = default, right = mirrored) ──
+    _panelVisibleX(mon) {
+        return this._POS === 'right' ? mon.x + mon.width - this._PANEL_W : mon.x;
+    }
+    _panelHiddenX(mon) {
+        return this._POS === 'right' ? mon.x + mon.width : mon.x - this._PANEL_W;
+    }
+    _edgeX(mon) {
+        return this._POS === 'right' ? mon.x + mon.width - this._EDGE_W : mon.x;
+    }
+    /** Preview floats on the side of the sidebar that faces the screen's
+     *  interior — to its left when the sidebar itself is on the right. */
+    _previewX(mon, previewW, gap) {
+        return this._POS === 'right'
+            ? mon.x + mon.width - this._PANEL_W - previewW - gap
+            : mon.x + this._PANEL_W + gap;
+    }
 
     enable() {
         this._recomputeScale();
         this._recomputeThemeClass();
+        this._loadAppMergeMap();
         this._build();
         this._wire();
         this._initGroups();
@@ -324,6 +361,7 @@ class StageSidebar {
         this._sigSources.forEach(o => o.disconnectObject(this));
         this._sigSources.clear();
         this._disconnectCardSigs();
+        this._cancelAppDrag();
         // Then preview + card content (cards live inside _box).
         this._destroyPreview();
         this._safeDestroyContent();
@@ -333,6 +371,7 @@ class StageSidebar {
         this._expectMinimize.clear();
         this._expectUnminimize.clear();
         this._snapshots.clear();
+        this._appMergeMap.clear();
         this._signature = null;
         // Explicit destroy for every actor created in _build() (EGO-L-002).
         // Destroy children before parents so set_child(null) calls don't dangle.
@@ -372,7 +411,7 @@ class StageSidebar {
             style: 'background-color: transparent;',
         });
         this._edge.set_size(edgeW, panelH);
-        this._edge.set_position(mon.x, mon.y + topH);
+        this._edge.set_position(this._edgeX(mon), mon.y + topH);
         Main.layoutManager.addChrome(this._edge, { trackFullscreen: false });
         this._sig(this._edge, 'enter-event', () => {
             if (!this._fullscreen()) this._show();
@@ -385,7 +424,7 @@ class StageSidebar {
             style: 'background-color: transparent;',
         });
         this._panel.set_size(panelW, panelH);
-        this._panel.set_position(mon.x - panelW, mon.y + topH);
+        this._panel.set_position(this._panelHiddenX(mon), mon.y + topH);
         this._visible = false;
         this._applyChrome();
 
@@ -418,6 +457,7 @@ class StageSidebar {
         // view — never rely on one alone, since the scroll view isn't reactive.
         this._sig(this._box, 'scroll-event', (_actor, event) => this._onScrollEvent(event));
         this._sig(this._scroll, 'scroll-event', (_actor, event) => this._onScrollEvent(event));
+        this._sig(this._box, 'button-release-event', () => { this._endAppDragCandidate(); return Clutter.EVENT_PROPAGATE; });
 
         // Fires for events bubbling up from the reactive cards.
         this._sig(this._panel, 'enter-event', () => {
@@ -474,10 +514,8 @@ class StageSidebar {
         const adj = this._scroll?.vadjustment;
         if (!adj) return Clutter.EVENT_PROPAGATE;
 
-        // Smooth-scroll devices (touchpads, hi-res mice) report a delta; legacy
-        // mice only report a discrete direction. get_scroll_delta() is only
-        // meaningful for SMOOTH, so branch on the direction instead of probing
-        // it — the shape GNOME's own scroll handlers use.
+        // Legacy mice only report a direction; get_scroll_delta() only means
+        // something for SMOOTH, so branch on direction first, not probe it.
         let dy = 0;
         const dir = event.get_scroll_direction();
         if (dir === Clutter.ScrollDirection.SMOOTH)
@@ -494,6 +532,61 @@ class StageSidebar {
         const max = Math.max(0, adj.upper - adj.page_size);
         adj.value = Math.max(0, Math.min(max, adj.value + dy * step));
         return Clutter.EVENT_STOP;
+    }
+
+    /** Merge gesture: press starts a candidate, stage motion flags it as a
+     *  drag past threshold, release on a different app card commits it. */
+    _startAppDragCandidate(group, card) {
+        this._cancelAppDrag();
+        const [px, py] = global.get_pointer();
+        this._appDrag = { group, card, startX: px, startY: py, moved: false };
+        this._sig(global.stage, 'motion-event', (_a, event) => this._onAppDragMotion(event));
+    }
+
+    _onAppDragMotion(event) {
+        if (!this._appDrag) return Clutter.EVENT_PROPAGATE;
+        const [px, py] = event.get_coords();
+        const dx = px - this._appDrag.startX;
+        const dy = py - this._appDrag.startY;
+        if (Math.hypot(dx, dy) > APP_DRAG_THRESHOLD * this._scaleFactor)
+            this._appDrag.moved = true;
+        return Clutter.EVENT_PROPAGATE;
+    }
+
+    /** Resolve a pending drag on release; true = consumed, caller skips its
+     *  click-activate. Target is hit-tested live — Clutter's implicit grab means release always fires on the origin card, not the pointer's target. */
+    _endAppDragCandidate() {
+        const drag = this._appDrag;
+        if (!drag) return false;
+        this._cancelAppDrag();
+        if (!drag.moved) return false;
+        const releaseGroup = this._appCardGroupAtPointer();
+        if (releaseGroup && releaseGroup !== drag.group) this._onDragCommit(drag.group, releaseGroup);
+        return true;
+    }
+
+    /** Group under the pointer, or null over blank space. Walks up from the
+     *  hit actor since the pick can land on a card's child, not the card itself. */
+    _appCardGroupAtPointer() {
+        const [px, py] = global.get_pointer();
+        let actor = global.stage.get_actor_at_pos(Clutter.PickMode.ALL, px, py);
+        while (actor) {
+            if (actor._group) return actor._group;
+            actor = actor.get_parent();
+        }
+        return null;
+    }
+
+    _cancelAppDrag() {
+        if (!this._appDrag) return;
+        this._appDrag = null;
+        global.stage.disconnectObject(this);
+    }
+
+    _onDragCommit(sourceGroup, targetGroup) {
+        for (const app of sourceGroup.apps) this._applyMerge(app.get_id(), targetGroup.key);
+        this._saveAppMergeMap();
+        this._scheduleRefresh();
     }
 
     /** The actor a crossing event is travelling to/from, if the event exposes one. */
@@ -536,13 +629,13 @@ class StageSidebar {
         const panelH = mon.height - topH;
 
         this._edge.set_size(edgeW, panelH);
-        this._edge.set_position(mon.x, mon.y + topH);
+        this._edge.set_position(this._edgeX(mon), mon.y + topH);
 
         // Drop any in-flight slide first — it's aimed at the old width and
         // would otherwise leave the panel at a stale offset.
         this._panel.remove_all_transitions();
         this._panel.set_size(panelW, panelH);
-        const x = this._visible ? mon.x : mon.x - panelW;
+        const x = this._visible ? this._panelVisibleX(mon) : this._panelHiddenX(mon);
         this._panel.set_position(x, mon.y + topH);
         this._scroll.set_size(panelW, panelH);
         this._syncEdge();
@@ -616,9 +709,14 @@ class StageSidebar {
             this._initGroups();
             if (this._visible) this._refresh();
         });
+        this._sig(this._settings, 'changed::app-merge-map', () => {
+            this._loadAppMergeMap();
+            if (this._visible) this._refresh();
+        });
 
         this._sig(this._settings, 'changed::sidebar-width', () => this._rebuildLayout());
         this._sig(this._settings, 'changed::edge-trigger-width', () => this._rebuildLayout());
+        this._sig(this._settings, 'changed::stack-panel-position', () => this._rebuildLayout());
         this._sig(this._settings, 'changed::sidebar-auto-hide', () => {
             if (this._settings.get_boolean('sidebar-auto-hide')) {
                 if (!this._hovered) this._scheduleHide();
@@ -760,6 +858,43 @@ class StageSidebar {
 
     _isActiveGroup(group) {
         return !!group && this._activeIds.get(group.ws) === group.id;
+    }
+
+    // ── App merge/un-merge ('apps' mode) ─────────────────────────────
+
+    _loadAppMergeMap() {
+        const raw = this._settings.get_string('app-merge-map');
+        let obj = {};
+        // JSON.parse genuinely throws on malformed input (hand-edited dconf) —
+        // the one deliberate exception to this file's zero-try-catch rule.
+        try { obj = JSON.parse(raw); } catch (_e) { obj = {}; }
+        this._appMergeMap = new Map(Object.entries(obj));
+    }
+
+    _saveAppMergeMap() {
+        const obj = Object.fromEntries(this._appMergeMap);
+        this._settings.set_string('app-merge-map', JSON.stringify(obj));
+    }
+
+    /** Point sourceAppId at targetKey, flattening anyone already pointing at
+     *  sourceAppId onto targetKey — keeps every entry a single hop. Map-only; callers save once. */
+    _applyMerge(sourceAppId, targetKey) {
+        if (sourceAppId === targetKey) return;
+        this._appMergeMap.set(sourceAppId, targetKey);
+        for (const [appId, key] of [...this._appMergeMap]) {
+            if (key === sourceAppId) this._appMergeMap.set(appId, targetKey);
+        }
+    }
+
+    _mergeApp(sourceAppId, targetKey) {
+        this._applyMerge(sourceAppId, targetKey);
+        this._saveAppMergeMap();
+    }
+
+    _unmergeGroup(group) {
+        if (group.apps.length <= 1) return;
+        for (const app of group.apps) this._appMergeMap.delete(app.get_id());
+        this._saveAppMergeMap();
     }
 
     _workspaceOf(win) {
@@ -936,7 +1071,7 @@ class StageSidebar {
                 if (this._panel) {
                     this._panel.remove_all_transitions();
                     this._panel.set_position(
-                        Main.layoutManager.primaryMonitor.x - this._PANEL_W, this._panel.y);
+                        this._panelHiddenX(Main.layoutManager.primaryMonitor), this._panel.y);
                 }
             }
             this._syncEdge();
@@ -991,7 +1126,7 @@ class StageSidebar {
 
         this._panel.remove_all_transitions();
         this._panel.ease({
-            x: Main.layoutManager.primaryMonitor.x,
+            x: this._panelVisibleX(Main.layoutManager.primaryMonitor),
             duration: this._SLIDE_MS,
             mode: Clutter.AnimationMode.EASE_OUT_QUAD,
             // Claimed only once settled — mid-slide would resize every window on every frame.
@@ -1014,7 +1149,7 @@ class StageSidebar {
 
         this._panel.remove_all_transitions();
         this._panel.ease({
-            x: Main.layoutManager.primaryMonitor.x - this._PANEL_W,
+            x: this._panelHiddenX(Main.layoutManager.primaryMonitor),
             duration: this._SLIDE_MS,
             mode: Clutter.AnimationMode.EASE_OUT_QUAD,
         });
@@ -1105,9 +1240,9 @@ class StageSidebar {
                 parts.push(`${i}:${ids(ws.list_windows().filter(w => _isNormal(w)))}`);
             }
         } else if (mode === 'apps') {
-            const groups = _groupByApp(this._activeWs(), global.display.get_focus_window());
+            const groups = _groupByApp(this._activeWs(), global.display.get_focus_window(), this._appMergeMap);
             for (const g of groups)
-                parts.push(`${g.app ? g.app.get_id() : '?'}:${ids(g.windows)}`);
+                parts.push(`${g.key}:${ids(g.windows)}`);
         } else if (mode === 'all-windows') {
             // Every window is its own card here, so each one's shape matters —
             // ids() only buckets the front window's aspect.
@@ -1140,7 +1275,7 @@ class StageSidebar {
 
     _refreshApps() {
         const focusedWin = global.display.get_focus_window();
-        const all = _groupByApp(this._activeWs(), focusedWin);
+        const all = _groupByApp(this._activeWs(), focusedWin, this._appMergeMap);
         for (const group of all.slice(0, MAX_GROUPS)) {
             const card = this._makeAppCard(group);
             if (card) { this._box.add_child(card); this._cards.push(card); }
@@ -1148,10 +1283,8 @@ class StageSidebar {
         this._addOverflowLabel(all.length - MAX_GROUPS);
     }
 
-    /** Every window on every workspace, one card each, under a workspace header.
-     *  Deliberately READ-ONLY: it never minimizes, regroups or moves a window, so
-     *  the workspace-scoped stage model is untouched. Clicking just activates the
-     *  window and lets mutter switch workspace itself. */
+    /** Every window on every workspace, one card each. Deliberately read-only —
+     *  never minimizes/regroups/moves a window; click just activates and lets mutter switch workspace. */
     _refreshAllWindows() {
         const wsm = global.workspace_manager;
         const focused = global.display.get_focus_window();
@@ -1187,13 +1320,13 @@ class StageSidebar {
     /** Workspace heading in all-windows mode. Not pushed to `_cards` — it is a
      *  label, not a hover/bell-curve target (same rule as the overflow label). */
     _addWorkspaceHeader(wsIndex) {
-        if (!this._box) return;
-        this._box.add_child(new St.Label({
-            text: _('Workspace %d').replace('%d', `${wsIndex + 1}`),
-            reactive: false,
-            x_align: Clutter.ActorAlign.CENTER,
-            style_class: this._cls('stage-ws-header'),
-        }));
+        const text = _('Workspace %d').replace('%d', `${wsIndex + 1}`);
+        if (this._box)
+            this._box.add_child(new St.Label({
+                text, reactive: false,
+                x_align: Clutter.ActorAlign.CENTER,
+                style_class: this._cls('stage-ws-header'),
+            }));
     }
 
     /** A single-window card for all-windows mode. */
@@ -1239,7 +1372,8 @@ class StageSidebar {
     /** Show "+N" for stages beyond MAX_GROUPS instead of dropping them silently.
      *  Not pushed to `_cards` — it's a label, not a hover/bell-curve target. */
     _addOverflowLabel(hidden) {
-        if (hidden <= 0 || !this._box) return;
+        if (hidden <= 0) return;
+        if (!this._box) return;
         this._box.add_child(new St.Label({
             text: `+${hidden}`,
             reactive: false,
@@ -1273,7 +1407,7 @@ class StageSidebar {
 
     _animateCardsEntrance() {
         const base = this._BASE_SCALE;
-        const angle = this._PERSP_ANGLE;
+        const angle = this._PERSP_ANGLE * this._ROT_SIGN;
 
         for (let i = 0; i < this._cards.length; i++) {
             const card = this._cards[i];
@@ -1362,18 +1496,27 @@ class StageSidebar {
     }
 
     _makeAppCard(group) {
-        const { app, windows } = group;
+        const { windows } = group;
         const card = this._wrapCard();
+        // Tagged so _appCardGroupAtPointer() can resolve a drag's drop target
+        // by hit-testing, without trusting which card's own handler fired.
+        card._group = group;
         const thumb = this._makeStackedThumb(windows);
         card.add_child(thumb);
         card._thumb = thumb;
 
-        if (app && this._settings.get_boolean('show-app-icons')) {
+        if (this._settings.get_boolean('show-app-icons') && group.apps.length > 0) {
+            const seenApps = new Set();
             const iconBox = new St.BoxLayout({
                 x_align: Clutter.ActorAlign.CENTER,
-                style: 'margin-top: 5px;',
+                style: 'margin-top: 5px; spacing: 4px;',
             });
-            iconBox.add_child(app.create_icon_texture(ICON_SIZE));
+            for (const a of group.apps) {
+                if (!seenApps.has(a.get_id())) {
+                    seenApps.add(a.get_id());
+                    iconBox.add_child(a.create_icon_texture(ICON_SIZE));
+                }
+            }
             card.add_child(iconBox);
         }
 
@@ -1381,8 +1524,17 @@ class StageSidebar {
         const idx = this._cards.length;
         this._wireCardEvents(card, thumb, windows, idx);
 
+        this._cardSig(card, 'button-press-event', (_a, event) => {
+            if (event.get_button() === 3 && group.apps.length > 1) {
+                this._unmergeGroup(group);
+                return Clutter.EVENT_STOP;
+            }
+            if (event.get_button() === 1) this._startAppDragCandidate(group, card);
+            return Clutter.EVENT_PROPAGATE;
+        });
         this._cardSig(card, 'button-release-event', () => {
             this._destroyPreview();
+            if (this._endAppDragCandidate()) return Clutter.EVENT_STOP;
             this._activateApp(group);
             return Clutter.EVENT_STOP;
         });
@@ -1428,9 +1580,8 @@ class StageSidebar {
         return { aw, ah, actor, content: null };
     }
 
-    /** Freeze win's current appearance as a last-resort thumbnail, for when its
-     *  actor is gone by draw time. Must be called while still on screen (needs a
-     *  live buffer); cache is capped, oldest evicted first. */
+    /** Freeze win's appearance as a last-resort thumbnail for when its actor is
+     *  gone by draw time. Call while still on screen; cache is capped, oldest evicted first. */
     _captureSnapshot(win) {
         const geom = this._windowGeometry(win);
         if (!geom) return;
@@ -1616,7 +1767,7 @@ class StageSidebar {
      *  cancelled a card's own in-flight leave-event ease, causing a visible jump. */
     _resetAllCardScales() {
         const base = this._BASE_SCALE;
-        const angle = this._PERSP_ANGLE;
+        const angle = this._PERSP_ANGLE * this._ROT_SIGN;
         for (const card of this._cards) {
             card.ease({
                 scale_x: base, scale_y: base,
@@ -1632,7 +1783,7 @@ class StageSidebar {
      *  are affected (tight sigma). */
     _applyBellCurve(hoveredIdx) {
         const base = this._BASE_SCALE;
-        const angle = this._PERSP_ANGLE;
+        const angle = this._PERSP_ANGLE * this._ROT_SIGN;
 
         for (let i = 0; i < this._cards.length; i++) {
             const dist = Math.abs(i - hoveredIdx);
@@ -1764,7 +1915,7 @@ class StageSidebar {
             reactive: false,
         });
         this._preview.set_size(previewW, previewH);
-        this._preview.set_position(mon.x + this._PANEL_W + 8 * sf, py);
+        this._preview.set_position(this._previewX(mon, previewW, 8 * sf), py);
 
         let yOff = padding;
         for (const holder of clones) {
@@ -1794,7 +1945,7 @@ class StageSidebar {
         });
         this._preview.set_size(previewW, previewH);
         let py = Math.max(mon.y + topH + 8, Math.min(cardY, mon.y + mon.height - previewH - 20));
-        this._preview.set_position(mon.x + this._PANEL_W + 8, py);
+        this._preview.set_position(this._previewX(mon, previewW, 8), py);
 
         const seenApps = new Map();
         for (const w of windows) {
@@ -1867,15 +2018,1040 @@ class StageSidebar {
 }
 
 
+// ─── ArcSidebar ─────────────────────────────────────────────────────────────
+// Carousel-style sidebar; owns its own actors/settings/timers/signals, never
+// shares state with StageSidebar. Spec: docs/superpowers/specs/2026-07-30-arc-sidebar-design.md.
+
+const ARC_BASE_GRID_W    = 158;
+const ARC_BASE_GRID_H    = 89;
+const ARC_BASE_ICON_SIZE = 42;
+const ARC_ICON_OVL       = 20;
+const ARC_PAD_H          = 12;
+const ARC_MAX_ANGLE      = 52;
+const ARC_SCROLL_FRICTION = 0.82;
+const ARC_SCROLL_MIN_VEL  = 0.005;
+const ARC_DRAG_THRESHOLD  = 18;   // logical px — scaled by _scaleFactor before use
+const ARC_GHOST_SIZE      = 100;  // logical px — scaled by _scaleFactor before use
+const ARC_RADIUS_RATIO   = 0.48;  // fraction of workarea height/width
+const ARC_MIN_RADIUS     = 200;   // logical px floor for a degenerate (very short) workarea
+
+const ARC_KEYBINDINGS = [
+    'toggle-sidebar',
+    'keybinding-arc-next',
+    'keybinding-arc-prev',
+    'keybinding-arc-activate',
+    'keybinding-arc-close',
+];
+
+class ArcSidebar {
+    constructor(settings) {
+        this._settings = settings;
+        this._sigSources = new Set();
+        this._cardSigSources = new Set();
+        this._cardTimers = new Set();
+
+        this._monitor = null;
+        this._isVisible = false;
+        this._persistMode = false;
+        this._persistEnabled = false;
+        this._scaleFactor = 1;
+
+        this._hideTimer = null;
+        this._physicsTimer = null;
+        this._persistTimer = null;
+        this._refreshTimer = null;
+        this._dragPollTimer = null;
+
+        this._groups = [];
+        this._offset = 0;
+        this._velocity = 0;
+        this._containers = [];
+        this._drag = null;
+
+        this._mergeMap = new Map();
+        this._orderMap = new Map();
+        this._groupStates = new Map();
+
+        this._panel = null;
+        this._edge = null;
+        this._geo = null;
+
+        this._boundKeys = [];
+    }
+
+    enable() {
+        this._scaleFactor = St.ThemeContext.get_for_stage(global.stage).scale_factor || 1;
+        this._monitor = this._pickMonitor();
+        this._loadMergeMap();
+        this._loadOrderMap();
+        this._loadConfig();
+        this._buildUI();
+        this._addKeybindings();
+
+        this._sig(global.display, 'notify::focus-window', () => {
+            this._trackFocus();
+            this._scheduleRefresh();
+        });
+        this._sig(Main.layoutManager, 'monitors-changed', () => this._rebuild());
+        this._sig(this._settings, 'changed', (_s, key) => {
+            if (key === 'arc-order-map') { this._loadOrderMap(); this._scheduleRefresh(); }
+            else if (key === 'arc-merge-map') { this._loadMergeMap(); this._scheduleRefresh(); }
+            else if (key === 'arc-persistent-mode') {
+                this._persistEnabled = this._settings.get_boolean('arc-persistent-mode');
+                if (this._persistEnabled) this._armPersistTimer();
+                else { this._killPersistTimer(); this._persistMode = false; }
+            }
+            else if (ARC_KEYBINDINGS.includes(key)) { this._removeKeybindings(); this._addKeybindings(); }
+            else this._rebuild();
+        });
+
+        this._scheduleRefresh();
+        if (this._settings.get_boolean('arc-persistent-mode')) this._armPersistTimer();
+    }
+
+    disable() {
+        this._cancelDrag();
+        this._removeKeybindings();
+        this._killHideTimer();
+        this._killPhysicsTimer();
+        this._killPersistTimer();
+        this._killRefreshTimer();
+        this._killCardTimers();
+
+        this._sigSources.forEach(o => o.disconnectObject(this));
+        this._sigSources.clear();
+        this._disconnectCardSigs();
+
+        this._destroyUI();
+        this._settings = null;
+    }
+
+    // ── Signal / timer helpers (same pattern as StageSidebar, EGO-L-003/004) ──
+
+    _sig(obj, signal, cb) {
+        obj.connectObject(signal, cb, this);
+        this._sigSources.add(obj);
+    }
+
+    _cardSig(obj, signal, cb) {
+        obj.connectObject(signal, cb, this);
+        this._cardSigSources.add(obj);
+    }
+
+    _disconnectCardSigs() {
+        this._cardSigSources.forEach(o => o.disconnectObject(this));
+        this._cardSigSources.clear();
+    }
+
+    _killHideTimer() { if (this._hideTimer) { GLib.source_remove(this._hideTimer); this._hideTimer = null; } }
+    _killPhysicsTimer() { if (this._physicsTimer) { GLib.source_remove(this._physicsTimer); this._physicsTimer = null; } }
+    _killPersistTimer() { if (this._persistTimer) { GLib.source_remove(this._persistTimer); this._persistTimer = null; } }
+    _killRefreshTimer() { if (this._refreshTimer) { GLib.source_remove(this._refreshTimer); this._refreshTimer = null; } }
+    _killDragPollTimer() { if (this._dragPollTimer) { GLib.source_remove(this._dragPollTimer); this._dragPollTimer = null; } }
+
+    _killCardTimers() {
+        this._cardTimers.forEach(id => GLib.source_remove(id));
+        this._cardTimers.clear();
+    }
+
+    _armPersistTimer() {
+        this._killPersistTimer();
+        this._persistTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 500, () => {
+            this._checkPersistence();
+            return GLib.SOURCE_CONTINUE;
+        });
+    }
+
+    // ── Filled in by later tasks ──
+
+    _pickMonitor() { return Main.layoutManager.primaryMonitor; }
+
+    _loadMergeMap() {
+        const raw = this._settings.get_string('arc-merge-map');
+        try {
+            this._mergeMap = new Map(Object.entries(JSON.parse(raw)));
+        } catch (_) {
+            this._mergeMap = new Map();
+        }
+    }
+
+    _saveMergeMap() {
+        this._settings.set_string('arc-merge-map', JSON.stringify(Object.fromEntries(this._mergeMap)));
+    }
+
+    _loadOrderMap() {
+        const raw = this._settings.get_string('arc-order-map');
+        try {
+            this._orderMap = new Map(Object.entries(JSON.parse(raw)).map(([k, v]) => [k, Number(v)]));
+        } catch (_) {
+            this._orderMap = new Map();
+        }
+    }
+
+    _saveOrderMap() {
+        this._settings.set_string('arc-order-map', JSON.stringify(Object.fromEntries(this._orderMap)));
+    }
+
+    _mergeApps(sourceAppId, targetAppId) {
+        const targetKey = this._mergeMap.get(targetAppId) ?? targetAppId;
+        const members = new Set([targetKey, sourceAppId]);
+        this._mergeMap.forEach((gKey, aId) => { if (gKey === targetKey) members.add(aId); });
+        const newKey = [...members].sort().join('|');
+        members.forEach(aId => this._mergeMap.set(aId, newKey));
+        this._saveMergeMap();
+    }
+
+    _unmergeApp(appId) {
+        this._mergeMap.delete(appId);
+        const counts = new Map();
+        this._mergeMap.forEach(gKey => counts.set(gKey, (counts.get(gKey) ?? 0) + 1));
+        const toDelete = [];
+        this._mergeMap.forEach((gKey, aId) => { if ((counts.get(gKey) ?? 0) <= 1) toDelete.push(aId); });
+        toDelete.forEach(aId => this._mergeMap.delete(aId));
+        this._saveMergeMap();
+    }
+
+    _buildGroups() {
+        const workspace = global.workspace_manager.get_active_workspace();
+        const tracker   = Shell.WindowTracker.get_default();
+        const byApp     = new Map();
+
+        workspace.list_windows().forEach(win => {
+            if (!_isNormal(win)) return;
+            const app = tracker.get_window_app(win);
+            if (!app) return;
+            const id = app.get_id();
+            if (!byApp.has(id)) byApp.set(id, { app, windows: [] });
+            byApp.get(id).windows.push(win);
+        });
+
+        const byGroup = new Map();
+        byApp.forEach(({ app, windows }, appId) => {
+            const groupKey = this._mergeMap.get(appId) ?? appId;
+            if (!byGroup.has(groupKey)) byGroup.set(groupKey, { appIds: [], apps: [], windows: [], key: groupKey });
+            const g = byGroup.get(groupKey);
+            g.appIds.push(appId);
+            g.apps.push(app);
+            g.windows.push(...windows);
+        });
+
+        this._groups = [...byGroup.values()].map(g => {
+            g.appIds.sort();
+            g.app = g.apps[0];
+            return g;
+        });
+
+        const liveAppIds = new Set(byApp.keys());
+        this._groupStates.forEach((_, id) => { if (!liveAppIds.has(id)) this._groupStates.delete(id); });
+
+        this._groups.sort((a, b) => {
+            const oa = this._orderMap.has(a.key) ? this._orderMap.get(a.key) : Number.MAX_SAFE_INTEGER;
+            const ob = this._orderMap.has(b.key) ? this._orderMap.get(b.key) : Number.MAX_SAFE_INTEGER;
+            return oa - ob;
+        });
+
+        this._offset = Math.max(0, Math.min(this._offset, this._groups.length - 1));
+
+        const focused = global.display.get_focus_window();
+        if (focused) {
+            this._groups.forEach(g => {
+                const fi = g.windows.indexOf(focused);
+                if (fi > 0) {
+                    g.windows.splice(fi, 1);
+                    g.windows.unshift(focused);
+                    const fApp = Shell.WindowTracker.get_default().get_window_app(focused);
+                    if (fApp) g.app = fApp;
+                }
+            });
+        }
+    }
+
+    _loadConfig() {
+        const s   = this._settings;
+        const pct = s.get_int('arc-card-scale') / 100;
+
+        this._gW        = Math.round(ARC_BASE_GRID_W * pct * this._scaleFactor);
+        this._gH        = Math.round(ARC_BASE_GRID_H * pct * this._scaleFactor);
+        this._iS        = Math.round(ARC_BASE_ICON_SIZE * pct * this._scaleFactor);
+        this._panelSize = Math.ceil(this._gW * 1.12 + ARC_PAD_H * this._scaleFactor * 2);
+        this._cxOffset  = ARC_PAD_H * this._scaleFactor + this._gW / 2;
+        this._angleStep = s.get_int('arc-angle-step');
+        this._hideDelay = s.get_int('auto-hide-delay');
+        this._scrollStep = this._mapSpeed(s.get_int('arc-scroll-speed'));
+        this._pos       = s.get_string('arc-panel-position');
+        this._persistEnabled = s.get_boolean('arc-persistent-mode');
+        this._geo       = this._computeGeo();
+    }
+
+    _mapSpeed(val) {
+        return 0.01 + (val - 1) * (0.15 - 0.01) / 19;
+    }
+
+    get _EDGE_W() { return this._settings.get_int('edge-trigger-width') * this._scaleFactor; }
+
+    _computeGeo() {
+        const mon = this._monitor;
+        const PS  = this._panelSize;
+        const CX  = this._cxOffset;
+        const sf  = this._scaleFactor;
+
+        const monIdx = Main.layoutManager.monitors.indexOf(mon);
+        const wa = Main.layoutManager.getWorkAreaForMonitor(monIdx >= 0 ? monIdx : 0);
+
+        const R_side   = Math.max(Math.round(ARC_MIN_RADIUS * sf), Math.round(wa.height * ARC_RADIUS_RATIO));
+        const R_bottom = Math.max(Math.round(ARC_MIN_RADIUS * sf), Math.round(wa.width  * ARC_RADIUS_RATIO));
+
+        const waCY = wa.y - mon.y + wa.height / 2;
+        const waCX = wa.x - mon.x + wa.width  / 2;
+        const hotLen = Math.round(Math.min(wa.height, wa.width) * 0.35);
+        const latY = wa.y - mon.y;
+        const latH = wa.height;
+
+        switch (this._pos) {
+            case 'right':
+                return {
+                    panelX: mon.x + mon.width,       panelY: mon.y + latY,
+                    panelW: PS,                       panelH: latH,
+                    visX:   mon.x + mon.width - PS,   visY:   mon.y + latY,
+                    hidX:   mon.x + mon.width,        hidY:   mon.y + latY,
+                    edgeX:  mon.x + mon.width - this._EDGE_W,
+                    edgeY:  mon.y + waCY - hotLen / 2,
+                    edgeW:  this._EDGE_W, edgeH: hotLen,
+                    arcCX:  PS - CX + R_side,
+                    arcCY:  waCY - latY,
+                    centerAngle: 180,
+                    arcR: R_side,
+                };
+            case 'bottom':
+                return {
+                    panelX: mon.x,      panelY: mon.y + mon.height,
+                    panelW: mon.width,  panelH: PS,
+                    visX:   mon.x,      visY:   mon.y + mon.height - PS,
+                    hidX:   mon.x,      hidY:   mon.y + mon.height,
+                    edgeX:  mon.x + waCX - hotLen / 2,
+                    edgeY:  mon.y + mon.height - this._EDGE_W,
+                    edgeW:  hotLen, edgeH: this._EDGE_W,
+                    arcCX:  waCX,
+                    arcCY:  PS - CX + R_bottom,
+                    centerAngle: -90,
+                    arcR: R_bottom,
+                };
+            default: // left
+                return {
+                    panelX: mon.x - PS, panelY: mon.y + latY,
+                    panelW: PS,         panelH: latH,
+                    visX:   mon.x,      visY:   mon.y + latY,
+                    hidX:   mon.x - PS, hidY:   mon.y + latY,
+                    edgeX:  mon.x,
+                    edgeY:  mon.y + waCY - hotLen / 2,
+                    edgeW:  this._EDGE_W, edgeH: hotLen,
+                    arcCX:  CX - R_side,
+                    arcCY:  waCY - latY,
+                    centerAngle: 0,
+                    arcR: R_side,
+                };
+        }
+    }
+
+    _buildGrid(group, gridW, gridH, scale) {
+        const windows = group.windows.slice(0, 4);
+        const r = Math.round(10 * scale);
+
+        const grid = new St.Widget({
+            reactive: false,
+            width: gridW, height: gridH,
+            clip_to_allocation: false,
+            style: `border-radius: ${Math.round(14 * scale)}px;`,
+        });
+        grid._cards = [];
+        grid._fanned = false;
+        grid._fanTimer = null;
+        grid._closeTimer = null;
+        grid._gridW = gridW;
+        grid._gridH = gridH;
+        grid._scale = scale;
+
+        windows.forEach((win, idx) => {
+            const actor = win.get_compositor_private();
+            const fr    = win.get_frame_rect();
+            const winW  = fr.width  || gridW;
+            const winH  = fr.height || gridH;
+            const s     = Math.min(gridW / winW, gridH / winH);
+            const cW    = Math.round(winW * s);
+            const cH    = Math.round(winH * s);
+
+            const card = new St.Widget({
+                reactive: true, width: cW, height: cH,
+                clip_to_allocation: true,
+                style: `border-radius: ${r}px;`,
+            });
+            card.set_pivot_point(0.5, 0.5);
+
+            if (actor)
+                card.add_child(new Clutter.Clone({ source: actor, width: cW, height: cH }));
+            else
+                card.add_child(new St.Widget({ style: `background-color:#2a2a2a; border-radius:${r}px;`, width: cW, height: cH }));
+
+            const dim = new St.Widget({
+                reactive: false, width: cW, height: cH,
+                style: 'background-color: rgba(0,0,0,0.45); border-radius: inherit;',
+                opacity: 0,
+            });
+
+            this._cardSig(card, 'button-release-event', (_a, ev) => {
+                if (ev.get_button() === 2) {
+                    win.delete(global.get_current_time());
+                    this._scheduleRefresh();
+                    return Clutter.EVENT_STOP;
+                }
+                if (ev.get_button() !== 1) return Clutter.EVENT_PROPAGATE;
+                if (idx > 0) { group.windows.splice(idx, 1); group.windows.unshift(win); }
+                this._activateGroup(group, win);
+                return Clutter.EVENT_STOP;
+            });
+
+            grid._cards.push({ card, dim, win, cW, cH });
+        });
+
+        [...grid._cards].reverse().forEach(({ card, dim }) => {
+            grid.add_child(card);
+            grid.add_child(dim);
+        });
+
+        this._positionStack(grid, false);
+        return grid;
+    }
+
+    _positionStack(grid, animate = true) {
+        const scale = grid._scale;
+        const OFFSETS = [
+            { dx: 0,                      dy: 0,                      rot:  0.0 },
+            { dx: Math.round(10 * scale), dy: Math.round( 7 * scale), rot:  3.8 },
+            { dx: Math.round(19 * scale), dy: Math.round(13 * scale), rot: -2.6 },
+            { dx: Math.round(27 * scale), dy: Math.round(18 * scale), rot:  2.0 },
+        ];
+        grid._cards.forEach(({ card, dim, icon, iconBaseX, iconBaseY }, i) => {
+            const off = OFFSETS[i] ?? OFFSETS[OFFSETS.length - 1];
+            if (animate) {
+                card.ease({ x: off.dx, y: off.dy, rotation_angle_z: off.rot, opacity: 255,
+                    duration: 240, mode: Clutter.AnimationMode.EASE_OUT_QUAD });
+            } else {
+                card.set_position(off.dx, off.dy);
+                card.opacity = 255;
+            }
+            dim.set_position(off.dx, off.dy);
+            if (icon && iconBaseX !== undefined) {
+                if (animate) icon.ease({ x: iconBaseX, y: iconBaseY, duration: 240, mode: Clutter.AnimationMode.EASE_OUT_QUAD });
+                else icon.set_position(iconBaseX, iconBaseY);
+            }
+        });
+        grid._fanned = false;
+    }
+
+    _positionFan(grid) {
+        const count = grid._cards.length;
+        if (count <= 1) return { shift: 0, isBottom: this._pos === 'bottom' };
+        const isBottom = this._pos === 'bottom';
+        const step = isBottom ? Math.round(grid._gridW * 0.90) : Math.round(grid._gridH * 0.88);
+
+        const padH = grid._padH ?? 0;
+        const sz   = grid._iconSz ?? 0;
+        const ovf  = grid._iconOvf ?? 0;
+
+        grid._cards.forEach(({ card, dim, icon, cW, cH }, i) => {
+            const dx = isBottom ? i * step : 0;
+            const dy = isBottom ? 0 : i * step;
+            card.ease({ x: dx, y: dy, rotation_angle_z: 0, opacity: 255,
+                duration: 280, mode: Clutter.AnimationMode.EASE_OUT_BACK });
+            dim.set_position(dx, dy);
+            if (icon && sz) {
+                let ix, iy;
+                if (isBottom) { ix = padH + dx - ovf; iy = dy - ovf; }
+                else if (this._pos === 'right') { ix = padH + dx + cW - sz + ovf; iy = dy + cH - sz + ovf; }
+                else { ix = padH + dx - ovf; iy = dy + cH - sz + ovf; }
+                icon.ease({ x: ix, y: iy, duration: 280, mode: Clutter.AnimationMode.EASE_OUT_BACK });
+            }
+        });
+        grid._fanned = true;
+        return { shift: (count - 1) * step, isBottom };
+    }
+
+    _buildIconRow(container, group, gridW, iconSize, iconOvl, padH, scale, grid) {
+        const tracker = Shell.WindowTracker.get_default();
+        const sz  = Math.round(iconSize * 0.92);
+        const ovf = Math.round(sz * 0.28);
+        const dX  = Math.round(sz * 0.72);
+        const dY  = Math.round(sz * 0.14);
+
+        grid._padH = padH;
+        grid._iconSz = sz;
+        grid._iconOvf = ovf;
+
+        grid._cards.forEach(({ win, cW, cH }, i) => {
+            const app = tracker.get_window_app(win);
+            if (!app) return;
+
+            // Anchor to the card's own fitted size (cW/cH), not the nominal box —
+            // a letterboxed card is smaller, so anchoring to the box's far edge stranded the badge in blank space.
+            let bx, by;
+            if (this._pos === 'right') { bx = padH + cW - sz + ovf - i * dX; by = cH - sz + ovf - i * dY; }
+            else if (this._pos === 'bottom') { bx = padH - ovf + i * dX; by = -ovf + i * dY; }
+            else { bx = padH - ovf + i * dX; by = cH - sz + ovf - i * dY; }
+
+            const icon = new St.Widget({ width: sz, height: sz, reactive: true });
+            icon.add_child(app.create_icon_texture(sz));
+            icon.set_position(bx, by);
+            container.add_child(icon);
+
+            this._cardSig(icon, 'button-release-event', (_a, ev) => {
+                if (ev.get_button() === 2) {
+                    win.delete(global.get_current_time());
+                    this._scheduleRefresh();
+                    return Clutter.EVENT_STOP;
+                }
+                if (ev.get_button() !== 1) return Clutter.EVENT_PROPAGATE;
+                if (i > 0) { group.windows.splice(i, 1); group.windows.unshift(win); }
+                this._activateGroup(group, win);
+                return Clutter.EVENT_STOP;
+            });
+
+            grid._cards[i].icon = icon;
+            grid._cards[i].iconBaseX = bx;
+            grid._cards[i].iconBaseY = by;
+        });
+    }
+
+    _buildUI() {
+        const geo = this._geo;
+
+        // Not clipped: cards extend past this nominal box as they curve away
+        // from the front — clipping would hide cards the angle cull already chose to show.
+        this._panel = new St.Widget({
+            reactive: true, clip_to_allocation: false,
+            width: geo.panelW, height: geo.panelH,
+        });
+        this._panel.set_position(geo.panelX, geo.panelY);
+        Main.layoutManager.addChrome(this._panel, { trackFullscreen: true });
+
+        this._edge = new St.Widget({ reactive: true, width: geo.edgeW, height: geo.edgeH });
+        this._edge.set_position(geo.edgeX, geo.edgeY);
+        Main.layoutManager.addChrome(this._edge, { trackFullscreen: false });
+
+        this._sig(this._edge, 'enter-event', () => { if (!this._isVisible) this._showPanel(); });
+        this._sig(this._panel, 'enter-event', () => { if (!this._drag) this._cancelHide(); });
+        this._sig(this._panel, 'leave-event', () => { if (this._isVisible && !this._drag) this._startHide(); });
+        this._sig(this._panel, 'scroll-event', (_a, event) => { this._handleScroll(event); return Clutter.EVENT_STOP; });
+    }
+
+    _destroyUI() {
+        this._cancelHide();
+        if (this._edge)  { this._edge.destroy();  this._edge = null; }
+        if (this._panel) { this._panel.destroy(); this._panel = null; }
+    }
+
+    _rebuild() {
+        const wasVisible = this._isVisible;
+        this._isVisible = false;
+        this._monitor = this._pickMonitor();
+        this._destroyUI();
+        this._loadConfig();
+        this._buildUI();
+        if (wasVisible) this._showPanel();
+        else this._scheduleRefresh();
+    }
+
+    _scheduleRefresh() {
+        this._killRefreshTimer();
+        this._refreshTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 50, () => {
+            this._refreshTimer = null;
+            this._buildGroups();
+            this._redraw();
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    _trackFocus() {
+        const focused = global.display.get_focus_window();
+        if (!focused) return;
+        const app = Shell.WindowTracker.get_default().get_window_app(focused);
+        if (!app) return;
+        const id = app.get_id();
+        if (!this._groupStates.has(id)) this._groupStates.set(id, { savedLayout: new Map(), lastFocused: focused });
+        else this._groupStates.get(id).lastFocused = focused;
+    }
+
+    _redraw() {
+        if (!this._panel) return;
+
+        this._killCardTimers();
+        this._disconnectCardSigs();
+        this._panel.destroy_all_children();
+        this._containers = [];
+        if (this._groups.length === 0) return;
+
+        const geo = this._geo;
+
+        this._groups.forEach((group, idx) => {
+            const relIdx = idx - this._offset;
+            if (Math.abs(relIdx * this._angleStep) > ARC_MAX_ANGLE + this._angleStep) return;
+
+            const angleDeg = geo.centerAngle + relIdx * this._angleStep;
+            const angleRad = angleDeg * Math.PI / 180;
+            const itemCX = geo.arcCX + geo.arcR * Math.cos(angleRad);
+            const itemCY = geo.arcCY + geo.arcR * Math.sin(angleRad);
+
+            const dist  = Math.abs(relIdx);
+            const scale = Math.pow(0.78, dist);
+
+            const sW = Math.round(this._gW * scale);
+            const sH = Math.round(this._gH * scale);
+            const sI = Math.round(this._iS * scale);
+            const sOvl = Math.round(ARC_ICON_OVL * this._scaleFactor * scale);
+            const sP = Math.round(ARC_PAD_H * this._scaleFactor * scale);
+            const totH = sH + sI - sOvl;
+
+            const baseX = Math.round(itemCX - sW / 2 - sP);
+            const baseY = Math.round(itemCY - totH / 2);
+
+            const container = new St.Widget({
+                reactive: true, track_hover: true,
+                width: sW + sP * 2, height: totH,
+            });
+            container.set_pivot_point(0.5, 0.5);
+            container.set_position(baseX, baseY);
+            container._baseX = baseX;
+            container._baseY = baseY;
+            container._groupRef = group;
+
+            const grid = this._buildGrid(group, sW, sH, scale);
+            grid.set_position(sP, 0);
+            container.add_child(grid);
+            container._grid = grid;
+
+            this._buildIconRow(container, group, sW, sI, sOvl, sP, scale, grid);
+
+            this._cardSig(container, 'notify::hover', () => this._onCardHover(container));
+            this._cardSig(container, 'button-press-event', (_a, event) => this._onCardPress(container, group, event));
+            this._cardSig(container, 'button-release-event', (_a, event) => this._onCardRelease(container, group, idx, event));
+
+            this._containers.push(container);
+            this._panel.add_child(container);
+        });
+    }
+
+    _onCardHover(container) {
+        if (container.hover) {
+            this._containers.forEach(c => {
+                const isThis = c === container;
+                c.ease({ scale_x: isThis ? 1.08 : 0.95, scale_y: isThis ? 1.08 : 0.95,
+                    duration: 180, mode: Clutter.AnimationMode.EASE_OUT_QUAD });
+            });
+            this._panel.set_child_above_sibling(container, null);
+            const g = container._grid;
+            if (g && !g._fanned && !g._fanTimer) {
+                g._fanTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 350, () => {
+                    this._cardTimers.delete(g._fanTimer);
+                    g._fanTimer = null;
+                    if (container.hover) {
+                        const { shift, isBottom } = this._positionFan(g);
+                        this._pushSiblings(container, shift, isBottom);
+                    }
+                    return GLib.SOURCE_REMOVE;
+                });
+                this._cardTimers.add(g._fanTimer);
+            }
+        } else {
+            const g = container._grid;
+            if (g?._fanTimer) { GLib.source_remove(g._fanTimer); this._cardTimers.delete(g._fanTimer); g._fanTimer = null; }
+            if (g?._fanned) {
+                if (g._closeTimer) { GLib.source_remove(g._closeTimer); this._cardTimers.delete(g._closeTimer); }
+                g._closeTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 470, () => {
+                    this._cardTimers.delete(g._closeTimer);
+                    g._closeTimer = null;
+                    if (!container.hover) {
+                        this._positionStack(g);
+                        this._pushSiblings(container, 0, this._pos === 'bottom');
+                    }
+                    return GLib.SOURCE_REMOVE;
+                });
+                this._cardTimers.add(g._closeTimer);
+            }
+        }
+    }
+
+    /** Shoves arc siblings out of a fanned card's way (else the fan just paints
+     *  over the next group). Only siblings ahead of `container` move, matching _positionFan()'s direction. */
+    _pushSiblings(container, shift, isBottom) {
+        const idx = this._containers.indexOf(container);
+        this._containers.forEach((c, i) => {
+            if (c === container || i <= idx) return;
+            c.ease({
+                x: c._baseX + (isBottom ? shift : 0),
+                y: c._baseY + (isBottom ? 0 : shift),
+                duration: 240, mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+            });
+        });
+    }
+
+    _activateGroup(group, focusWin = null) {
+        const tracker = Shell.WindowTracker.get_default();
+        const focused = global.display.get_focus_window();
+        if (focused) {
+            const app = tracker.get_window_app(focused);
+            if (app) {
+                const fid = app.get_id();
+                if (!this._groupStates.has(fid)) this._groupStates.set(fid, { savedLayout: new Map(), lastFocused: focused });
+                const state = this._groupStates.get(fid);
+                state.savedLayout.clear();
+                global.workspace_manager.get_active_workspace().list_windows().forEach(win => {
+                    const wa = tracker.get_window_app(win);
+                    if (wa && wa.get_id() === fid) state.savedLayout.set(win, win.get_frame_rect());
+                });
+            }
+        }
+
+        global.workspace_manager.get_active_workspace().list_windows().forEach(win => {
+            if (_isNormal(win) && !group.windows.includes(win) && !win.minimized) win.minimize();
+        });
+
+        group.windows.forEach(win => {
+            if (win.minimized) win.unminimize();
+            const app = tracker.get_window_app(win);
+            if (app) {
+                const state = this._groupStates.get(app.get_id());
+                if (state?.savedLayout.has(win)) {
+                    const rect = state.savedLayout.get(win);
+                    win.move_resize_frame?.(true, rect.x, rect.y, rect.width, rect.height);
+                }
+            }
+        });
+
+        let target = focusWin ?? null;
+        if (!target) group.appIds.forEach(id => { if (!target) target = this._groupStates.get(id)?.lastFocused; });
+        (target ?? group.windows[0])?.activate(global.get_current_time());
+
+        this._hidePanel();
+    }
+
+    _onCardPress(container, group, event) {
+        if (event.get_button() === 3 && group.appIds.length > 1) {
+            group.appIds.forEach(id => this._unmergeApp(id));
+            this._scheduleRefresh();
+            return Clutter.EVENT_STOP;
+        }
+        if (event.get_button() === 1) {
+            this._cancelDrag();
+            const [px, py] = global.get_pointer();
+            this._drag = { group, card: container, startX: px, startY: py, moved: false, ghost: null };
+            this._sig(global.stage, 'motion-event', (_a, ev) => this._onDragMotion(ev));
+            this._armDragPollTimer();
+        }
+        return Clutter.EVENT_PROPAGATE;
+    }
+
+    /** Safety net: resolves the drag from live pointer-button state, not just
+     *  release-event — covers the origin card dying mid-drag, which kills Clutter's implicit grab before release fires. */
+    _armDragPollTimer() {
+        this._killDragPollTimer();
+        this._dragPollTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 50, () => {
+            if (!this._drag) { this._dragPollTimer = null; return GLib.SOURCE_REMOVE; }
+            const [px, py, mask] = global.get_pointer();
+            if (mask & Clutter.ModifierType.BUTTON1_MASK) return GLib.SOURCE_CONTINUE;
+
+            this._dragPollTimer = null;
+            const drag = this._drag;
+            this._cancelDrag();
+            if (drag.moved) this._commitDrag(drag.group, px, py);
+            else this._activateGroup(drag.group);
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    _onDragMotion(event) {
+        if (!this._drag) return Clutter.EVENT_PROPAGATE;
+        const [px, py] = event.get_coords();
+        const dx = px - this._drag.startX;
+        const dy = py - this._drag.startY;
+        if (!this._drag.moved && Math.hypot(dx, dy) > ARC_DRAG_THRESHOLD * this._scaleFactor) {
+            this._drag.moved = true;
+            this._startDragGhost(this._drag.group);
+        }
+        if (this._drag.moved) this._updateDragGhost(px, py);
+        return Clutter.EVENT_PROPAGATE;
+    }
+
+    _onCardRelease(_container, group, idx, event) {
+        if (event.get_button() !== 1) return Clutter.EVENT_PROPAGATE;
+        const drag = this._drag;
+        if (!drag) return Clutter.EVENT_PROPAGATE;
+        const [px, py] = global.get_pointer();
+        this._cancelDrag();
+
+        if (!drag.moved) {
+            if (idx !== Math.round(this._offset)) this._scrollTo(idx, () => this._activateGroup(group));
+            else this._activateGroup(group);
+            return Clutter.EVENT_STOP;
+        }
+
+        this._commitDrag(drag.group, px, py);
+        return Clutter.EVENT_STOP;
+    }
+
+    _commitDrag(group, px, py) {
+        const geo = this._geo;
+        const inside = px >= geo.visX && px <= geo.visX + geo.panelW &&
+                       py >= geo.visY && py <= geo.visY + geo.panelH;
+        if (inside) this._reorderGroup(group, px, py);
+        else this._mergeIntoActive(group);
+    }
+
+    _mergeIntoActive(sourceGroup) {
+        const focused = global.display.get_focus_window();
+        const activeApp = focused ? Shell.WindowTracker.get_default().get_window_app(focused) : null;
+        const sourceAppId = sourceGroup.app.get_id ? sourceGroup.app.get_id() : sourceGroup.appIds[0];
+        const activeAppId = activeApp?.get_id();
+
+        // No distinct app to merge into — dropping outside the panel still
+        // opens the group rather than stranding it mid-drag.
+        if (!activeApp || activeAppId === sourceAppId) {
+            this._activateGroup(sourceGroup);
+            return;
+        }
+
+        this._mergeApps(sourceAppId, activeAppId);
+        sourceGroup.windows.forEach(win => { if (win.minimized) win.unminimize(); win.raise?.(); });
+        this._hidePanel();
+        this._scheduleRefresh();
+    }
+
+    _reorderGroup(group, px, py) {
+        if (this._groups.length < 2 || this._containers.length < 2) return;
+        const sourceIdx = this._groups.indexOf(group);
+        if (sourceIdx === -1) return;
+
+        let targetIdx = sourceIdx;
+        let minDist = Infinity;
+        this._containers.forEach((c, i) => {
+            const cx = c.x + c.width / 2;
+            const cy = c.y + c.height / 2;
+            const dist = this._pos === 'bottom' ? Math.abs(px - cx) : Math.abs(py - cy);
+            if (dist < minDist) { minDist = dist; targetIdx = i; }
+        });
+        if (targetIdx === sourceIdx) return;
+
+        const ordered = [...this._groups];
+        const [moved] = ordered.splice(sourceIdx, 1);
+        ordered.splice(targetIdx, 0, moved);
+        this._orderMap.clear();
+        ordered.forEach((g, i) => this._orderMap.set(g.key, i));
+        this._saveOrderMap();
+        this._scheduleRefresh();
+    }
+
+    _startDragGhost(group) {
+        const size = Math.round(ARC_GHOST_SIZE * this._scaleFactor);
+        const ghost = new St.Widget({
+            width: size, height: size, opacity: 220,
+            style: 'background-color: rgba(30,30,30,0.88); border-radius: 18px; border: 2px solid rgba(255,255,255,0.28);',
+        });
+        ghost.set_pivot_point(0.5, 0.5);
+        const iconSize = Math.round(48 * this._scaleFactor);
+        const icon = new St.Widget({ width: iconSize, height: iconSize });
+        icon.add_child(group.app.create_icon_texture(iconSize));
+        icon.set_position(size / 2 - iconSize / 2, size / 2 - iconSize / 2);
+        ghost.add_child(icon);
+        Main.uiGroup.add_child(ghost);
+        this._drag.ghost = ghost;
+    }
+
+    _updateDragGhost(px, py) {
+        if (!this._drag?.ghost) return;
+        const size = Math.round(ARC_GHOST_SIZE * this._scaleFactor);
+        this._drag.ghost.set_position(px - size / 2, py - size / 2);
+    }
+
+    _cancelDrag() {
+        this._killDragPollTimer();
+        if (!this._drag) return;
+        if (this._drag.ghost) this._drag.ghost.destroy();
+        this._drag = null;
+        global.stage.disconnectObject(this);
+    }
+
+    _handleScroll(event) {
+        const dir = event.get_scroll_direction();
+        const isBottom = this._pos === 'bottom';
+        if (dir === Clutter.ScrollDirection.SMOOTH) {
+            const [dx, dy] = event.get_scroll_delta();
+            const delta = isBottom ? dx : dy;
+            if (Math.abs(delta) > 0.01) { this._velocity += delta * this._scrollStep; this._startPhysics(); }
+        } else if (dir === Clutter.ScrollDirection.DOWN || dir === Clutter.ScrollDirection.RIGHT) {
+            this._velocity += this._scrollStep; this._startPhysics();
+        } else if (dir === Clutter.ScrollDirection.UP || dir === Clutter.ScrollDirection.LEFT) {
+            this._velocity -= this._scrollStep; this._startPhysics();
+        }
+    }
+
+    _startPhysics() {
+        if (this._physicsTimer) return;
+        this._physicsTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 16, () => {
+            this._offset += this._velocity;
+            this._velocity *= ARC_SCROLL_FRICTION;
+            const max = Math.max(0, this._groups.length - 1);
+            if (this._offset < 0) { this._offset = 0; this._velocity = 0; }
+            if (this._offset > max) { this._offset = max; this._velocity = 0; }
+            this._redraw();
+            if (Math.abs(this._velocity) < ARC_SCROLL_MIN_VEL) {
+                this._velocity = 0;
+                this._physicsTimer = null;
+                return GLib.SOURCE_REMOVE;
+            }
+            return GLib.SOURCE_CONTINUE;
+        });
+    }
+
+    _scrollTo(targetIdx, onComplete) {
+        this._killPhysicsTimer();
+        this._velocity = 0;
+        targetIdx = Math.max(0, Math.min(targetIdx, this._groups.length - 1));
+        const start = this._offset;
+        const frames = Math.max(8, Math.round(Math.abs(targetIdx - start) * 12));
+        let frame = 0;
+        this._physicsTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 16, () => {
+            frame++;
+            this._offset = start + (targetIdx - start) * (1 - Math.pow(1 - frame / frames, 3));
+            this._redraw();
+            if (frame >= frames) {
+                this._offset = targetIdx;
+                this._physicsTimer = null;
+                this._redraw();
+                onComplete?.();
+                return GLib.SOURCE_REMOVE;
+            }
+            return GLib.SOURCE_CONTINUE;
+        });
+    }
+
+    _showPanel() {
+        if (this._isVisible || !this._panel) return;
+        this._isVisible = true;
+        this._cancelHide();
+        this._scheduleRefresh();
+        const geo = this._geo;
+        this._panel.ease({ x: geo.visX, y: geo.visY, duration: 220, mode: Clutter.AnimationMode.EASE_OUT_QUAD });
+    }
+
+    _hidePanel() {
+        if (!this._isVisible || !this._panel) return;
+        this._isVisible = false;
+        this._cancelHide();
+        const geo = this._geo;
+        this._panel.ease({ x: geo.hidX, y: geo.hidY, duration: 220, mode: Clutter.AnimationMode.EASE_OUT_QUAD });
+    }
+
+    _startHide() {
+        if (this._persistMode) return;
+        this._cancelHide();
+        this._hideTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, this._hideDelay, () => {
+            this._hidePanel();
+            this._hideTimer = null;
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    _cancelHide() { this._killHideTimer(); }
+
+    _checkPersistence() {
+        if (!this._persistEnabled) {
+            if (this._persistMode) { this._persistMode = false; this._hidePanel(); }
+            return;
+        }
+        const ws = global.workspace_manager.get_active_workspace();
+        const geo = this._geo;
+        const px1 = geo.visX, py1 = geo.visY, px2 = geo.visX + geo.panelW, py2 = geo.visY + geo.panelH;
+        const clear = !ws.list_windows().some(win => {
+            if (win.minimized || !_isNormal(win)) return false;
+            const r = win.get_frame_rect();
+            return r.x < px2 && r.x + r.width > px1 && r.y < py2 && r.y + r.height > py1;
+        });
+        if (clear && !this._persistMode) { this._persistMode = true; if (!this._isVisible) this._showPanel(); }
+        else if (!clear && this._persistMode) { this._persistMode = false; this._hidePanel(); }
+    }
+
+    _addKeybindings() {
+        this._boundKeys = [];
+        ARC_KEYBINDINGS.forEach(key => {
+            const binding = this._settings.get_strv(key)[0];
+            if (!binding || binding === '') return;
+            Main.wm.addKeybinding(
+                key, this._settings,
+                Meta.KeyBindingFlags.NONE,
+                Shell.ActionMode.NORMAL | Shell.ActionMode.OVERVIEW,
+                this._keybindingCallback(key),
+            );
+            this._boundKeys.push(key);
+        });
+    }
+
+    _keybindingCallback(key) {
+        switch (key) {
+            case 'toggle-sidebar': return () => this._toggleVisible();
+            case 'keybinding-arc-next': return () => this._scrollTo(Math.round(this._offset) + 1);
+            case 'keybinding-arc-prev': return () => this._scrollTo(Math.round(this._offset) - 1);
+            case 'keybinding-arc-activate': return () => {
+                const idx = Math.round(this._offset);
+                if (this._groups[idx]) { if (!this._isVisible) this._showPanel(); this._activateGroup(this._groups[idx]); }
+            };
+            case 'keybinding-arc-close': return () => {
+                const idx = Math.round(this._offset);
+                const grp = this._groups[idx];
+                if (grp?.windows[0]) {
+                    grp.windows[0].delete(global.get_current_time());
+                    this._scheduleRefresh();
+                }
+            };
+        }
+        return () => {};
+    }
+
+    _removeKeybindings() {
+        this._boundKeys.forEach(key => Main.wm.removeKeybinding(key));
+        this._boundKeys = [];
+    }
+
+    _toggleVisible() {
+        if (this._isVisible) this._hidePanel();
+        else this._showPanel();
+    }
+}
+
+
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 export default class StageManagerExtension extends Extension {
     enable() {
+        this._sigSources = new Set();
         this._settings = this.getSettings();
         this._max = new MaximizeToWorkspace(this._settings);
-        this._side = new StageSidebar(this._settings);
         this._max.enable();
+        this._buildActiveSidebar();
+        this._sig(this._settings, 'changed::sidebar-layout', () => this._swapSidebar());
+    }
+
+    _sig(obj, signal, cb) {
+        obj.connectObject(signal, cb, this);
+        this._sigSources.add(obj);
+    }
+
+    _buildActiveSidebar() {
+        const arc = this._settings.get_string('sidebar-layout') === 'arc';
+        this._side = arc ? new ArcSidebar(this._settings) : new StageSidebar(this._settings);
         this._side.enable();
+    }
+
+    _swapSidebar() {
+        if (this._side) this._side.disable();
+        this._buildActiveSidebar();
     }
 
     disable() {
@@ -1885,6 +3061,8 @@ export default class StageManagerExtension extends Extension {
         if (this._max) this._max.disable();
         this._side = null;
         this._max = null;
+        this._sigSources.forEach(o => o.disconnectObject(this));
+        this._sigSources.clear();
         this._settings = null;
     }
 }

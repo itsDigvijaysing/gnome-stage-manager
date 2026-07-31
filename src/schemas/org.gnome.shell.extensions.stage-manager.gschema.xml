@@ -106,7 +106,7 @@
                 <choice value="arc"/>
             </choices>
             <summary>Sidebar Layout</summary>
-            <description>Vertical stack (default) or a left-edge arc/carousel arrangement of cards.</description>
+            <description>Vertical stack (default) or a full carousel arc layout — see arc-panel-position for which edge it attaches to.</description>
         </key>
 
         <key name="arc-angle-step" type="i">
@@ -120,6 +120,83 @@
             <default>'{}'</default>
             <summary>App Merge Map (internal)</summary>
             <description>Internal JSON map of appId to merge-group key, used by the 'apps' sidebar-mode's drag-to-merge feature. Not intended for manual editing.</description>
+        </key>
+
+        <key name="stack-panel-position" type="s">
+            <default>'left'</default>
+            <choices>
+                <choice value="left"/>
+                <choice value="right"/>
+            </choices>
+            <summary>Stack Panel Position</summary>
+            <description>Screen edge the Stack sidebar is attached to.</description>
+        </key>
+
+        <key name="arc-panel-position" type="s">
+            <default>'left'</default>
+            <choices>
+                <choice value="left"/>
+                <choice value="right"/>
+                <choice value="bottom"/>
+            </choices>
+            <summary>Arc Panel Position</summary>
+            <description>Screen edge the arc sidebar carousel is attached to.</description>
+        </key>
+
+        <key name="arc-persistent-mode" type="b">
+            <default>false</default>
+            <summary>Arc Persistent Mode</summary>
+            <description>Keep the arc sidebar shown whenever no window overlaps its area, instead of only on hover.</description>
+        </key>
+
+        <key name="arc-card-scale" type="i">
+            <default>100</default>
+            <range min="50" max="150"/>
+            <summary>Arc Card Scale</summary>
+            <description>Card size percentage for the arc sidebar carousel.</description>
+        </key>
+
+        <key name="arc-scroll-speed" type="i">
+            <default>10</default>
+            <range min="1" max="20"/>
+            <summary>Arc Scroll Speed</summary>
+            <description>Momentum-scroll speed for the arc sidebar carousel.</description>
+        </key>
+
+        <key name="arc-merge-map" type="s">
+            <default>'{}'</default>
+            <summary>Arc Merge Map (internal)</summary>
+            <description>Internal JSON map of appId to merge-group key for the arc sidebar's drag-to-merge gesture. Not intended for manual editing.</description>
+        </key>
+
+        <key name="arc-order-map" type="s">
+            <default>'{}'</default>
+            <summary>Arc Order Map (internal)</summary>
+            <description>Internal JSON map of merge-group key to display order for the arc sidebar's drag-to-reorder gesture. Not intended for manual editing.</description>
+        </key>
+
+        <key name="keybinding-arc-next" type="as">
+            <default>[]</default>
+            <summary>Arc: Next Card</summary>
+            <description>Keyboard shortcut to move the arc carousel to the next card.</description>
+        </key>
+
+        <key name="keybinding-arc-prev" type="as">
+            <default>[]</default>
+            <summary>Arc: Previous Card</summary>
+            <description>Keyboard shortcut to move the arc carousel to the previous card.</description>
+        </key>
+
+        <key name="keybinding-arc-activate" type="as">
+            <default>[]</default>
+            <summary>Arc: Activate Card</summary>
+            <description>Keyboard shortcut to activate the front card of the arc carousel.</description>
+        </key>
+
+        <key name="keybinding-arc-close" type="as">
+            <default>[]</default>
+            <summary>Arc: Close Front Window</summary>
+            <description>Keyboard shortcut to close the front window of the arc carousel's front card.</description>
         </key>
 
     </schema>

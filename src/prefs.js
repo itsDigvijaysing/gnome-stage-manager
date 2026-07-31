@@ -23,6 +23,43 @@ export default class StageManagerPreferences extends ExtensionPreferences {
         });
         window.add(behaviorPage);
 
+        // Sidebar Layout — the single biggest choice in this page, so it gets
+        // its own segmented switch at the very top rather than a dropdown
+        // buried inside a settings group.
+        const layoutGroup = new Adw.PreferencesGroup({
+            title: _('Sidebar Layout'),
+            description: _('Stack = vertical list of cards (default). Arc = full carousel arrangement.'),
+        });
+        behaviorPage.add(layoutGroup);
+
+        const layoutBox = new Gtk.Box({
+            orientation: Gtk.Orientation.HORIZONTAL,
+            halign: Gtk.Align.CENTER,
+            margin_top: 6,
+            margin_bottom: 6,
+        });
+        layoutBox.add_css_class('linked');
+
+        const layoutKeys = ['stack', 'arc'];
+        const stackToggle = new Gtk.ToggleButton({ label: _('Stack') });
+        const arcToggle = new Gtk.ToggleButton({ label: _('Arc') });
+        arcToggle.set_group(stackToggle);
+        layoutBox.append(stackToggle);
+        layoutBox.append(arcToggle);
+
+        const layoutToggles = [stackToggle, arcToggle];
+        const layoutVal = settings.get_string('sidebar-layout');
+        layoutToggles[Math.max(0, layoutKeys.indexOf(layoutVal))].set_active(true);
+        layoutToggles.forEach((toggle, i) => {
+            toggle.connect('notify::active', () => {
+                if (toggle.active) settings.set_string('sidebar-layout', layoutKeys[i]);
+            });
+        });
+
+        const layoutSwitchRow = new Adw.PreferencesRow({ activatable: false });
+        layoutSwitchRow.set_child(layoutBox);
+        layoutGroup.add(layoutSwitchRow);
+
         // Maximize to Workspace
         const maxGroup = new Adw.PreferencesGroup({
             title: _('Maximize to Workspace'),
@@ -51,9 +88,37 @@ export default class StageManagerPreferences extends ExtensionPreferences {
         settings.bind('enable-stage-sidebar', sideSwitch, 'active', Gio.SettingsBindFlags.DEFAULT);
         sideGroup.add(sideSwitch);
 
-        // Sidebar mode — 3 options
-        const modeRow = new Adw.ActionRow({
+        // Arc always auto-hides (hover-only, no "always visible" mode) and
+        // never reserves struts — both rows are Stack-only.
+        const autoHideSwitch = new Adw.SwitchRow({
+            title: _('Auto-hide Sidebar'),
+            subtitle: _('Off = always visible (macOS default). On = hover to reveal.'),
+        });
+        settings.bind('sidebar-auto-hide', autoHideSwitch, 'active', Gio.SettingsBindFlags.DEFAULT);
+        sideGroup.add(autoHideSwitch);
+        this._bindLayoutSensitivity(autoHideSwitch, settings, 'stack');
+
+        const reserveSwitch = new Adw.SwitchRow({
+            title: _('Reserve Space for Sidebar'),
+            subtitle: _('Maximized windows stop at the sidebar instead of being covered. Needs auto-hide off.'),
+        });
+        settings.bind('sidebar-reserve-space', reserveSwitch, 'active', Gio.SettingsBindFlags.DEFAULT);
+        sideGroup.add(reserveSwitch);
+        this._bindLayoutSensitivity(reserveSwitch, settings, 'stack');
+
+        // Sidebar Content — what the Stack layout's cards show. Arc has no
+        // equivalent (it always groups by app and always shows one icon per
+        // stacked window), so this whole group is greyed out while
+        // sidebar-layout is 'arc' rather than left active-but-inert.
+        const contentGroup = new Adw.PreferencesGroup({
             title: _('Sidebar Content'),
+            description: _('Stack layout only'),
+        });
+        behaviorPage.add(contentGroup);
+        this._bindLayoutSensitivity(contentGroup, settings, 'stack');
+
+        const modeRow = new Adw.ActionRow({
+            title: _('Card Grouping'),
             subtitle: _('Groups = Stage Manager (swap), Apps = per-app (focus), Workspaces, All Windows'),
         });
         const modeKeys = ['groups', 'apps', 'workspaces', 'all-windows'];
@@ -76,42 +141,28 @@ export default class StageManagerPreferences extends ExtensionPreferences {
             settings.set_string('sidebar-mode', modeKeys[sel] || 'groups');
         });
         modeRow.add_suffix(modeDropdown);
-        sideGroup.add(modeRow);
-
-        const autoHideSwitch = new Adw.SwitchRow({
-            title: _('Auto-hide Sidebar'),
-            subtitle: _('Off = always visible (macOS default). On = hover to reveal.'),
-        });
-        settings.bind('sidebar-auto-hide', autoHideSwitch, 'active', Gio.SettingsBindFlags.DEFAULT);
-        sideGroup.add(autoHideSwitch);
-
-        const reserveSwitch = new Adw.SwitchRow({
-            title: _('Reserve Space for Sidebar'),
-            subtitle: _('Maximized windows stop at the sidebar instead of being covered. Needs auto-hide off.'),
-        });
-        settings.bind('sidebar-reserve-space', reserveSwitch, 'active', Gio.SettingsBindFlags.DEFAULT);
-        sideGroup.add(reserveSwitch);
+        contentGroup.add(modeRow);
 
         const iconSwitch = new Adw.SwitchRow({
             title: _('Show App Icons'),
             subtitle: _('Display app icon below each thumbnail'),
         });
         settings.bind('show-app-icons', iconSwitch, 'active', Gio.SettingsBindFlags.DEFAULT);
-        sideGroup.add(iconSwitch);
+        contentGroup.add(iconSwitch);
 
         const groupCountSwitch = new Adw.SwitchRow({
             title: _('Show Window Count Badge'),
             subtitle: _('Show number of windows on group thumbnails'),
         });
         settings.bind('show-group-count', groupCountSwitch, 'active', Gio.SettingsBindFlags.DEFAULT);
-        sideGroup.add(groupCountSwitch);
+        contentGroup.add(groupCountSwitch);
 
         const showCurrentWsSwitch = new Adw.SwitchRow({
             title: _('Show Current Workspace'),
             subtitle: _('In workspace mode, also show the current workspace card'),
         });
         settings.bind('show-workspace-current', showCurrentWsSwitch, 'active', Gio.SettingsBindFlags.DEFAULT);
-        sideGroup.add(showCurrentWsSwitch);
+        contentGroup.add(showCurrentWsSwitch);
 
         // Shortcuts
         const shortcutGroup = new Adw.PreferencesGroup({
@@ -123,6 +174,14 @@ export default class StageManagerPreferences extends ExtensionPreferences {
         this._addShortcutRow(shortcutGroup, settings, 'toggle-sidebar',
             _('Toggle Sidebar'),
             _('Reveal or hide the sidebar without moving the mouse to the screen edge'));
+        this._addShortcutRow(shortcutGroup, settings, 'keybinding-arc-next',
+            _('Arc: Next Card'), _('Move the arc carousel to the next card'));
+        this._addShortcutRow(shortcutGroup, settings, 'keybinding-arc-prev',
+            _('Arc: Previous Card'), _('Move the arc carousel to the previous card'));
+        this._addShortcutRow(shortcutGroup, settings, 'keybinding-arc-activate',
+            _('Arc: Activate Card'), _('Activate the front card of the arc carousel'));
+        this._addShortcutRow(shortcutGroup, settings, 'keybinding-arc-close',
+            _('Arc: Close Front Window'), _('Close the front window of the arc carousel\'s front card'));
 
         // ── Appearance Page ──
         const lookPage = new Adw.PreferencesPage({
@@ -139,8 +198,81 @@ export default class StageManagerPreferences extends ExtensionPreferences {
         this._addSpinRow(sizeGroup, settings, 'edge-trigger-width',
             _('Edge Trigger Width'), _('Hot zone at screen edge (pixels)'), 1, 20, 1);
 
-        const cardGroup = new Adw.PreferencesGroup({ title: _('Cards') });
+        // Stack Layout — position only applies to the Stack layout; the card
+        // list itself stays a vertical column either way (see CLAUDE.md on
+        // why Bottom isn't offered here yet).
+        const stackGroup = new Adw.PreferencesGroup({
+            title: _('Stack Layout'),
+            description: _('Stack layout only'),
+        });
+        lookPage.add(stackGroup);
+        this._bindLayoutSensitivity(stackGroup, settings, 'stack');
+
+        const stackPosRow = new Adw.ActionRow({
+            title: _('Panel Position'),
+            subtitle: _('Screen edge the stack sidebar attaches to'),
+        });
+        const stackPosKeys = ['left', 'right'];
+        const stackPosLabels = [_('Left'), _('Right')];
+        const stackPosDropdown = new Gtk.DropDown({
+            model: Gtk.StringList.new(stackPosLabels),
+            valign: Gtk.Align.CENTER,
+        });
+        const stackPosVal = settings.get_string('stack-panel-position');
+        stackPosDropdown.set_selected(Math.max(0, stackPosKeys.indexOf(stackPosVal)));
+        stackPosDropdown.connect('notify::selected', () => {
+            const sel = stackPosDropdown.get_selected();
+            settings.set_string('stack-panel-position', stackPosKeys[sel] || 'left');
+        });
+        stackPosRow.add_suffix(stackPosDropdown);
+        stackGroup.add(stackPosRow);
+
+        // Arc Layout — settings specific to the 'arc' sidebar-layout carousel.
+        const arcGroup = new Adw.PreferencesGroup({
+            title: _('Arc Layout'),
+            description: _('Arc layout only'),
+        });
+        lookPage.add(arcGroup);
+        this._bindLayoutSensitivity(arcGroup, settings, 'arc');
+
+        const arcPosRow = new Adw.ActionRow({
+            title: _('Panel Position'),
+            subtitle: _('Screen edge the arc carousel attaches to'),
+        });
+        const arcPosKeys = ['left', 'right', 'bottom'];
+        const arcPosLabels = [_('Left'), _('Right'), _('Bottom')];
+        const arcPosDropdown = new Gtk.DropDown({
+            model: Gtk.StringList.new(arcPosLabels),
+            valign: Gtk.Align.CENTER,
+        });
+        const arcPosVal = settings.get_string('arc-panel-position');
+        arcPosDropdown.set_selected(Math.max(0, arcPosKeys.indexOf(arcPosVal)));
+        arcPosDropdown.connect('notify::selected', () => {
+            const sel = arcPosDropdown.get_selected();
+            settings.set_string('arc-panel-position', arcPosKeys[sel] || 'left');
+        });
+        arcPosRow.add_suffix(arcPosDropdown);
+        arcGroup.add(arcPosRow);
+
+        const arcPersistSwitch = new Adw.SwitchRow({
+            title: _('Persistent Mode'),
+            subtitle: _('Keep the arc carousel shown whenever no window overlaps its area'),
+        });
+        settings.bind('arc-persistent-mode', arcPersistSwitch, 'active', Gio.SettingsBindFlags.DEFAULT);
+        arcGroup.add(arcPersistSwitch);
+
+        this._addSpinRow(arcGroup, settings, 'arc-angle-step',
+            _('Arc Angle Step'), _('Degrees between cards (8-30)'), 8, 30, 1);
+        this._addSpinRow(arcGroup, settings, 'arc-card-scale',
+            _('Arc Card Scale'), _('Card size percentage (50-150)'), 50, 150, 5);
+        this._addSpinRow(arcGroup, settings, 'arc-scroll-speed',
+            _('Arc Scroll Speed'), _('Momentum-scroll speed (1-20)'), 1, 20, 1);
+
+        // Card scale/perspective are the Stack layout's own 3D card effect —
+        // Arc has its own separate 'arc-card-scale' above and no perspective tilt.
+        const cardGroup = new Adw.PreferencesGroup({ title: _('Cards'), description: _('Stack layout only') });
         lookPage.add(cardGroup);
+        this._bindLayoutSensitivity(cardGroup, settings, 'stack');
 
         this._addSpinRow(cardGroup, settings, 'card-base-scale',
             _('Card Base Scale'), _('Default card size percentage (40-100)'), 40, 100, 5);
@@ -150,8 +282,12 @@ export default class StageManagerPreferences extends ExtensionPreferences {
         const animGroup = new Adw.PreferencesGroup({ title: _('Animation') });
         lookPage.add(animGroup);
 
-        this._addSpinRow(animGroup, settings, 'animation-duration',
+        // Slide duration is the Stack panel's own show/hide animation; Arc's
+        // card motions use their own fixed durations. Hide Delay (below) is
+        // shared — both layouts read auto-hide-delay.
+        const animDurationRow = this._addSpinRow(animGroup, settings, 'animation-duration',
             _('Animation Duration'), _('Slide speed in milliseconds'), 0, 1000, 25);
+        this._bindLayoutSensitivity(animDurationRow, settings, 'stack');
         this._addSpinRow(animGroup, settings, 'auto-hide-delay',
             _('Hide Delay'), _('Delay before hiding after mouse leaves (ms)'), 100, 5000, 100);
 
@@ -241,6 +377,16 @@ export default class StageManagerPreferences extends ExtensionPreferences {
         logGroup.add(copyRow);
     }
 
+    /** Grey out `widget` (a group or row) while sidebar-layout isn't `wantedLayout`. */
+    _bindLayoutSensitivity(widget, settings, wantedLayout) {
+        const update = () => {
+            widget.sensitive = settings.get_string('sidebar-layout') === wantedLayout;
+        };
+        update();
+        const id = settings.connect('changed::sidebar-layout', update);
+        widget.connect('destroy', () => settings.disconnect(id));
+    }
+
     _addSpinRow(group, settings, key, title, subtitle, min, max, step) {
         const row = new Adw.ActionRow({ title, subtitle });
         const adj = new Gtk.Adjustment({
@@ -251,6 +397,7 @@ export default class StageManagerPreferences extends ExtensionPreferences {
         settings.bind(key, spin, 'value', Gio.SettingsBindFlags.DEFAULT);
         row.add_suffix(spin);
         group.add(row);
+        return row;
     }
 
     _addShortcutRow(group, settings, key, title, subtitle) {
