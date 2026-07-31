@@ -2161,6 +2161,7 @@ class ArcSidebar {
     this._scrollTimer = null;
     this._refreshTimer = null;
     this._dragPollTimer = null;
+    this._edgeTimer = null;    // dwell-delay before reveal on edge-enter
 
     this._groups = [];
     this._offset = 0;
@@ -2221,6 +2222,7 @@ class ArcSidebar {
     this._killCardTimers();
     // Anything the named fields above did not cover.
     this._timers.splice(0).forEach(id => GLib.source_remove(id));
+    this._killEdgeTimer();
 
     this._sigSources.forEach(o => o.disconnectObject(this));
     this._sigSources.clear();
@@ -2660,7 +2662,27 @@ class ArcSidebar {
     this._edge.set_position(geo.edgeX, geo.edgeY);
     Main.layoutManager.addChrome(this._edge, { trackFullscreen: false });
 
-    this._sig(this._edge, 'enter-event', () => { if (!this._isVisible) this._showPanel(); });
+    this._sig(this._edge, 'enter-event', () => {
+      if (this._isVisible) return;
+      // Same dwell-delay as StageSidebar — pointer must stay on the edge strip
+      // for edge-trigger-delay ms before revealing. Prevents accidental triggers
+      // when brushing the edge to reach left-edge app UI (e.g. vertical tab bars).
+      const delay = this._settings.get_int('edge-trigger-delay');
+      if (delay <= 0) {
+        this._showPanel();
+        return;
+      }
+      this._killEdgeTimer();
+      this._edgeTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, delay, () => {
+        this._edgeTimer = null;
+        if (!this._isVisible) this._showPanel();
+        return GLib.SOURCE_REMOVE;
+      });
+    });
+    this._sig(this._edge, 'leave-event', () => {
+      // Pointer left before the dwell timer fired — cancel the pending reveal.
+      this._killEdgeTimer();
+    });
     this._sig(this._panel, 'enter-event', () => { if (!this._drag) this._cancelHide(); });
     this._sig(this._panel, 'leave-event', () => { if (this._isVisible && !this._drag) this._startHide(); });
     this._sig(this._panel, 'scroll-event', (_a, event) => { this._handleScroll(event); return Clutter.EVENT_STOP; });
