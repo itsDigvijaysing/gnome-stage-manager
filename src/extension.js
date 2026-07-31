@@ -143,6 +143,8 @@ class MaximizeToWorkspace {
     }
 
     /** Drop a fired timer from tracking without disturbing the others. */
+    /** Drop an id from this._timers once its source is gone. Every timeout is
+     *  pushed to that array at creation so disable() can loop over the rest. */
     _untrackTimer(id) {
         const i = this._timers.indexOf(id);
         if (i >= 0) this._timers.splice(i, 1);
@@ -1046,22 +1048,24 @@ class StageSidebar {
         // Safety net only: a compositor that refuses a minimize would otherwise
         // leave a stale expectation behind that swallows the user's next one.
         this._killSwapTimer();
-        this._swapTimer = this._addTimer(2000, () => {
-            this._swapTimer = null;
+        this._swapTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 2000, () => {
+            this._untrackTimer(this._swapTimer); this._swapTimer = null;
             this._expectMinimize.clear();
             this._expectUnminimize.clear();
             return GLib.SOURCE_REMOVE;
         });
+        this._timers.push(this._swapTimer);
 
         this._hovered = false;
         // Reuses the single _refreshTimer slot — killing it first means a swap
         // refresh and a debounced refresh can never both be queued.
         this._killRefreshTimer();
-        this._refreshTimer = this._addTimer(120, () => {
-            this._refreshTimer = null;
+        this._refreshTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 120, () => {
+            this._untrackTimer(this._refreshTimer); this._refreshTimer = null;
             if (this._visible) this._refresh();
             return GLib.SOURCE_REMOVE;
         });
+        this._timers.push(this._refreshTimer);
 
         if (this._settings.get_boolean('sidebar-auto-hide') && !this._shouldForceShow())
             this._scheduleHide();
@@ -1172,22 +1176,24 @@ class StageSidebar {
         // Never hide when force-show is active (empty desktop override).
         if (this._shouldForceShow()) return;
         this._killHideTimer();
-        this._hideTimer = this._addTimer(this._HIDE_DELAY_MS, () => {
-            this._hideTimer = null;
+        this._hideTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, this._HIDE_DELAY_MS, () => {
+            this._untrackTimer(this._hideTimer); this._hideTimer = null;
             if (!this._hovered && !this._shouldForceShow()) this._hide();
             return GLib.SOURCE_REMOVE;
         });
+        this._timers.push(this._hideTimer);
     }
 
     _scheduleRefresh() {
         // EGO-L-007: must remove any in-flight timer before re-arming. Inlined
         // (not via _killRefreshTimer) — shexli wants the remove textually adjacent.
         if (this._refreshTimer) { GLib.source_remove(this._refreshTimer); this._untrackTimer(this._refreshTimer); this._refreshTimer = null; }
-        this._refreshTimer = this._addTimer(200, () => {
-            this._refreshTimer = null;
+        this._refreshTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 200, () => {
+            this._untrackTimer(this._refreshTimer); this._refreshTimer = null;
             if (this._visible && !this._hovered) this._refresh();
             return GLib.SOURCE_REMOVE;
         });
+        this._timers.push(this._refreshTimer);
     }
 
     // ── Render ──────────────────────────────────────────────────────────
@@ -1841,11 +1847,12 @@ class StageSidebar {
 
             // Preview after short delay
             this._killHoverTimer();
-            this._hoverTimer = this._addTimer(220, () => {
-                this._hoverTimer = null;
+            this._hoverTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 220, () => {
+                this._untrackTimer(this._hoverTimer); this._hoverTimer = null;
                 this._showPreview(card, windows);
                 return GLib.SOURCE_REMOVE;
             });
+            this._timers.push(this._hoverTimer);
         });
 
         this._cardSig(card, 'leave-event', (_actor, event) => {
@@ -2013,19 +2020,6 @@ class StageSidebar {
     // ── Util ──
     // Per-timer kill helpers — named explicitly so shexli (EGO-L-004) can trace
     // GLib.source_remove(this._fooTimer) statically.
-
-    /** Every timeout goes through here so its id lands in this._timers, which
-     *  disable() loops over. The id is forgotten again as soon as the callback
-     *  is done, so the array only ever holds sources that still exist. */
-    _addTimer(delay, fn) {
-        const id = GLib.timeout_add(GLib.PRIORITY_DEFAULT, delay, () => {
-            const again = fn();
-            if (!again) this._untrackTimer(id);   // falsy === GLib.SOURCE_REMOVE
-            return again;
-        });
-        this._timers.push(id);
-        return id;
-    }
 
     _untrackTimer(id) {
         const i = this._timers.indexOf(id);
@@ -2227,19 +2221,6 @@ class ArcSidebar {
         this._cardSigSources.clear();
     }
 
-    /** Every timeout goes through here so its id lands in this._timers, which
-     *  disable() loops over. The id is forgotten again as soon as the callback
-     *  is done, so the array only ever holds sources that still exist. */
-    _addTimer(delay, fn) {
-        const id = GLib.timeout_add(GLib.PRIORITY_DEFAULT, delay, () => {
-            const again = fn();
-            if (!again) this._untrackTimer(id);   // falsy === GLib.SOURCE_REMOVE
-            return again;
-        });
-        this._timers.push(id);
-        return id;
-    }
-
     _untrackTimer(id) {
         const i = this._timers.indexOf(id);
         if (i >= 0) this._timers.splice(i, 1);
@@ -2266,10 +2247,11 @@ class ArcSidebar {
 
     _armPersistTimer() {
         this._killPersistTimer();
-        this._persistTimer = this._addTimer(500, () => {
+        this._persistTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 500, () => {
             this._checkPersistence();
             return GLib.SOURCE_CONTINUE;
         });
+        this._timers.push(this._persistTimer);
     }
 
     // ── Filled in by later tasks ──
@@ -2679,12 +2661,13 @@ class ArcSidebar {
 
     _scheduleRefresh() {
         this._killRefreshTimer();
-        this._refreshTimer = this._addTimer(50, () => {
-            this._refreshTimer = null;
+        this._refreshTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 50, () => {
+            this._untrackTimer(this._refreshTimer); this._refreshTimer = null;
             this._buildGroups();
             this._redraw();
             return GLib.SOURCE_REMOVE;
         });
+        this._timers.push(this._refreshTimer);
     }
 
     _trackFocus() {
@@ -2768,28 +2751,30 @@ class ArcSidebar {
             this._panel.set_child_above_sibling(container, null);
             const g = container._grid;
             if (g && !g._fanned && !g._fanTimer) {
-                g._fanTimer = this._addTimer(350, () => {
-                    g._fanTimer = null;
+                g._fanTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 350, () => {
+                    this._untrackTimer(g._fanTimer); g._fanTimer = null;
                     if (container.hover) {
                         const { shift, isBottom } = this._positionFan(g);
                         this._pushSiblings(container, shift, isBottom);
                     }
                     return GLib.SOURCE_REMOVE;
                 });
+                this._timers.push(g._fanTimer);
             }
         } else {
             const g = container._grid;
             this._killGridTimers(g);
             if (g?._fanned) {
                 if (g._closeTimer) { GLib.source_remove(g._closeTimer); this._untrackTimer(g._closeTimer); g._closeTimer = null; }
-                g._closeTimer = this._addTimer(470, () => {
-                    g._closeTimer = null;
+                g._closeTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 470, () => {
+                    this._untrackTimer(g._closeTimer); g._closeTimer = null;
                     if (!container.hover) {
                         this._positionStack(g);
                         this._pushSiblings(container, 0, this._pos === 'bottom');
                     }
                     return GLib.SOURCE_REMOVE;
                 });
+                this._timers.push(g._closeTimer);
             }
         }
     }
@@ -2868,8 +2853,8 @@ class ArcSidebar {
      *  release-event — covers the origin card dying mid-drag, which kills Clutter's implicit grab before release fires. */
     _armDragPollTimer() {
         this._killDragPollTimer();
-        this._dragPollTimer = this._addTimer(50, () => {
-            if (!this._drag) { this._dragPollTimer = null; return GLib.SOURCE_REMOVE; }
+        this._dragPollTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 50, () => {
+            if (!this._drag) { this._untrackTimer(this._dragPollTimer); this._dragPollTimer = null; return GLib.SOURCE_REMOVE; }
             const [px, py, mask] = global.get_pointer();
             if (mask & Clutter.ModifierType.BUTTON1_MASK) return GLib.SOURCE_CONTINUE;
 
@@ -2880,6 +2865,7 @@ class ArcSidebar {
             else this._activateGroup(drag.group);
             return GLib.SOURCE_REMOVE;
         });
+        this._timers.push(this._dragPollTimer);
     }
 
     _onDragMotion(event) {
@@ -3014,7 +3000,7 @@ class ArcSidebar {
         // EGO-L-007: inlined, not via _killPhysicsTimer — shexli wants the
         // remove textually adjacent to this re-arm (see _scrollTo() below).
         if (this._physicsTimer) { GLib.source_remove(this._physicsTimer); this._untrackTimer(this._physicsTimer); this._physicsTimer = null; }
-        this._physicsTimer = this._addTimer(16, () => {
+        this._physicsTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 16, () => {
             this._offset += this._velocity;
             this._velocity *= ARC_SCROLL_FRICTION;
             const max = Math.max(0, this._groups.length - 1);
@@ -3023,11 +3009,12 @@ class ArcSidebar {
             this._redraw();
             if (Math.abs(this._velocity) < ARC_SCROLL_MIN_VEL) {
                 this._velocity = 0;
-                this._physicsTimer = null;
+                this._untrackTimer(this._physicsTimer); this._physicsTimer = null;
                 return GLib.SOURCE_REMOVE;
             }
             return GLib.SOURCE_CONTINUE;
         });
+        this._timers.push(this._physicsTimer);
     }
 
     _scrollTo(targetIdx, onComplete) {
@@ -3040,19 +3027,20 @@ class ArcSidebar {
         // EGO-L-007: inlined, not via _killScrollTimer — shexli wants the
         // remove textually adjacent to this re-arm.
         if (this._scrollTimer) { GLib.source_remove(this._scrollTimer); this._untrackTimer(this._scrollTimer); this._scrollTimer = null; }
-        this._scrollTimer = this._addTimer(16, () => {
+        this._scrollTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 16, () => {
             frame++;
             this._offset = start + (targetIdx - start) * (1 - Math.pow(1 - frame / frames, 3));
             this._redraw();
             if (frame >= frames) {
                 this._offset = targetIdx;
-                this._scrollTimer = null;
+                this._untrackTimer(this._scrollTimer); this._scrollTimer = null;
                 this._redraw();
                 onComplete?.();
                 return GLib.SOURCE_REMOVE;
             }
             return GLib.SOURCE_CONTINUE;
         });
+        this._timers.push(this._scrollTimer);
     }
 
     _showPanel() {
@@ -3075,11 +3063,12 @@ class ArcSidebar {
     _startHide() {
         if (this._persistMode) return;
         this._cancelHide();
-        this._hideTimer = this._addTimer(this._hideDelay, () => {
+        this._hideTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, this._hideDelay, () => {
             this._hidePanel();
-            this._hideTimer = null;
+            this._untrackTimer(this._hideTimer); this._hideTimer = null;
             return GLib.SOURCE_REMOVE;
         });
+        this._timers.push(this._hideTimer);
     }
 
     _cancelHide() { this._killHideTimer(); }
