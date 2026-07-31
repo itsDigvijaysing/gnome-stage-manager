@@ -728,10 +728,10 @@ class StageSidebar {
       }
       this._applyChrome();
     });
-    sig(this._settings, 'changed::show-on-empty-workspace', () => {
+    this._sig(this._settings, 'changed::show-on-empty-workspace', () => {
       this._syncForceShow();
     });
-    sig(this._settings, 'changed::show-app-icons', () => {
+    this._sig(this._settings, 'changed::show-app-icons', () => {
       if (this._visible) this._refresh();
     });
     this._sig(this._settings, 'changed::show-group-count', () => {
