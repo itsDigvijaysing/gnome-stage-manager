@@ -408,6 +408,7 @@ const DEFAULTS = {
     'sidebar-reserve-space': false,
     'auto-hide-delay': 800,
     'edge-trigger-width': 4,
+    'edge-trigger-delay': 250,
     'show-app-icons': true,
     'sidebar-mode': 'groups',
     'card-base-scale': 70,

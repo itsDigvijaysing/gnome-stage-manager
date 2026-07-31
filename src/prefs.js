@@ -211,6 +211,8 @@ export default class StageManagerPreferences extends ExtensionPreferences {
             _('Sidebar Width'), _('Width in pixels'), 120, 400, 10);
         this._addSpinRow(sizeGroup, settings, 'edge-trigger-width',
             _('Edge Trigger Width'), _('Hot zone at screen edge (pixels)'), 1, 20, 1);
+        this._addSpinRow(sizeGroup, settings, 'edge-trigger-delay',
+            _('Edge Trigger Delay'), _('Dwell time before sidebar reveals (ms, 0 = instant)'), 0, 1000, 50);
 
         // Stack Layout — position only applies to the Stack layout; the card
         // list itself stays a vertical column either way (see CLAUDE.md on
