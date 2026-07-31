@@ -2260,6 +2260,7 @@ class ArcSidebar {
   _killPersistTimer() { if (this._persistTimer) { GLib.source_remove(this._persistTimer); this._untrackTimer(this._persistTimer); this._persistTimer = null; } }
   _killRefreshTimer() { if (this._refreshTimer) { GLib.source_remove(this._refreshTimer); this._untrackTimer(this._refreshTimer); this._refreshTimer = null; } }
   _killDragPollTimer() { if (this._dragPollTimer) { GLib.source_remove(this._dragPollTimer); this._untrackTimer(this._dragPollTimer); this._dragPollTimer = null; } }
+  _killEdgeTimer() { if (this._edgeTimer) { GLib.source_remove(this._edgeTimer); this._untrackTimer(this._edgeTimer); this._edgeTimer = null; } }
 
   _killCardTimers() {
     this._containers.forEach(c => this._killGridTimers(c._grid));
