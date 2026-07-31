@@ -1640,7 +1640,7 @@ test('enable()/disable() cycle leaves zero pending card timers and zero tracked 
     arc.enable();
     clock.advance(50); // fire the debounced _scheduleRefresh timer
     arc.disable();
-    assert.equal(arc._cardTimers.size, 0);
+    assert.equal(arc._timers.length, 0, 'the tracked-timeout array must be drained by disable()');
     assert.equal(clock.pending, 0, 'no timers should remain pending after disable()');
 });
 
