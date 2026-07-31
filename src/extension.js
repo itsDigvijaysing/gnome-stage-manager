@@ -2067,6 +2067,7 @@ class ArcSidebar {
         this._velocity = 0;
         this._containers = [];
         this._drag = null;
+        this._dragGhost = null;
 
         this._mergeMap = new Map();
         this._orderMap = new Map();
@@ -2545,6 +2546,8 @@ class ArcSidebar {
 
     _destroyUI() {
         this._cancelHide();
+        this._containers.forEach(c => c.destroy());
+        this._containers = [];
         if (this._edge)  { this._edge.destroy();  this._edge = null; }
         if (this._panel) { this._panel.destroy(); this._panel = null; }
     }
@@ -2585,7 +2588,7 @@ class ArcSidebar {
 
         this._killCardTimers();
         this._disconnectCardSigs();
-        this._panel.destroy_all_children();
+        this._containers.forEach(c => c.destroy());
         this._containers = [];
         if (this._groups.length === 0) return;
 
@@ -2742,7 +2745,7 @@ class ArcSidebar {
         if (event.get_button() === 1) {
             this._cancelDrag();
             const [px, py] = global.get_pointer();
-            this._drag = { group, card: container, startX: px, startY: py, moved: false, ghost: null };
+            this._drag = { group, card: container, startX: px, startY: py, moved: false };
             this._sig(global.stage, 'motion-event', (_a, ev) => this._onDragMotion(ev));
             this._armDragPollTimer();
         }
@@ -2861,19 +2864,21 @@ class ArcSidebar {
         icon.set_position(size / 2 - iconSize / 2, size / 2 - iconSize / 2);
         ghost.add_child(icon);
         Main.uiGroup.add_child(ghost);
-        this._drag.ghost = ghost;
+        this._dragGhost = ghost;
     }
 
     _updateDragGhost(px, py) {
-        if (!this._drag?.ghost) return;
+        if (!this._dragGhost) return;
         const size = Math.round(ARC_GHOST_SIZE * this._scaleFactor);
-        this._drag.ghost.set_position(px - size / 2, py - size / 2);
+        this._dragGhost.set_position(px - size / 2, py - size / 2);
     }
+
+    _killDragGhost() { if (this._dragGhost) { this._dragGhost.destroy(); this._dragGhost = null; } }
 
     _cancelDrag() {
         this._killDragPollTimer();
+        this._killDragGhost();
         if (!this._drag) return;
-        if (this._drag.ghost) this._drag.ghost.destroy();
         this._drag = null;
         global.stage.disconnectObject(this);
     }
@@ -2893,7 +2898,9 @@ class ArcSidebar {
     }
 
     _startPhysics() {
-        if (this._physicsTimer) return;
+        // EGO-L-007: inlined, not via _killPhysicsTimer — shexli wants the
+        // remove textually adjacent to this re-arm (see _scrollTo() below).
+        if (this._physicsTimer) { GLib.source_remove(this._physicsTimer); this._physicsTimer = null; }
         this._physicsTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 16, () => {
             this._offset += this._velocity;
             this._velocity *= ARC_SCROLL_FRICTION;
@@ -2911,12 +2918,12 @@ class ArcSidebar {
     }
 
     _scrollTo(targetIdx, onComplete) {
-        this._killPhysicsTimer();
         this._velocity = 0;
         targetIdx = Math.max(0, Math.min(targetIdx, this._groups.length - 1));
         const start = this._offset;
         const frames = Math.max(8, Math.round(Math.abs(targetIdx - start) * 12));
         let frame = 0;
+        if (this._physicsTimer) { GLib.source_remove(this._physicsTimer); this._physicsTimer = null; }
         this._physicsTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 16, () => {
             frame++;
             this._offset = start + (targetIdx - start) * (1 - Math.pow(1 - frame / frames, 3));
