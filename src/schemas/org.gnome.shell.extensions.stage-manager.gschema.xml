@@ -61,6 +61,14 @@
             <description>Width of the invisible hot zone at the screen edge to trigger the sidebar.</description>
         </key>
 
+        <key name="edge-trigger-delay" type="i">
+            <default>250</default>
+            <range min="0" max="1000"/>
+            <summary>Edge Trigger Delay</summary>
+            <description>How long (ms) the pointer must dwell at the screen edge before the sidebar reveals. Prevents accidental triggers when brushing the edge to reach left-edge app UI (e.g. vertical tab bars). Set to 0 for the original instant behaviour.</description>
+        </key>
+
+
         <key name="show-app-icons" type="b">
             <default>true</default>
             <summary>Show Application Icons</summary>
