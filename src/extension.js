@@ -43,6 +43,40 @@ const APP_DRAG_THRESHOLD = 18;    // logical px — past this, a press+release i
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
+function _getMon() {
+    const display = global.display;
+    
+    // 1. Fallback if the display server isn't fully ready
+    if (!display) {
+        return { x: 0, y: 0, width: 1920, height: 1080 }; // Sensible headless default
+    }
+
+    // 2. Fetch the current index of the primary monitor directly from Mutter
+    const primaryIndex = display.get_primary_monitor();
+    
+    // 3. Fallback to 0 if primaryIndex is invalid/negative
+    const safeIndex = primaryIndex >= 0 ? primaryIndex : 0;
+    
+    // 4. Extract MtkRectangle/MetaRectangle straight from the compositor
+    if (display.get_n_monitors() > safeIndex) {
+        const rect = display.get_monitor_geometry(safeIndex);
+        return {
+            x: rect.x,
+            y: rect.y,
+            width: rect.width,
+            height: rect.height
+        };
+    }
+    
+    // 5. Hard fallback to layoutManager elements if layoutManager has populated late
+    if (Main.layoutManager && Main.layoutManager.primaryMonitor) {
+        return Main.layoutManager.primaryMonitor;
+    }
+
+    return { x: 0, y: 0, width: 1024, height: 768 };
+}
+
+
 function _isNormal(win) {
     if (!win) return false;
     if (win.get_window_type() !== Meta.WindowType.NORMAL) return false;
@@ -405,7 +439,7 @@ class StageSidebar {
     // ── Build UI ──
 
     _build() {
-        const mon = Main.layoutManager.primaryMonitor;
+        const mon = _getMon();
         const topH = Main.panel ? Main.panel.height : 0;
         const panelW = this._PANEL_W;
         const edgeW = this._EDGE_W;
@@ -628,7 +662,7 @@ class StageSidebar {
 
     _rebuildLayout() {
         if (!this._panel || !this._edge || !this._scroll) return;
-        const mon = Main.layoutManager.primaryMonitor;
+        const mon = _getMon();
         const topH = Main.panel ? Main.panel.height : 0;
         const panelW = this._PANEL_W;
         const edgeW = this._EDGE_W;
@@ -1075,7 +1109,7 @@ class StageSidebar {
 
     _fullscreen() {
         // primaryMonitor is briefly null while monitors are being reconfigured.
-        const mon = Main.layoutManager.primaryMonitor;
+        const mon = _getMon();
         if (!mon) return false;
         return global.display.get_monitor_in_fullscreen(mon.index);
     }
@@ -1088,7 +1122,8 @@ class StageSidebar {
                 if (this._panel) {
                     this._panel.remove_all_transitions();
                     this._panel.set_position(
-                        this._panelHiddenX(Main.layoutManager.primaryMonitor), this._panel.y);
+                        this._panelHiddenX(_getMon(), this._panel.y)
+                    );
                 }
             }
             this._syncEdge();
@@ -1143,7 +1178,7 @@ class StageSidebar {
 
         this._panel.remove_all_transitions();
         this._panel.ease({
-            x: this._panelVisibleX(Main.layoutManager.primaryMonitor),
+            x: this._panelVisibleX(_getMon()),
             duration: this._SLIDE_MS,
             mode: Clutter.AnimationMode.EASE_OUT_QUAD,
             // Claimed only once settled — mid-slide would resize every window on every frame.
@@ -1166,7 +1201,7 @@ class StageSidebar {
 
         this._panel.remove_all_transitions();
         this._panel.ease({
-            x: this._panelHiddenX(Main.layoutManager.primaryMonitor),
+            x: this._panelHiddenX(_getMon()),
             duration: this._SLIDE_MS,
             mode: Clutter.AnimationMode.EASE_OUT_QUAD,
         });
@@ -1640,7 +1675,7 @@ class StageSidebar {
 
     /** Shape of the display — what a maximized window looks like. */
     _monitorAspect() {
-        const mon = Main.layoutManager.primaryMonitor;
+        const mon = _getMon();
         return (mon && this._clampAspect(mon.width / mon.height)) ??
                this._clampAspect(THUMB_W / THUMB_H);
     }
@@ -1885,7 +1920,7 @@ class StageSidebar {
     _showPreview(card, windows) {
         this._destroyPreview();
 
-        const mon = Main.layoutManager.primaryMonitor;
+        const mon = _getMon();
         const topH = Main.panel ? Main.panel.height : 0;
         const [, cardY] = card.get_transformed_position();
 
@@ -1953,7 +1988,7 @@ class StageSidebar {
     /** Fallback preview: app icons + names when clones aren't available. */
     _showIconPreview(windows, cardY) {
         const tracker = Shell.WindowTracker.get_default();
-        const mon = Main.layoutManager.primaryMonitor;
+        const mon = _getMon();
         const topH = Main.panel ? Main.panel.height : 0;
         const sf = this._scaleFactor;
 
@@ -2256,7 +2291,7 @@ class ArcSidebar {
 
     // ── Filled in by later tasks ──
 
-    _pickMonitor() { return Main.layoutManager.primaryMonitor; }
+    _pickMonitor() { return _getMon() }
 
     _loadMergeMap() {
         const raw = this._settings.get_string('arc-merge-map');
