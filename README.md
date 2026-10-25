@@ -10,6 +10,11 @@ Group windows into stages: only one group is visible at a time, others appear as
 
 ![Stage Manager Sidebar](assets/sidebar.png)
 
+## What's New in 2.1.1
+
+- **Arc layout honours Show on Empty Desktop**: the carousel comes up when every window on the workspace is minimized, as the Stack sidebar already did.
+- **No more empty card from the desktop icons**: the desktop-icons window could join a stage before it became the desktop and then show as a blank card.
+
 ## What's New in 2.1.0
 
 - **Click the desktop** to park the current stage, like clicking the wallpaper on macOS.

@@ -3697,6 +3697,62 @@ test('Arc does not rebuild its cards while hidden, and redraws on the way in', (
     } finally { arc.disable(); }
 });
 
+/* ═══ Arc: Show on Empty Desktop ═══════════════════════════════════════ */
+
+function arcEnabled(over = {}) {
+    const [ws0] = wsm.reset(1); wsm.setActive(ws0);
+    const a = new FakeWindow('appA'), b = new FakeWindow('appB');
+    ws0.adopt(a); ws0.adopt(b);
+    setPointer(900, 500);                  // away from the carousel
+    const arc = new ArcSidebar(makeSettings(over));
+    arc.enable();
+    return { arc, a, b };
+}
+
+test('Arc: minimizing every window brings the carousel up and keeps it up, like Stack', () => {
+    const { arc, a, b } = arcEnabled();
+    try {
+        assert.equal(arc._isVisible, false, 'precondition: hidden while windows are on screen');
+        a.minimize(); windowManager.emit('minimize');
+        assert.equal(arc._isVisible, false, 'one window is still showing');
+        b.minimize(); windowManager.emit('minimize');
+        assert.equal(arc._isVisible, true, 'the desktop is empty, so the carousel must come up');
+        arc._startHide(); clock.advance(5000);
+        assert.equal(arc._isVisible, true, 'leaving it hid the only way back to the windows');
+        b.unminimize(); windowManager.emit('unminimize');
+        clock.advance(5000);
+        assert.equal(arc._isVisible, false, 'a window came back, so it should step aside');
+    } finally { arc.disable(); }
+});
+
+test('Arc: closing the last visible window also counts as an empty desktop', () => {
+    const { arc, a, b } = arcEnabled();
+    try {
+        a.minimize(); windowManager.emit('minimize');
+        b.unmanage(); display.emit('restacked');   // closed: no minimize signal
+        assert.equal(arc._isVisible, true);
+    } finally { arc.disable(); }
+});
+
+test('Arc: with Show on Empty Desktop off, minimizing everything leaves it hidden', () => {
+    const { arc, a, b } = arcEnabled({ 'show-on-empty-workspace': false });
+    try {
+        a.minimize(); b.minimize(); windowManager.emit('minimize');
+        assert.equal(arc._isVisible, false);
+    } finally { arc.disable(); }
+});
+
+test('Arc: an empty desktop in the overview waits for it to close when Arc is hidden there', () => {
+    const { arc, a, b } = arcEnabled({ 'arc-show-in-overview': false });
+    try {
+        arc._onOverviewShowing();
+        a.minimize(); b.minimize(); windowManager.emit('minimize');
+        assert.equal(arc._isVisible, false, 'shown in the overview against the setting');
+        arc._onOverviewHidden();
+        assert.equal(arc._isVisible, true, 'not shown once the overview closed');
+    } finally { arc.disable(); }
+});
+
 /* ── report ──────────────────────────────────────────────────────────── */
 
 let failed = 0;

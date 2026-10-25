@@ -2697,6 +2697,7 @@ class ArcSidebar {
         this._monitor = null;
         this._isVisible = false;
         this._persistMode = false;
+        this._emptyDesk = false;           // shown because every window is minimized
         this._persistEnabled = false;
         this._scaleFactor = 1;
 
@@ -2767,6 +2768,7 @@ class ArcSidebar {
                 else { this._killPersistTimer(); this._persistMode = false; }
             }
             else if (key === 'arc-hide-active') { this._scheduleRefresh(); }
+            else if (key === 'show-on-empty-workspace') { this._syncEmptyDesk(); }
             else if (key === 'arc-fan-hold' || key === 'arc-fan-hold-delay') { /* read live, nothing to rebuild */ }
             else if (ARC_KEYBINDINGS.includes(key)) { this._removeKeybindings(); this._addKeybindings(); }
             else this._rebuild();
@@ -2776,6 +2778,11 @@ class ArcSidebar {
             this._syncEdge();
             this._syncPanel();
         });
+        // Anything that can leave every window minimized, or end that state.
+        this._sig(global.window_manager, 'minimize', () => this._syncEmptyDesk());
+        this._sig(global.window_manager, 'unminimize', () => this._syncEmptyDesk());
+        this._sig(global.display, 'restacked', () => this._syncEmptyDesk());
+        this._sig(global.workspace_manager, 'active-workspace-changed', () => this._syncEmptyDesk());
 
         this._trackFocus();
         this._scheduleRefresh();
@@ -2787,6 +2794,7 @@ class ArcSidebar {
             this._showPanel();
             this._startHide(ARC_PEEK_MS);
         }
+        this._syncEmptyDesk();
     }
 
     disable() {
@@ -3446,6 +3454,7 @@ class ArcSidebar {
 
     _onOverviewHidden() {
         this._overviewActive = false;
+        this._syncEmptyDesk();
         if (this._persistEnabled)
             this._checkPersistence();
         // After leaving the overview, show only the focused window's group
@@ -4168,7 +4177,7 @@ class ArcSidebar {
     }
 
     _startHide(delay = this._hideDelay) {
-        if (this._persistMode) return;
+        if (this._persistMode || this._emptyDesk) return;
         this._cancelHide();
         this._hideTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, delay, () => {
             this._hidePanel();
@@ -4200,6 +4209,26 @@ class ArcSidebar {
         });
         if (clear && !this._persistMode) { this._persistMode = true; if (!this._isVisible) this._showPanel(); }
         else if (!clear && this._persistMode) { this._persistMode = false; this._hidePanel(); }
+    }
+
+    /** 'show-on-empty-workspace', as in the Stack sidebar: while every window on the
+     *  workspace is minimized, keep the carousel up so they stay one click away. */
+    _syncEmptyDesk() {
+        const wins = global.workspace_manager.get_active_workspace().list_windows().filter(w => _isNormal(w));
+        const empty = this._settings.get_boolean('show-on-empty-workspace') &&
+            wins.length > 0 && wins.every(w => w.minimized) &&
+            !(this._overviewActive && !this._settings.get_boolean('arc-show-in-overview'));
+        if (empty) {
+            this._emptyDesk = true;
+            this._cancelHide();
+            if (!this._isVisible) this._showPanel();
+        } else if (this._emptyDesk) {
+            this._emptyDesk = false;
+            const [px, py] = global.get_pointer();
+            const g = this._geo;
+            const over = px >= g.visX && px <= g.visX + g.panelW && py >= g.visY && py <= g.visY + g.panelH;
+            if (this._isVisible && !over) this._startHide();
+        }
     }
 
     _addKeybindings() {

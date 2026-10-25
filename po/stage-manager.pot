@@ -6,7 +6,7 @@
 #, fuzzy
 msgid ""
 msgstr ""
-"Project-Id-Version: Stage Manager 2.1.0\n"
+"Project-Id-Version: Stage Manager 2.1.1\n"
 "Report-Msgid-Bugs-To: https://github.com/itsdigvijaysing/gnome-stage-manager/"
 "issues\n"
 "POT-Creation-Date: 2026-10-14 17:25+0530\n"
