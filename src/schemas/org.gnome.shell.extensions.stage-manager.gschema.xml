@@ -52,7 +52,19 @@
         <key name="sidebar-auto-hide" type="b">
             <default>false</default>
             <summary>Auto-hide Sidebar</summary>
-            <description>When off (default): the sidebar stays visible, drawn over your windows; the empty space around the cards passes clicks through to whatever is underneath. When on: the sidebar stays off screen and is revealed by moving the pointer to the screen edge it is attached to.</description>
+            <description>When off (default): the sidebar stays visible, except that it steps aside while a window covers its area (see sidebar-hide-when-covered). When on: the sidebar stays off screen and is revealed by moving the pointer to the screen edge it is attached to.</description>
+        </key>
+
+        <key name="sidebar-hide-when-covered" type="b">
+            <default>true</default>
+            <summary>Hide the Sidebar When a Window Covers It</summary>
+            <description>With auto-hide off, the sidebar slides out of the way while a window overlaps its area, so that window stays fully clickable, and comes back once the area is clear, the way macOS Stage Manager does. Move the pointer to the screen edge to reveal it meanwhile. Has no effect while space is reserved for the sidebar, since windows then never cover it.</description>
+        </key>
+
+        <key name="park-on-desktop-click" type="b">
+            <default>true</default>
+            <summary>Park the Stage on Desktop Click</summary>
+            <description>In Groups mode, clicking the empty desktop minimizes the current stage into a single card and reveals the wallpaper, as clicking the wallpaper does on macOS.</description>
         </key>
 
         <key name="show-on-empty-workspace" type="b">

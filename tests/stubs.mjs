@@ -5,7 +5,11 @@
  */
 
 export const Meta = {
-    WindowType: { NORMAL: 0, DIALOG: 1 },
+    // Real mutter values (Meta-18). DESKTOP is what Ubuntu's desktop-icons
+    // window becomes via set_type(), so it must not alias another type.
+    WindowType: { NORMAL: 0, DESKTOP: 1, DOCK: 2, DIALOG: 3 },
+    // Only used for instanceof: a press on the bare wallpaper comes from one.
+    BackgroundActor: class BackgroundActor {},
     SizeChange: { MAXIMIZE: 0, UNMAXIMIZE: 1 },
     KeyBindingFlags: { NONE: 0 },
     // Real mutter values. Note that meta_window_is_maximized() returns a
@@ -36,6 +40,11 @@ class FakeActor {
     set_position(x, y) { this.x = x; this.y = y; }
     get_position() { return [this.x, this.y]; }
     add_child(c) { this.children.push(c); c.parent = this; }
+    insert_child_below(c, sibling) {
+        const i = this.children.indexOf(sibling);
+        this.children.splice(i < 0 ? 0 : i, 0, c);
+        c.parent = this;
+    }
     remove_child(c) { this.children = this.children.filter(k => k !== c); }
     get_children() { return [...this.children]; }
     // sibling === null moves child to the end of the list (top of paint order),
@@ -89,6 +98,20 @@ class FakeActor {
         if (a === this) return true;
         return this.children.some(c => c.contains?.(a));
     }
+    // Stage position = own position plus every ancestor's (no scale or rotation here).
+    get_transformed_position() {
+        const [px, py] = this.parent?.get_transformed_position?.() ?? [0, 0];
+        return [px + this.x, py + this.y];
+    }
+    /** Stage point → this actor's coordinates, as Clutter returns it: [ok, x, y]. */
+    transform_stage_point(x, y) {
+        const [tx, ty] = this.get_transformed_position();
+        return [true, x - tx, y - ty];
+    }
+    get_transformed_extents() {
+        const [x, y] = this.get_transformed_position();
+        return { origin: { x, y }, size: { width: this.width, height: this.height } };
+    }
 }
 
 export const Clutter = {
@@ -101,6 +124,10 @@ export const Clutter = {
     PickMode: { REACTIVE: 0, ALL: 1 },
     // Real Clutter value (1 << 8); the arc drag poll masks against it.
     ModifierType: { BUTTON1_MASK: 256 },
+    BUTTON_PRIMARY: 1,
+    // Real Clutter value: a click that moves focus is dispatched as type 6.
+    EventType: { BUTTON_PRESS: 6 },
+    get_current_event: () => currentEvent,
     PolicyType: { NEVER: 0 },
     EVENT_STOP: true,
     EVENT_PROPAGATE: false,
@@ -210,7 +237,7 @@ export class FakeWindow {
     constructor(appId, {
         minimized = false, type = Meta.WindowType.NORMAL,
         actor = null, frame = { x: 0, y: 0, width: 800, height: 600 },
-        maximizedH = true, maximizedV = true,
+        maximizedH = true, maximizedV = true, sticky = false,
     } = {}) {
         this._id = ++winSeq;
         this.appId = appId;
@@ -226,9 +253,27 @@ export class FakeWindow {
         // maximize; one true = an edge-tiled (half-screen) window.
         this.maximized_horizontally = maximizedH;
         this.maximized_vertically = maximizedV;
+        /** On all workspaces by the user's choice (window menu), not by type. */
+        this.sticky = sticky;
         /** Signal emissions the compositor would deliver asynchronously. */
         this.pending = [];
+        this._sigs = [];
     }
+
+    // GObject signals on the window itself ('unmanaged'), with connectObject().
+    connectObject(sig, cb, owner) { this._sigs.push({ sig, cb, owner }); }
+    disconnectObject(owner) { this._sigs = this._sigs.filter(h => h.owner !== owner); }
+    get signalCount() { return this._sigs.length; }
+    /** Closed. Like mutter, no wm 'destroy' effect is implied: that only runs for
+     *  a window visible at the time. 'unmanaged' always fires; the workspace is gone. */
+    unmanage() {
+        if (this._ws) this._ws.windows = this._ws.windows.filter(w => w !== this);
+        this._ws = null;
+        for (const h of [...this._sigs]) if (h.sig === 'unmanaged') h.cb(this);
+    }
+
+    /** meta_window_raise(): mutter calls it on every plain click, focused or not. */
+    raise() { for (const h of [...this._sigs]) if (h.sig === 'raised') h.cb(this); }
 
     get_id() { return this._id; }
     /** Per-session window counter, NOT stable across logins (see mutter docs). */
@@ -238,6 +283,9 @@ export class FakeWindow {
     get_window_type() { return this._type; }
     is_attached_dialog() { return false; }
     is_always_on_all_workspaces() { return false; }
+    is_on_all_workspaces() { return this.sticky; }
+    /** False for a window mutter refuses to minimize (no minimize function). */
+    can_minimize() { return this.canMinimize ?? true; }
     get_user_time() { return this._userTime; }
     get_workspace() { return this._ws; }
     get_compositor_private() { return this._actor; }
@@ -246,7 +294,8 @@ export class FakeWindow {
 
     // Minimize/unminimize are async in the compositor: state flips, but the wm
     // signal is queued until the test flushes it.
-    minimize() { if (this.minimized) return; this.minimized = true; this.pending.push('minimize'); }
+    // Like mutter, a window that can't be minimized refuses (mutter also warns).
+    minimize() { if (this.minimized || !this.can_minimize()) return; this.minimized = true; this.pending.push('minimize'); }
     unminimize() { if (!this.minimized) return; this.minimized = false; this.pending.push('unminimize'); }
 
     change_workspace_by_index(i, _append) { wsm.get_workspace_by_index(i)?.adopt(this); }
@@ -258,6 +307,7 @@ export class FakeWorkspace {
     list_windows() { return [...this.windows]; }
     index() { return wsm.workspaces.indexOf(this); }
     activate() { this.activations++; wsm.activeIndex = this.index(); }
+    get active() { return wsm.get_active_workspace() === this; }
     adopt(win) {
         if (win._ws) win._ws.windows = win._ws.windows.filter(w => w !== win);
         win._ws = this;
@@ -282,7 +332,12 @@ class FakeWorkspaceManager {
         return ws;
     }
     /** Model mutter reaping an empty workspace: indices after it shift down. */
-    removeWorkspace(ws) { this.workspaces = this.workspaces.filter(w => w !== ws); }
+    removeWorkspace(ws) {
+        // Like mutter: the active workspace stays the same object, its index shifts.
+        const active = this.workspaces[this.activeIndex];
+        this.workspaces = this.workspaces.filter(w => w !== ws);
+        this.activeIndex = Math.max(0, this.workspaces.indexOf(active));
+    }
     setActive(ws) { this.activeIndex = this.workspaces.indexOf(ws); }
 }
 
@@ -324,6 +379,7 @@ export const windowManager = new Emitter('window_manager');
 export const display = new Emitter('display');
 export const wsmEmitter = new Emitter('workspace_manager');
 export const stage = new Emitter('stage');
+export const windowGroup = new Emitter('window_group');
 
 /**
  * A stand-in MetaWindowActor: `size` is the actor including shadow margins, and
@@ -362,6 +418,10 @@ export function setFocus(win) {
 }
 
 /** Full isolation between tests: no leaked handlers, no leaked timers. */
+/** The event Clutter is dispatching right now (null outside dispatch). */
+let currentEvent = null;
+export function setCurrentEvent(ev) { currentEvent = ev; }
+
 /** Stage-coordinate pointer position, driven by setPointer() in tests. */
 let pointerPos = [0, 0, 0];
 export function setPointer(x, y, mask = 0) { pointerPos = [x, y, mask]; }
@@ -372,7 +432,9 @@ export function setMonitors(mons, primaryIndex = 0) {
 }
 
 export function resetHarness() {
+    Main.sessionMode.isLocked = false;
     pointerPos = [0, 0, 0];
+    currentEvent = null;
     Main.layoutManager.monitors = [{ x: 0, y: 0, width: 1920, height: 1080, index: 0 }];
     Main.layoutManager.primaryIndex = 0;
     Main.layoutManager.lastWorkAreaIndex = null;
@@ -381,12 +443,16 @@ export function resetHarness() {
     wsmEmitter.clear();
     stage.clear();
     stage._actorAtPos = null;
+    windowGroup.clear();
+    Main.actionMode = Shell.ActionMode.NORMAL;
+    Main.wm.moves = [];
     clock.reset();
     focusedWindow = null;
 }
 
 export const Shell = {
-    ActionMode: { NORMAL: 1, OVERVIEW: 2 },
+    // Real Shell values; POPUP is what a menu grab puts the shell in.
+    ActionMode: { NORMAL: 1, OVERVIEW: 2, POPUP: 128 },
     WindowTracker: {
         get_default: () => ({
             get_window_app: win => win.appId
@@ -428,8 +494,19 @@ export const Main = {
         connectObject: () => {},
         disconnectObject: () => {},
     },
-    wm: { addKeybinding: () => 1, removeKeybinding: () => {} },
+    wm: {
+        addKeybinding: () => 1, removeKeybinding: () => {},
+        // windowManager.js: move the window and follow it, as one animated switch.
+        moves: [],
+        actionMoveWindow(win, ws) {
+            this.moves.push([win, ws]);
+            if (!ws.active) { win.change_workspace(ws); ws.activate(); }
+        },
+    },
     uiGroup: new FakeActor(),
+    actionMode: 1,
+    // True while the lock screen is up; the shell disables extensions then.
+    sessionMode: { isLocked: false },
     // ArcSidebar tracks overview show/hide so it can re-show only the focused
     // window's group on the way out.
     overview: {
@@ -472,6 +549,8 @@ const DEFAULTS = {
     'show-on-empty-workspace': true,
     'toggle-sidebar': [],
     'keybinding-show-desktop': [],
+    'sidebar-hide-when-covered': true,
+    'park-on-desktop-click': true,
     'arc-angle-step': 16,
     'sidebar-layout': 'stack',
     'app-merge-map': '{}',
@@ -518,6 +597,7 @@ export function makeSettings(overrides = {}) {
 export function installGlobals() {
     globalThis.global = {
         window_manager: windowManager,
+        window_group: windowGroup,
         workspace_manager: Object.assign(wsm, {
             connect: (s, cb) => wsmEmitter.connect(s, cb),
             disconnect: id => wsmEmitter.disconnect(id),
@@ -526,6 +606,7 @@ export function installGlobals() {
         }),
         display: Object.assign(display, {
             get_focus_window: () => focusedWindow,
+            list_all_windows: () => [...new Set(wsm.workspaces.flatMap(ws => ws.windows))],
             // Strict on purpose: the real binding takes a gint, so a monitor
             // object built without `index` throws instead of silently reporting
             // "not fullscreen".
@@ -548,6 +629,8 @@ export function installGlobals() {
             // Tests drive this by setting stage._actorAtPos directly; there's
             // no real geometry in this fake, so it can't hit-test from x/y.
             get_actor_at_pos: () => stage._actorAtPos ?? null,
+            // Tests pass events carrying the actor they "came from".
+            get_event_actor: ev => ev?._source ?? null,
         }),
         get_pointer: () => pointerPos,
         get_current_time: () => ++winSeq,

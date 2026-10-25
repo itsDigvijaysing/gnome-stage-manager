@@ -8,7 +8,7 @@ import assert from 'node:assert/strict';
 import {
     Meta, St, Clutter, clock, wsm, windowManager,
     FakeWindow, makeWindowActor, makeSettings, installGlobals, deliver, resetHarness,
-    setFocus, Main, stage, setPointer, setMonitors,
+    setFocus, Main, stage, setPointer, setMonitors, windowGroup, display, Shell, setCurrentEvent,
 } from './stubs.mjs';
 
 installGlobals();
@@ -850,7 +850,7 @@ test('#19 a stage with no windows still yields a sanely sized thumbnail', () => 
 
 /* ═══ snapshots are a fallback for a dead actor, never the default ════ */
 
-test('a swap captures a still for each window it parks', () => {
+test('a swap renders no offscreen copies of the windows it parks', () => {
     const [ws0] = wsm.reset(1);
     wsm.setActive(ws0);
 
@@ -864,62 +864,24 @@ test('a swap captures a still for each window it parks', () => {
 
     const target = sidebar._groups.find(g => g.windows.has(other));
     sidebar._swapToGroup(target);
-    assert.equal(actor.paintCount, 1, 'swap did not capture a still before minimizing');
-    assert.ok(sidebar._snapshots.has(parked), 'no snapshot cached for the parked window');
-
-    // Restoring it invalidates the still.
-    parked.unminimize();
-    deliver(sidebar, [parked]);
-    assert.equal(sidebar._snapshots.has(parked), false,
-        'stale snapshot kept after the window came back');
+    // A full-size texture per window per click, ~8 MB at 1080p, that no card ever drew.
+    assert.equal(actor.paintCount, 0, 'the swap painted a still nothing uses');
 });
 
-test('a window with a usable actor is cloned live, even when parked', () => {
+test('a parked window is cloned live from its actor', () => {
     wsm.reset(1);
     const sidebar = makeSidebar(makeSettings());
-    const w = new FakeWindow('appA', { actor: makeWindowActor() });
-
-    sidebar._captureSnapshot(w);
-    assert.ok(sidebar._snapshots.has(w), 'precondition: a still is cached');
-
-    w.minimized = true;                       // parked, but the actor is fine
+    const actor = makeWindowActor();
+    const w = new FakeWindow('appA', { actor, minimized: true });
     const inner = sidebar._makeWindowClone(w, 170, 110);
-    assert.equal(inner.content, undefined,
-        'used the cached still when a free live clone was available');
-    assert.ok(inner.source, 'expected a live clone of the window actor');
+    assert.equal(inner.source, actor, 'expected a live clone of the window actor');
 });
 
-test('the cached still takes over once the actor is gone', () => {
+test('a window with no actor gets no clone, leaving the icon fallback', () => {
     wsm.reset(1);
     const sidebar = makeSidebar(makeSettings());
-    const w = new FakeWindow('appA', { actor: makeWindowActor() });
-
-    sidebar._captureSnapshot(w);
-    w.minimized = true;
-    w._actor = null;                          // compositor actor went away
-
-    const drawn = sidebar._makeWindowClone(w, 170, 110);
-    assert.ok(drawn, 'should still produce a thumbnail from the cached still');
-    assert.ok(drawn.content && drawn.content.token === 'content-1',
-        'did not fall back to the cached still');
-    // Size must come from the geometry captured at snapshot time (860x660).
-    const scale = Math.min(170 / 860, 110 / 660);
-    assert.equal(drawn.height, Math.round(660 * scale), 'wrong fallback height');
-});
-
-test('the snapshot cache is bounded and evicts oldest first', () => {
-    wsm.reset(1);
-    const sidebar = makeSidebar(makeSettings());
-    const wins = [];
-    for (let i = 0; i < 12; i++) {
-        const w = new FakeWindow(`app${i}`, { actor: makeWindowActor() });
-        wins.push(w);
-        sidebar._captureSnapshot(w);
-    }
-    assert.ok(sidebar._snapshots.size <= 8,
-        `cache grew to ${sidebar._snapshots.size} full-resolution textures`);
-    assert.equal(sidebar._snapshots.has(wins[0]), false, 'oldest entry should have been evicted');
-    assert.ok(sidebar._snapshots.has(wins[11]), 'newest entry should be kept');
+    const w = new FakeWindow('appA');
+    assert.equal(sidebar._makeWindowClone(w, 170, 110), null);
 });
 
 /* ═══ #4: stages past the cap are announced, not dropped silently ═══ */
@@ -1082,6 +1044,61 @@ test('#8 a full maximize still moves, so the tiling guard is not just always-fal
     } finally { mtw.disable(); }
 });
 
+test('maximize moves the window with the shell\'s own move, so it rides the switch animation', () => {
+    const [ws0, ws1] = wsm.reset(2);
+    const a = new FakeWindow('appA'); const sibling = new FakeWindow('appS');
+    ws1.adopt(a); ws1.adopt(sibling);
+    wsm.setActive(ws1);
+    const mtw = new MaximizeToWorkspace(makeSettings({ 'maximize-behavior': 'workspace' }));
+    mtw.enable();
+    try {
+        windowManager.emit('size-change', { meta_window: a }, Meta.SizeChange.MAXIMIZE);
+        clock.advance(100);
+        assert.deepEqual(Main.wm.moves, [[a, ws0]], 'the move must go through Main.wm.actionMoveWindow');
+        assert.equal(wsm.get_active_workspace(), ws0, 'the user must follow the window');
+        windowManager.emit('size-change', { meta_window: a }, Meta.SizeChange.UNMAXIMIZE);
+        clock.advance(100);
+        assert.equal(Main.wm.moves.length, 2, 'the way back must use it too');
+        assert.equal(a.get_workspace(), ws1, 'unmaximize returns the window home');
+        assert.equal(wsm.get_active_workspace(), ws1);
+    } finally { mtw.disable(); }
+});
+
+test('maximize follows the target workspace object even if indices shift before the switch', () => {
+    const [ws0, ws1, ws2, ws3] = wsm.reset(4);
+    const d0 = new FakeWindow('appD0'); const d1 = new FakeWindow('appD1');
+    const a = new FakeWindow('appA'); const sibling = new FakeWindow('appS');
+    ws0.adopt(d0); ws1.adopt(d1); ws2.adopt(a); ws2.adopt(sibling);
+    wsm.setActive(ws2);
+    const mtw = new MaximizeToWorkspace(makeSettings({ 'maximize-behavior': 'workspace' }));
+    mtw.enable();
+    try {
+        windowManager.emit('size-change', { meta_window: a }, Meta.SizeChange.MAXIMIZE);
+        wsm.removeWorkspace(ws0);                 // d0 closed, ws0 reaped: ws3 is now index 2
+        clock.advance(100);
+        assert.equal(a.get_workspace(), ws3, 'window must land on the empty target ws3');
+        assert.equal(wsm.get_active_workspace(), ws3,
+            `switched to ${wsm.get_active_workspace()?.label} instead of the window's workspace`);
+    } finally { mtw.disable(); }
+});
+
+test('a maximize undone before the deferred move leaves the window where it is', () => {
+    const [ws0, ws1] = wsm.reset(2);
+    const a = new FakeWindow('appA'); const sibling = new FakeWindow('appS');
+    ws1.adopt(a); ws1.adopt(sibling);
+    wsm.setActive(ws1);
+    const mtw = new MaximizeToWorkspace(makeSettings({ 'maximize-behavior': 'workspace' }));
+    mtw.enable();
+    try {
+        windowManager.emit('size-change', { meta_window: a }, Meta.SizeChange.MAXIMIZE);
+        windowManager.emit('size-change', { meta_window: a }, Meta.SizeChange.UNMAXIMIZE);
+        clock.advance(100);
+        assert.equal(a.get_workspace(), ws1, 'a double-click flip must not bounce the window');
+        assert.equal(wsm.get_active_workspace(), ws1, 'nor switch workspace');
+        assert.equal(Main.wm.moves.length, 0);
+    } finally { mtw.disable(); }
+});
+
 /* ═══ a rebuild must not strand the sidebar open ════════════════════ */
 
 /** A sidebar with a REAL _refresh(), unlike makeSidebar()'s no-op stub. */
@@ -1118,7 +1135,8 @@ test('a refresh with the pointer still over the panel keeps it open', () => {
         'show-on-empty-workspace': false,
     }));
     try {
-        setPointer(40, 400);   // inside the default 220px left panel
+        sidebar._box.set_size(180, 600);   // the cards, from the top of the column
+        setPointer(40, 400);   // on them
         sidebar._refresh();
 
         assert.equal(sidebar._hovered, true,
@@ -1134,6 +1152,7 @@ test('_pointerOverPanel uses the settled position, not the mid-slide one', () =>
     try {
         // Panel parked off screen, as it is at the start of a reveal.
         sidebar._panel.set_position(-220, 32);
+        sidebar._box.set_size(180, 600);
         setPointer(40, 400);
         assert.ok(sidebar._pointerOverPanel(),
             'a check made mid-slide must use where the panel is going, not where it is');
@@ -1611,6 +1630,97 @@ test('starting a new drag cleans up a stale one that never received a release', 
     assert.equal(stage.count, 1, 'starting a new drag must not leak the previous motion-event handler');
 });
 
+/* ═══ report 2: Arc must be findable ════════════════════════════════ */
+
+function arcFor(pos) {
+    const arc = new ArcSidebar(makeSettings({ 'arc-panel-position': pos }));
+    arc._scaleFactor = 1;
+    arc._monitor = arc._pickMonitor();
+    arc._loadMergeMap(); arc._loadOrderMap(); arc._loadConfig();
+    return arc;
+}
+
+test('the Arc hover strip spans the whole work-area edge, not a 35% slice', () => {
+    wsm.reset(1);
+    const wa = Main.layoutManager.getWorkAreaForMonitor(0);
+    for (const pos of ['left', 'right']) {
+        const g = arcFor(pos)._geo;
+        assert.equal(g.edgeY, wa.y, `${pos}: strip must start at the top of the work area`);
+        assert.equal(g.edgeH, wa.height, `${pos}: strip must run the full work-area height`);
+    }
+    const b = arcFor('bottom')._geo;
+    assert.equal(b.edgeX, wa.x);
+    assert.equal(b.edgeW, wa.width, 'bottom: strip must run the full work-area width');
+});
+
+test('the Arc edge strip hides while Arc is open and returns when it closes', () => {
+    wsm.reset(1);
+    const arc = arcFor('left');
+    arc._buildUI();
+    try {
+        assert.equal(arc._edge.visible, true, 'precondition: strip up while Arc is hidden');
+        arc._showPanel();
+        assert.equal(arc._edge.visible, false,
+            'left up over the open carousel it stole the pointer at the edge and started a hide');
+        arc._hidePanel();
+        assert.equal(arc._edge.visible, true);
+    } finally { arc._destroyUI(); }
+});
+
+test('the Arc edge strip does nothing during fullscreen', () => {
+    wsm.reset(1);
+    const arc = arcFor('left');
+    arc._buildUI();
+    const real = global.display.get_monitor_in_fullscreen;
+    global.display.get_monitor_in_fullscreen = () => true;
+    try {
+        arc._syncEdge();
+        assert.equal(arc._edge.visible, false, 'a 4px strip must not sit over fullscreen video');
+        let shown = 0;
+        arc._showPanel = () => { shown++; };
+        arc._edge.emit('enter-event');
+        clock.advance(2000);
+        assert.equal(shown, 0, 'no reveal while fullscreen');
+    } finally { global.display.get_monitor_in_fullscreen = real; arc._destroyUI(); }
+});
+
+test('Arc peeks on enable when asked, then hides by itself', () => {
+    wsm.reset(1);
+    const arc = new ArcSidebar(makeSettings(), { peek: true });
+    arc.enable();
+    try {
+        assert.equal(arc._isVisible, true, 'a freshly selected Arc must slide in so users see it');
+        clock.advance(3500);
+        assert.equal(arc._isVisible, false, 'and step back out on its own');
+    } finally { arc.disable(); }
+});
+
+test('Arc does not peek unless asked', () => {
+    wsm.reset(1);
+    const arc = new ArcSidebar(makeSettings());
+    arc.enable();
+    try { assert.equal(arc._isVisible, false); } finally { arc.disable(); }
+});
+
+test('Arc peeks once per login and on every explicit switch, not after each unlock', () => {
+    wsm.reset(1);
+    const settings = makeSettings({ 'sidebar-layout': 'arc' });
+    const ext = new StageManagerExtension();
+    ext._fakeSettings = settings;
+
+    ext.enable();
+    assert.equal(ext._side._peekOnEnable, true, 'first enable of the session peeks');
+    ext.disable();
+
+    ext.enable();                                // screen unlock re-enables
+    assert.equal(ext._side._peekOnEnable, false, 'an unlock must not peek again');
+
+    settings.set('sidebar-layout', 'stack');
+    settings.set('sidebar-layout', 'arc');       // user picks Arc again
+    assert.equal(ext._side._peekOnEnable, true, 'an explicit switch always peeks');
+    ext.disable();
+});
+
 /* ═══ ArcSidebar: layout-swap wiring ═════════════════════════════════ */
 
 test('sidebar-layout arc constructs ArcSidebar, not StageSidebar', () => {
@@ -2062,6 +2172,8 @@ test('dragging past the threshold and releasing inside the panel reorders instea
     const containerA = new St.Widget({}); containerA.set_position(0, 0); containerA.set_size(100, 80);
     const containerB = new St.Widget({}); containerB.set_position(0, 200); containerB.set_size(100, 80);
     arc._containers = [containerA, containerB];
+    arc._containerByKey = new Map([['appA', containerA], ['appB', containerB]]);
+    arc._panel = new St.Widget({});   // at the stage origin, so panel and stage coords agree
     arc._onCardPress(containerA, groupA, { get_button: () => 1 });
     arc._onDragMotion({ get_coords: () => [50, 240] });
     const origGetPointer = global.get_pointer;
@@ -2248,6 +2360,364 @@ test('_panel is not clip_to_allocation; cards beyond relIdx=1 legitimately exten
     arc._destroyUI();
 });
 
+/* ═══ report 3: a window under the sidebar must stay clickable ══════ */
+
+/** A maximized-like window: covers the whole left strip below the top bar. */
+const coveringFrame = () => ({ x: 0, y: 32, width: 1920, height: 1048 });
+const clearFrame = () => ({ x: 600, y: 200, width: 600, height: 400 });
+
+test('a window over the sidebar area counts as covering it; one beside it does not', () => {
+    const [ws0] = wsm.reset(1); wsm.setActive(ws0);
+    const w = new FakeWindow('appA', { frame: coveringFrame() }); ws0.adopt(w);
+    const sidebar = realSidebar(makeSettings());
+    try {
+        assert.equal(sidebar._windowCoversPanel(), true);
+        w._frame = clearFrame();
+        assert.equal(sidebar._windowCoversPanel(), false);
+        w._frame = coveringFrame(); w.minimized = true;
+        assert.equal(sidebar._windowCoversPanel(), false, 'a minimized window covers nothing');
+    } finally { sidebar.disable(); }
+});
+
+test('an always-visible sidebar steps aside while a window covers it, and returns when it clears', () => {
+    const [ws0] = wsm.reset(1); wsm.setActive(ws0);
+    const w = new FakeWindow('appA', { frame: coveringFrame() }); ws0.adopt(w);
+    const sidebar = realSidebar(makeSettings({ 'sidebar-auto-hide': false }));
+    try {
+        setPointer(1500, 500);
+        sidebar._syncCovered();
+        clock.advance(1000);
+        assert.equal(sidebar._visible, false,
+            'with a maximized window under it the sidebar must slide out, or it blocks that window');
+
+        w._frame = clearFrame();
+        sidebar._syncCovered();
+        assert.equal(sidebar._visible, true, 'once the area is clear it must come back on its own');
+    } finally { sidebar.disable(); }
+});
+
+test('hide-when-covered never applies while space is reserved for the sidebar', () => {
+    const [ws0] = wsm.reset(1); wsm.setActive(ws0);
+    const w = new FakeWindow('appA', { frame: coveringFrame() }); ws0.adopt(w);
+    const sidebar = realSidebar(makeSettings({ 'sidebar-reserve-space': true }));
+    try {
+        setPointer(1500, 500);
+        sidebar._syncCovered();
+        clock.advance(1000);
+        assert.equal(sidebar._visible, true,
+            'releasing the strut would let windows grow back under the sidebar for good');
+    } finally { sidebar.disable(); }
+});
+
+test('hide-when-covered can be switched off', () => {
+    const [ws0] = wsm.reset(1); wsm.setActive(ws0);
+    const w = new FakeWindow('appA', { frame: coveringFrame() }); ws0.adopt(w);
+    const sidebar = realSidebar(makeSettings({ 'sidebar-hide-when-covered': false }));
+    try {
+        setPointer(1500, 500);
+        sidebar._syncCovered();
+        clock.advance(1000);
+        assert.equal(sidebar._visible, true);
+    } finally { sidebar.disable(); }
+});
+
+test('an edge reveal stays while the pointer rests on the sidebar area and recedes once it leaves', () => {
+    const [ws0] = wsm.reset(1); wsm.setActive(ws0);
+    const w = new FakeWindow('appA', { frame: coveringFrame() }); ws0.adopt(w);
+    const sidebar = realSidebar(makeSettings({ 'sidebar-auto-hide': false }));
+    sidebar._visible = false;
+    try {
+        setPointer(2, 400);              // still on the edge strip after the dwell
+        sidebar._revealFromEdge();
+        clock.advance(3000);
+        assert.equal(sidebar._visible, true, 'must not hide from under a pointer still on it');
+
+        setPointer(1500, 400);           // moved away without touching a card
+        clock.advance(1000);
+        assert.equal(sidebar._visible, false,
+            'the panel is click-through, so no leave-event comes: the timer itself must notice');
+    } finally { sidebar.disable(); }
+});
+
+test('a burst of window signals runs the coverage check once', () => {
+    const [ws0] = wsm.reset(1); wsm.setActive(ws0);
+    const w = new FakeWindow('appA', { frame: coveringFrame() }); ws0.adopt(w);
+    const sidebar = realSidebar(makeSettings());
+    let checks = 0;
+    sidebar._syncCovered = () => { checks++; };
+    sidebar._wire();
+    try {
+        windowManager.emit('size-change', { meta_window: w }, Meta.SizeChange.MAXIMIZE);
+        windowManager.emit('map', { meta_window: w });
+        display.emit('grab-op-end', w, 0);
+        clock.advance(500);
+        assert.equal(checks, 1, `expected one debounced check, got ${checks}`);
+    } finally { sidebar.disable(); }
+});
+
+/* ═══ report 1: clicking the wallpaper parks the current stage ═══════ */
+
+function stageOfTwo(over = {}) {
+    const [ws0] = wsm.reset(1); wsm.setActive(ws0);
+    const a = new FakeWindow('appA', { frame: clearFrame() });
+    const b = new FakeWindow('appB', { frame: clearFrame() });
+    ws0.adopt(a); ws0.adopt(b);
+    const sidebar = new StageSidebar(makeSettings({ 'sidebar-auto-hide': false, ...over }));
+    sidebar._build(); sidebar._wire(); sidebar._initGroups();
+    return { sidebar, a, b };
+}
+const wallpaperPress = (button = 1) =>
+    ({ get_button: () => button, _source: new Meta.BackgroundActor() });
+
+test('clicking the bare wallpaper parks the current stage as ONE card', () => {
+    const { sidebar, a, b } = stageOfTwo();
+    try {
+        stage.emit('button-press-event', wallpaperPress());
+        assert.ok(a.minimized && b.minimized, 'the stage\'s windows must be parked');
+        const parked = sidebar._getInactiveGroups();
+        assert.equal(parked.length, 1, 'parked as one stage, not split per window');
+        assert.equal(parked[0].windows.size, 2);
+    } finally { sidebar.disable(); }
+});
+
+test('a wallpaper click is ignored for right-click, other actors, the overview and menus', () => {
+    for (const [label, press, mode] of [
+        ['right-click', wallpaperPress(3), Shell.ActionMode.NORMAL],
+        ['press on a shell actor', { get_button: () => 1, _source: new St.Widget() }, Shell.ActionMode.NORMAL],
+        ['overview open', wallpaperPress(), Shell.ActionMode.OVERVIEW],
+        ['menu open', wallpaperPress(), Shell.ActionMode.POPUP],
+    ]) {
+        const { sidebar, a, b } = stageOfTwo();
+        Main.actionMode = mode;
+        try {
+            stage.emit('button-press-event', press);
+            assert.ok(!a.minimized && !b.minimized, `${label} must not park the stage`);
+        } finally { sidebar.disable(); Main.actionMode = Shell.ActionMode.NORMAL; }
+    }
+});
+
+const pressEvent = (button = 1) => ({ type: () => Clutter.EventType.BUTTON_PRESS, get_button: () => button });
+
+const BUTTON1 = Clutter.ModifierType.BUTTON1_MASK;
+
+/** A primary press on the DING desktop: focus moves to it while the press dispatches. */
+function pressDesktop(x = 500, y = 500) {
+    setPointer(x, y, 0);             // the button mask is not set yet while the press dispatches
+    setCurrentEvent(pressEvent());
+    setFocus(new FakeWindow('ding', { type: Meta.WindowType.DESKTOP }));
+    display.emit('notify::focus-window');
+    setCurrentEvent(null);
+}
+
+test('clicking Ubuntu desktop icons (a DESKTOP window taking focus) parks the stage', () => {
+    const { sidebar, a, b } = stageOfTwo();
+    try {
+        pressDesktop();
+        setPointer(500, 500, BUTTON1);   // still held
+        clock.advance(200);
+        assert.ok(!a.minimized && !b.minimized, 'nothing may park before the button comes up');
+        setPointer(500, 500, 0);         // released where it was pressed: a click
+        clock.advance(60);
+        assert.ok(a.minimized && b.minimized,
+            'DING takes the click itself, so the focus change is the only signal');
+    } finally { sidebar.disable(); }
+});
+
+test('dragging a file from the desktop onto a window does not park that window', () => {
+    const { sidebar, a, b } = stageOfTwo();
+    try {
+        pressDesktop(500, 500);
+        setPointer(560, 520, BUTTON1);   // dragging the icon away
+        clock.advance(60);
+        setPointer(900, 400, 0);         // dropped on the app window
+        clock.advance(200);
+        assert.ok(!a.minimized && !b.minimized, 'the drop target was minimized under the pointer');
+        assert.equal(sidebar._deskTimer, null, 'the release check must stop once it is a drag');
+    } finally { sidebar.disable(); }
+});
+
+test('a click on a desktop that already has focus (after an icon drag) still parks', () => {
+    const { sidebar, a, b } = stageOfTwo();
+    const desk = () => display.get_focus_window();
+    try {
+        pressDesktop(500, 500);
+        setPointer(900, 400, 0);         // dragged onto the app and dropped
+        clock.advance(200);
+        assert.ok(!a.minimized && !b.minimized, 'precondition: the drag parked nothing');
+        setPointer(500, 500, 0);
+        setCurrentEvent(pressEvent());
+        desk().raise();                  // focus is unchanged, so only the raise is seen
+        setCurrentEvent(null);
+        clock.advance(60);
+        assert.ok(a.minimized && b.minimized, 'the next desktop click did nothing');
+        const d = desk();
+        d.unmanage();
+        assert.equal(d.signalCount, 0, 'a closed desktop window keeps our handlers');
+        assert.ok(!sidebar._sigSources.has(d), 'a closed desktop window stays referenced');
+    } finally { sidebar.disable(); }
+});
+
+test('disable() disconnects the desktop window it watched', () => {
+    const { sidebar } = stageOfTwo();
+    pressDesktop();
+    const d = display.get_focus_window();
+    assert.equal(d.signalCount, 2, 'precondition: raised + unmanaged');
+    sidebar.disable();
+    assert.equal(d.signalCount, 0);
+});
+
+test('a desktop press that ends with focus elsewhere does not park', () => {
+    const { sidebar, a, b } = stageOfTwo();
+    try {
+        pressDesktop();
+        setFocus(a);                      // e.g. the click opened a file in a
+        clock.advance(60);
+        assert.ok(!a.minimized && !b.minimized);
+    } finally { sidebar.disable(); }
+});
+
+test('disable() drops a pending desktop-click check', () => {
+    const { sidebar } = stageOfTwo();
+    pressDesktop();
+    setPointer(500, 500, BUTTON1);
+    assert.ok(sidebar._deskTimer, 'precondition: waiting for the release');
+    sidebar.disable();
+    assert.equal(sidebar._deskTimer, null);
+    assert.equal(sidebar._timers.length, 0);
+});
+
+test('the desktop window gaining focus without a click, or by right-click, does not park', () => {
+    for (const [label, ev] of [['no click (programmatic)', null], ['right-click', pressEvent(3)]]) {
+        const { sidebar, a, b } = stageOfTwo();
+        try {
+            setCurrentEvent(ev);
+            setFocus(new FakeWindow('ding', { type: Meta.WindowType.DESKTOP }));
+            display.emit('notify::focus-window');
+            assert.ok(!a.minimized && !b.minimized, `${label} must not park`);
+        } finally { sidebar.disable(); }
+    }
+});
+
+test('desktop-click parking is groups-only and can be switched off', () => {
+    for (const over of [{ 'sidebar-mode': 'apps' }, { 'park-on-desktop-click': false }]) {
+        const { sidebar, a, b } = stageOfTwo(over);
+        try {
+            stage.emit('button-press-event', wallpaperPress());
+            assert.ok(!a.minimized && !b.minimized, `must not park with ${JSON.stringify(over)}`);
+        } finally { sidebar.disable(); }
+    }
+});
+
+test('the wallpaper handler sits on the stage, not on window_group', () => {
+    const { sidebar } = stageOfTwo();
+    try {
+        // Clutter only bubbles events to REACTIVE actors and the stage, and
+        // window_group is not reactive: a handler there never fires in a real
+        // shell (verified in a nested shell; this stub cannot model picking).
+        assert.equal(windowGroup.count, 0, 'nothing may rely on window_group receiving presses');
+        assert.ok(stage.count > 0, 'the stage must carry the wallpaper handler');
+    } finally { sidebar.disable(); }
+});
+
+test('ending a card drag does not unhook the wallpaper handler', () => {
+    const { sidebar, a, b } = stageOfTwo();
+    try {
+        // _cancelAppDrag() drops every stage handler owned by the sidebar itself.
+        sidebar._startAppDragCandidate({ key: 'x', apps: [], windows: [a] }, null);
+        sidebar._cancelAppDrag();
+        stage.emit('button-press-event', wallpaperPress());
+        assert.ok(a.minimized && b.minimized, 'a finished drag silently disabled desktop-click parking');
+    } finally { sidebar.disable(); }
+});
+
+test('disable() disconnects the wallpaper click handler', () => {
+    const { sidebar } = stageOfTwo();
+    assert.ok(stage.count > 0, 'precondition: handler connected');
+    sidebar.disable();
+    assert.equal(stage.count, 0, 'stage handler leaked past disable()');
+});
+
+test('Show Desktop placeholders are dropped once another stage is shown', () => {
+    const [ws0] = wsm.reset(1); wsm.setActive(ws0);
+    const a = new FakeWindow('appA'); const b = new FakeWindow('appB');
+    ws0.adopt(a); ws0.adopt(b);
+    const sidebar = makeSidebar(makeSettings());
+    sidebar._initGroups();
+    b.minimize(); deliver(sidebar, [b]);             // b parked as its own card
+    for (let i = 0; i < 5; i++) {
+        const parked = sidebar._getInactiveGroups()[0];
+        sidebar._showDesktop(); deliver(sidebar, [a, b].filter(w => w.minimized));
+        sidebar._swapToGroup(parked); deliver(sidebar, [a, b]);
+    }
+    const empty = sidebar._groups.filter(g => g.windows.size === 0);
+    assert.equal(empty.length, 0, `${empty.length} empty stages left behind after 5 Show Desktop round trips`);
+    assert.equal(sidebar._groups.length, 2, 'only the two real stages remain');
+});
+
+/* ═══ restoring a window from the dock / alt-tab ═══════════════════ */
+
+/** Two real stages on one workspace: {c,d} parked by a swap, {a,b} active. */
+function twoStages() {
+    const [ws0] = wsm.reset(1); wsm.setActive(ws0);
+    const c = new FakeWindow('appC'); const d = new FakeWindow('appD');
+    ws0.adopt(c); ws0.adopt(d);
+    const sidebar = makeSidebar(makeSettings());
+    sidebar._initGroups();
+    const stageCD = sidebar._getActiveGroup();
+    // Park {c,d} the way the sidebar does, then open a and b on the fresh stage.
+    sidebar._showDesktop();
+    deliver(sidebar, [c, d]);
+    const a = new FakeWindow('appA'); const b = new FakeWindow('appB');
+    ws0.adopt(a); ws0.adopt(b);
+    sidebar._onWindowMap(a); sidebar._onWindowMap(b);
+    return { sidebar, a, b, c, d, stageCD };
+}
+
+test('restoring a window of a parked stage brings that whole stage forward', () => {
+    const { sidebar, a, b, c, d, stageCD } = twoStages();
+    assert.ok(c.minimized && d.minimized && !a.minimized, 'precondition');
+
+    c.unminimize(); deliver(sidebar, [c]);       // user picks c in the dock
+    deliver(sidebar, [a, b, d]);                 // the swap's own signals arrive
+
+    assert.equal(sidebar._getActiveGroup(), stageCD, 'c\'s stage must become the active one');
+    assert.ok(!d.minimized, 'c\'s stage-mate must come back with it');
+    assert.ok(a.minimized && b.minimized, 'the stage that was on screen must be parked');
+    assert.equal(stageCD.windows.size, 2, 'the restored stage must not be split');
+    assert.ok(c.activated > 0, 'the window the user picked must get focus');
+});
+
+test('restoring a window the user minimized on its own just rejoins the current stage', () => {
+    const [ws0] = wsm.reset(1); wsm.setActive(ws0);
+    const a = new FakeWindow('appA'); const b = new FakeWindow('appB');
+    ws0.adopt(a); ws0.adopt(b);
+    const sidebar = makeSidebar(makeSettings());
+    sidebar._initGroups();
+    const active = sidebar._getActiveGroup();
+
+    b.minimize(); deliver(sidebar, [b]);         // b becomes its own card
+    b.unminimize(); deliver(sidebar, [b]);       // and is restored from the dock
+
+    assert.equal(sidebar._getActiveGroup(), active, 'no stage swap for a lone minimized window');
+    assert.ok(!a.minimized, 'the current stage must stay on screen');
+    assert.ok(active.windows.has(b), 'b rejoins the stage it was minimized from');
+});
+
+test('a lone minimized window shown as a stage becomes a real stage', () => {
+    const [ws0] = wsm.reset(1); wsm.setActive(ws0);
+    const a = new FakeWindow('appA'); const b = new FakeWindow('appB');
+    ws0.adopt(a); ws0.adopt(b);
+    const sidebar = makeSidebar(makeSettings());
+    sidebar._initGroups();
+    b.minimize(); deliver(sidebar, [b]);
+    const lone = sidebar._findGroupForWindow(b);
+    assert.ok(lone.fromMinimize, 'precondition: marked as a minimized window');
+
+    sidebar._swapToGroup(lone);                  // user clicks its card
+    assert.equal(lone.fromMinimize, undefined,
+        'once shown as a stage, parking it again must swap it back whole');
+});
+
 /* ═══ an explicit reveal must not hide itself straight away ═════════ */
 
 test('the keyboard toggle does not auto-hide while the pointer is elsewhere', () => {
@@ -2349,6 +2819,7 @@ test('clicking a multi-window group activates it instead of fanning it open', ()
 
         const grid = arc._containers[0]._grid;
         grid._fanned = false;
+        grid._cards[0].card.emit('button-press-event', { get_button: () => 1 });
         grid._cards[0].card.emit('button-release-event', { get_button: () => 1 });
 
         assert.equal(activated, 1, 'a click must bring the group forward');
@@ -2680,6 +3151,527 @@ test('#10 disable() clears the origin map and _wire() binds size-change', () => 
         '_wire() must connect the window manager for size-change');
     sidebar.disable();
     assert.equal(sidebar._maxOrigin.size, 0, 'disable() must drop every origin record');
+});
+
+/* ═══ the lock screen disables extensions: state must survive it ═══ */
+
+/** Lock (the shell disables every extension) and unlock (enables them again). */
+function lockCycle(ext) {
+    Main.sessionMode.isLocked = true;
+    ext.disable();
+    Main.sessionMode.isLocked = false;
+    ext.enable();
+}
+
+test('a parked stage survives the lock screen whole, not split per app', () => {
+    const [ws0] = wsm.reset(1); wsm.setActive(ws0);
+    const a = new FakeWindow('appA'); const b = new FakeWindow('appB');
+    const c = new FakeWindow('appC', { minimized: true });
+    [a, b, c].forEach(w => ws0.adopt(w));
+    const ext = new StageManagerExtension();
+    ext._fakeSettings = makeSettings();
+    ext.enable();
+    try {
+        const before = ext._side;
+        before._swapToGroup(before._findGroupForWindow(c));   // park {a,b}, show {c}
+        deliver(before, [a, b, c]);
+        lockCycle(ext);
+        const side = ext._side;
+        assert.notEqual(side, before, 'precondition: a fresh sidebar after unlock');
+        const ab = side._findGroupForWindow(a);
+        assert.ok(ab?.windows.has(b), 'the parked stage {a,b} was split by the lock screen');
+        assert.ok(!ab.fromMinimize, 'it must still swap back as a stage, not as lone windows');
+        assert.equal(side._getActiveGroup(), side._findGroupForWindow(c), 'c stays the stage on screen');
+    } finally { ext.disable(); }
+});
+
+test('a window closed while locked drops out of its restored stage', () => {
+    const [ws0] = wsm.reset(1); wsm.setActive(ws0);
+    const a = new FakeWindow('appA'); const b = new FakeWindow('appB');
+    const c = new FakeWindow('appC', { minimized: true });
+    [a, b, c].forEach(w => ws0.adopt(w));
+    const ext = new StageManagerExtension();
+    ext._fakeSettings = makeSettings();
+    ext.enable();
+    try {
+        ext._side._swapToGroup(ext._side._findGroupForWindow(c));
+        deliver(ext._side, [a, b, c]);
+        Main.sessionMode.isLocked = true;
+        ext.disable();
+        b.unmanage();                      // the app quit while the screen was locked
+        Main.sessionMode.isLocked = false;
+        ext.enable();
+        const ab = ext._side._findGroupForWindow(a);
+        assert.ok(ab && !ab.windows.has(b) && ab.windows.size === 1);
+    } finally { ext.disable(); }
+});
+
+test('turning the extension off keeps nothing; only the lock screen does', () => {
+    wsm.reset(1);
+    const ext = new StageManagerExtension();
+    ext._fakeSettings = makeSettings();
+    ext.enable();
+    ext.disable();
+    assert.equal(ext._lockState, null, 'state kept past a real disable');
+});
+
+test('a window maximized onto its own workspace still goes home after the lock screen', () => {
+    const [ws0, ws1] = wsm.reset(2);
+    const a = new FakeWindow('appA'); const s = new FakeWindow('appS');
+    ws0.adopt(a); ws0.adopt(s); wsm.setActive(ws0);
+    const ext = new StageManagerExtension();
+    ext._fakeSettings = makeSettings({ 'maximize-behavior': 'workspace' });
+    ext.enable();
+    try {
+        windowManager.emit('size-change', { meta_window: a }, Meta.SizeChange.MAXIMIZE);
+        clock.advance(100);
+        assert.equal(a.get_workspace(), ws1, 'precondition: moved to its own workspace');
+        lockCycle(ext);
+        windowManager.emit('size-change', { meta_window: a }, Meta.SizeChange.UNMAXIMIZE);
+        clock.advance(100);
+        assert.equal(a.get_workspace(), ws0, 'unmaximize after an unlock stranded the window');
+    } finally { ext.disable(); }
+});
+
+test('maximize origins are dropped, not misapplied, if workspaces changed while locked', () => {
+    const [ws0, ws1] = wsm.reset(2);
+    const a = new FakeWindow('appA'); const s = new FakeWindow('appS');
+    ws0.adopt(a); ws0.adopt(s); wsm.setActive(ws0);
+    const mtw = new MaximizeToWorkspace(makeSettings(), { n: 3, origins: [[a.get_stable_sequence(), 0]] });
+    mtw.enable();
+    try {
+        assert.equal(mtw._origin.size, 0, 'an index from a different workspace layout was trusted');
+    } finally { mtw.disable(); }
+    void ws1;
+});
+
+test('Arc keeps its drag-made groups across the lock screen', () => {
+    const [ws0] = wsm.reset(1); wsm.setActive(ws0);
+    const a = new FakeWindow('appA'); const b = new FakeWindow('appB');
+    ws0.adopt(a); ws0.adopt(b);
+    const ext = new StageManagerExtension();
+    ext._fakeSettings = makeSettings({ 'sidebar-layout': 'arc' });
+    ext.enable();
+    try {
+        ext._side._mergeApps(arc0WindowKey(a), arc0WindowKey(b));
+        const merged = [...ext._side._mergeMap];
+        lockCycle(ext);
+        assert.deepEqual([...ext._side._mergeMap], merged, 'drag-made groups vanished on unlock');
+    } finally { ext.disable(); }
+});
+
+/* ═══ a window closed while not on screen ═════════════════════════ */
+
+test('closing a window that was maximized away forgets it (mutter sends no destroy hook)', () => {
+    const [ws0, ws1] = wsm.reset(2);
+    const a = new FakeWindow('appA'); const s = new FakeWindow('appS');
+    ws0.adopt(a); ws0.adopt(s); wsm.setActive(ws0);
+    const mtw = new MaximizeToWorkspace(makeSettings({ 'maximize-behavior': 'workspace' }));
+    mtw.enable();
+    try {
+        windowManager.emit('size-change', { meta_window: a }, Meta.SizeChange.MAXIMIZE);
+        clock.advance(100);
+        wsm.setActive(ws0);              // user went back; a sits alone on ws1
+        a.unmanage();
+        assert.equal(mtw._origin.size, 0, 'the closed window is still held in the origin map');
+        assert.equal(a.signalCount, 0, 'its unmanaged handler was left connected');
+        assert.ok(!mtw._sigSources.has(a));
+    } finally { mtw.disable(); }
+    void ws1;
+});
+
+test('a window closed while parked leaves its stage', () => {
+    const { sidebar, c, d, stageCD } = twoStages();
+    sidebar._wire();
+    try {
+        c.unmanage(); d.unmanage();      // quit from the dock: no wm destroy for hidden windows
+        display.emit('restacked');
+        clock.advance(200);
+        assert.ok(!sidebar._groups.includes(stageCD), 'a stage of closed windows kept its card');
+        assert.equal(sidebar._findGroupForWindow(c), null);
+    } finally { sidebar.disable(); }
+});
+
+/* ═══ windows changed during a workspace switch (no wm hooks) ═══════ */
+
+test('a parked window restored with no unminimize signal still brings its stage forward', () => {
+    const { sidebar, a, b, d, stageCD } = twoStages();
+    const c = [...stageCD.windows].find(w => w.appId === 'appC');
+    sidebar._wire();
+    try {
+        // Alt-tab from another workspace: mutter unminimizes during the switch
+        // animation and skips the effect hook, so only the restack is seen.
+        c.minimized = false;
+        display.emit('restacked');
+        clock.advance(200);
+        deliver(sidebar, [a, b, d]);
+        assert.equal(sidebar._getActiveGroup(), stageCD, 'the restored window\'s stage must be the one on screen');
+        assert.ok(!d.minimized, 'its stage-mate comes back with it');
+        assert.ok(a.minimized && b.minimized, 'the other stage is parked, not left showing under it');
+    } finally { sidebar.disable(); }
+});
+
+test('a window minimized with no signal is parked, not counted on screen', () => {
+    const [ws0] = wsm.reset(1); wsm.setActive(ws0);
+    const a = new FakeWindow('appA'); const b = new FakeWindow('appB');
+    ws0.adopt(a); ws0.adopt(b);
+    const sidebar = makeSidebar(makeSettings());
+    sidebar._wire(); sidebar._initGroups();
+    try {
+        b.minimized = true;
+        display.emit('restacked');
+        clock.advance(200);
+        assert.ok(!sidebar._isActiveGroup(sidebar._findGroupForWindow(b)), 'b would have had no card');
+        assert.ok(sidebar._isActiveGroup(sidebar._findGroupForWindow(a)));
+    } finally { sidebar.disable(); }
+});
+
+test('a window opened with no map signal joins the stage on screen', () => {
+    const [ws0] = wsm.reset(1); wsm.setActive(ws0);
+    const a = new FakeWindow('appA'); ws0.adopt(a);
+    const sidebar = makeSidebar(makeSettings());
+    sidebar._wire(); sidebar._initGroups();
+    try {
+        const n = new FakeWindow('appN'); ws0.adopt(n);
+        display.emit('restacked');
+        clock.advance(200);
+        assert.ok(sidebar._getActiveGroup().windows.has(n), 'the new window belonged to no stage');
+    } finally { sidebar.disable(); }
+});
+
+test('a window that cannot be minimized never flips the stage back', () => {
+    const [ws0] = wsm.reset(1); wsm.setActive(ws0);
+    const a = new FakeWindow('appA'); const pinned = new FakeWindow('appP');
+    pinned.canMinimize = false;
+    const c = new FakeWindow('appC', { minimized: true });
+    [a, pinned, c].forEach(w => ws0.adopt(w));
+    const sidebar = makeSidebar(makeSettings());
+    sidebar._wire(); sidebar._initGroups();
+    try {
+        const target = sidebar._findGroupForWindow(c);
+        sidebar._swapToGroup(target);
+        deliver(sidebar, [a, c]);
+        clock.advance(3000);             // past the swap's expectation window
+        display.emit('restacked');
+        clock.advance(200);
+        assert.equal(sidebar._getActiveGroup(), target, 'the user\'s swap was undone');
+        assert.equal(pinned.minimized, false);
+    } finally { sidebar.disable(); }
+});
+
+test('switching sidebar-mode away and back re-derives who is parked', () => {
+    const [ws0] = wsm.reset(1); wsm.setActive(ws0);
+    const a = new FakeWindow('appA'); const b = new FakeWindow('appB');
+    const c = new FakeWindow('appC', { minimized: true });
+    [a, b, c].forEach(w => ws0.adopt(w));
+    const settings = makeSettings();
+    const sidebar = makeSidebar(settings);
+    sidebar._wire(); sidebar._initGroups();
+    try {
+        settings.set('sidebar-mode', 'all-windows');
+        b.minimize(); c.unminimize(); deliver(sidebar, [b, c]);   // not tracked in this mode
+        settings.set('sidebar-mode', 'groups');
+        assert.ok(!sidebar._isActiveGroup(sidebar._findGroupForWindow(b)), 'b is minimized but still counted on screen');
+        assert.ok(sidebar._isActiveGroup(sidebar._findGroupForWindow(c)), 'c is on screen but still drawn as a card');
+    } finally { sidebar.disable(); }
+});
+
+/* ═══ windows on every workspace belong to no stage ═════════════════ */
+
+test('a window stuck to all workspaces never joins a stage or gets minimized by one', () => {
+    const [ws0] = wsm.reset(1); wsm.setActive(ws0);
+    const a = new FakeWindow('appA'); const pip = new FakeWindow('pip', { sticky: true });
+    ws0.adopt(a); ws0.adopt(pip);
+    const sidebar = makeSidebar(makeSettings());
+    sidebar._initGroups();
+    assert.equal(sidebar._findGroupForWindow(pip), null, 'a window on every workspace joined one stage');
+    sidebar._showDesktop();
+    assert.equal(pip.minimized, false, 'a stage swap minimized a window shown on every workspace');
+});
+
+test('a window stuck after joining a stage is released from it', () => {
+    const [ws0] = wsm.reset(1); wsm.setActive(ws0);
+    const a = new FakeWindow('appA'); const b = new FakeWindow('appB');
+    ws0.adopt(a); ws0.adopt(b);
+    const sidebar = makeSidebar(makeSettings());
+    sidebar._wire(); sidebar._initGroups();
+    try {
+        b.sticky = true;                 // "Always on Visible Workspace" from the window menu
+        display.emit('restacked');
+        clock.advance(200);
+        assert.equal(sidebar._findGroupForWindow(b), null);
+    } finally { sidebar.disable(); }
+});
+
+/* ═══ auto-hide: the card column drives hover ═══════════════════════ */
+
+const crossing = related => ({ get_related: () => related });
+
+test('leaving the card column through its blank space still hides an auto-hide sidebar', () => {
+    wsm.reset(1);
+    const sidebar = realSidebar(makeSettings({ 'sidebar-auto-hide': true, 'show-on-empty-workspace': false }));
+    try {
+        sidebar._box.emit('enter-event', crossing(null));
+        assert.equal(sidebar._hovered, true, 'entering the cards must count as hover');
+        sidebar._box.emit('leave-event', crossing(sidebar._box));   // card → gap between cards
+        assert.equal(sidebar._hovered, true, 'a move inside the column is not leaving it');
+        setPointer(1500, 500);
+        sidebar._box.emit('leave-event', crossing(new St.Widget()));   // out to the window
+        assert.equal(sidebar._hovered, false, 'hover stuck on after the pointer left the column');
+        clock.advance(1000);
+        assert.equal(sidebar._visible, false, 'the sidebar stayed open over the window');
+    } finally { sidebar.disable(); }
+});
+
+test('a pointer resting below the cards does not hold an auto-hide sidebar open', () => {
+    wsm.reset(1);
+    const sidebar = realSidebar(makeSettings({ 'sidebar-auto-hide': true, 'show-on-empty-workspace': false }));
+    try {
+        sidebar._panel.set_position(0, 32);   // settled
+        sidebar._box.set_position(20, 0);
+        sidebar._box.set_size(180, 300);      // two cards at the top of the column
+        setPointer(100, 200);
+        sidebar._scheduleHide();
+        clock.advance(1000);
+        assert.equal(sidebar._visible, true, 'a pointer on the cards must keep it open');
+        setPointer(100, 900);                 // same column, below the cards: over the window
+        clock.advance(1000);
+        assert.equal(sidebar._visible, false, 'the empty part of the column held the sidebar open');
+    } finally { sidebar.disable(); }
+});
+
+test('hiding by hand stops a pending auto-hide timer', () => {
+    wsm.reset(1);
+    const sidebar = realSidebar(makeSettings({ 'sidebar-auto-hide': true, 'show-on-empty-workspace': false }));
+    try {
+        setPointer(2, 400);                   // on the edge strip: the timer keeps re-arming
+        sidebar._scheduleHide();
+        sidebar._hide();
+        assert.equal(sidebar._hideTimer, null, 'a timer kept firing for a sidebar already hidden');
+    } finally { sidebar.disable(); }
+});
+
+/* ═══ hidden means hidden: the parked spot can be on another monitor ═══ */
+
+/** Make an actor's ease finish at once, as Clutter does when the transition ends. */
+function easeFinishes(actor) {
+    actor.ease = p => {
+        if ('x' in p) actor.set_position(p.x, p.y);
+        p.onComplete?.();
+    };
+}
+
+test('the hidden Stack panel is not drawn, so it cannot sit on a monitor to the left', () => {
+    setMonitors([{ x: 0, y: 0, width: 1920, height: 1080, index: 0 },
+        { x: 1920, y: 0, width: 1920, height: 1080, index: 1 }], 1);
+    wsm.reset(1);
+    const sidebar = new StageSidebar(makeSettings({ 'sidebar-auto-hide': true, 'show-on-empty-workspace': false }));
+    sidebar._build();
+    try {
+        assert.equal(sidebar._panel.visible, false, 'built hidden, it was drawn at its parked spot');
+        easeFinishes(sidebar._panel);
+        sidebar._show();
+        assert.equal(sidebar._panel.visible, true);
+        sidebar._hide();
+        assert.equal(sidebar._panel.x, 1700, 'precondition: parked on the left monitor\'s edge');
+        assert.equal(sidebar._panel.visible, false, 'its cards stayed drawn and clickable there');
+    } finally { sidebar.disable(); }
+});
+
+test('a reveal that interrupts the slide-out shows the panel again', () => {
+    wsm.reset(1);
+    const sidebar = new StageSidebar(makeSettings({ 'sidebar-auto-hide': true, 'show-on-empty-workspace': false }));
+    sidebar._build();
+    try {
+        sidebar._show();
+        sidebar._hide();                      // ease never completes: interrupted
+        sidebar._show();
+        assert.equal(sidebar._panel.visible, true);
+    } finally { sidebar.disable(); }
+});
+
+test('the hidden Arc panel is not drawn or clickable where it parks', () => {
+    wsm.reset(1);
+    const arc = new ArcSidebar(makeSettings());
+    arc.enable();
+    try {
+        assert.equal(arc._panel.visible, false, 'built hidden, Arc was drawn at its parked spot');
+        easeFinishes(arc._panel);
+        arc._showPanel();
+        assert.equal(arc._panel.visible, true);
+        arc._hidePanel();
+        assert.equal(arc._panel.visible, false, 'faded out but still reactive: an invisible strip ate clicks');
+    } finally { arc.disable(); }
+});
+
+/* ═══ Show Desktop leaves the sidebar up ═════════════════════════════ */
+
+test('Show Desktop with auto-hide on brings the sidebar up over the empty desktop', () => {
+    const { sidebar, a, b } = stageOfTwo({ 'sidebar-auto-hide': true });
+    try {
+        sidebar._showDesktop();
+        assert.ok(a.minimized && b.minimized, 'precondition');
+        assert.equal(sidebar._visible, true, 'every window vanished and the sidebar stayed hidden');
+    } finally { sidebar.disable(); }
+});
+
+/* ═══ maximize-to-workspace vs Ubuntu's tiling-assistant ═════════════ */
+
+test('a re-tile by tiling-assistant during our move does not bounce the window', () => {
+    const [ws0, ws1] = wsm.reset(2);
+    const a = new FakeWindow('appA'); const s = new FakeWindow('appS');
+    ws0.adopt(a); ws0.adopt(s); wsm.setActive(ws0);
+    const mtw = new MaximizeToWorkspace(makeSettings({ 'maximize-behavior': 'workspace' }));
+    mtw.enable();
+    // tiling-assistant re-tiles a window whose workspace changed: unmaximize, maximize.
+    const move = a.change_workspace.bind(a);
+    a.change_workspace = ws => {
+        move(ws);
+        windowManager.emit('size-change', { meta_window: a }, Meta.SizeChange.UNMAXIMIZE);
+        windowManager.emit('size-change', { meta_window: a }, Meta.SizeChange.MAXIMIZE);
+    };
+    try {
+        windowManager.emit('size-change', { meta_window: a }, Meta.SizeChange.MAXIMIZE);
+        clock.advance(500);
+        assert.equal(Main.wm.moves.length, 1, `the window was moved ${Main.wm.moves.length} times`);
+        assert.equal(a.get_workspace(), ws1);
+        assert.equal(wsm.get_active_workspace(), ws1);
+        a.change_workspace = move;
+        windowManager.emit('size-change', { meta_window: a }, Meta.SizeChange.UNMAXIMIZE);
+        clock.advance(100);
+        assert.equal(a.get_workspace(), ws0, 'it must still go home on unmaximize');
+    } finally { mtw.disable(); }
+});
+
+/* ═══ past the card cap, the newest stages keep their cards ══════════ */
+
+test('past the card cap, the window just minimized gets a card and the oldest is folded away', () => {
+    const [ws0] = wsm.reset(1); wsm.setActive(ws0);
+    const wins = Array.from({ length: 10 }, (_, i) => new FakeWindow(`app${i}`));
+    wins.forEach(w => ws0.adopt(w));
+    const sidebar = makeSidebar(makeSettings());
+    sidebar._initGroups();
+    for (const w of wins.slice(1)) { w.minimize(); deliver(sidebar, [w]); }   // 9 parked stages
+    const shown = sidebar._shownInactiveGroups();
+    assert.equal(shown.length, 8);
+    assert.ok(shown.includes(sidebar._findGroupForWindow(wins[9])), 'the newest parked stage had no card');
+    assert.ok(!shown.includes(sidebar._findGroupForWindow(wins[1])), 'the oldest should be the one behind +1');
+    assert.deepEqual(shown, sidebar._getInactiveGroups().filter(g => shown.includes(g)), 'cards keep their order');
+});
+
+/* ═══ Arc: scrolling, clicks, reorder, new windows, hidden refresh ═══ */
+
+function arcOf(n, over = {}) {
+    const [ws0] = wsm.reset(1); wsm.setActive(ws0);
+    const wins = Array.from({ length: n }, (_, i) => new FakeWindow(`app${i}`));
+    wins.forEach(w => ws0.adopt(w));
+    const arc = arcWithGroups(makeSettings(over));
+    arc._isVisible = true;
+    arc._buildGroups();
+    arc._redraw();
+    return { arc, wins };
+}
+
+test('Arc: scrolling past the cards built at the last redraw builds the ones coming into view', () => {
+    const { arc } = arcOf(12);
+    try {
+        assert.ok(!arc._containerByKey.has(arc._groups[9].key), 'precondition: card 9 not built at offset 0');
+        arc._offset = 9;
+        arc._updatePositions();
+        const c = arc._containerByKey.get(arc._groups[9].key);
+        assert.ok(c && c.visible, 'the front slot was empty after the scroll');
+        const order = arc._containers.map(k => k._idx);
+        assert.deepEqual(order, [...order].sort((x, y) => x - y), 'cards must stay in group order');
+    } finally { arc.disable(); }
+});
+
+test('Arc: a release after the drag poll already resolved the press does nothing more', () => {
+    const { arc, wins } = arcOf(2);
+    try {
+        let activations = 0;
+        arc._activateGroup = () => { activations++; };
+        const card = arc._containers[0]._grid._cards[0].card;
+        card.emit('button-press-event', { get_button: () => 1 });
+        setPointer(0, 0, 0);                  // Wayland clears the button before the release arrives
+        clock.advance(60);                    // the poll resolves it
+        card.emit('button-release-event', { get_button: () => 1 });
+        assert.equal(activations, 1, `one click activated ${activations} times`);
+    } finally { arc.disable(); }
+    void wins;
+});
+
+test('Arc: a click resolved by the drag poll focuses the window that was clicked', () => {
+    const { arc } = arcOf(1);
+    try {
+        let focus = null;
+        arc._activateGroup = (_g, win) => { focus = win; };
+        const { card, win } = arc._containers[0]._grid._cards[0];
+        card.emit('button-press-event', { get_button: () => 1 });
+        setPointer(0, 0, 0);
+        clock.advance(60);
+        assert.equal(focus, win);
+    } finally { arc.disable(); }
+});
+
+test('Arc: activating a card never focuses the app\'s window from another card', () => {
+    const [ws0] = wsm.reset(1); wsm.setActive(ws0);
+    const b1 = new FakeWindow('brave'); const b2 = new FakeWindow('brave', { minimized: true });
+    ws0.adopt(b1); ws0.adopt(b2);
+    const arc = arcWithGroups();
+    try {
+        setFocus(b1);
+        arc._trackFocus();                    // lastFocused for 'brave' = b1
+        arc._buildGroups();
+        const cardB2 = arc._groups.find(g => g.windows.includes(b2));
+        const before = b1.activated;
+        arc._activateGroup(cardB2);
+        assert.equal(b1.activated, before, 'b1 (another card) was brought back');
+        assert.ok(b2.activated > 0, 'the card\'s own window must get focus');
+    } finally { arc.disable(); }
+});
+
+test('Arc: reorder picks the target in group order and in the panel\'s coordinates', () => {
+    const { arc } = arcOf(12);
+    try {
+        arc._offset = 9;
+        arc._updatePositions();
+        arc._panel.set_position(0, 32);       // below the top bar: panel y ≠ stage y
+        const src = arc._groups[9];
+        const target = arc._containerByKey.get(arc._groups[10].key);
+        const [tx, ty] = target.get_transformed_position();
+        arc._reorderGroup(src, tx + target.width / 2, ty + target.height / 2);
+        const order = [...arc._orderMap].sort((p, q) => p[1] - q[1]).map(([k]) => k);
+        assert.equal(order.indexOf(src.key), 10, `dropped on card 10, landed at ${order.indexOf(src.key)}`);
+    } finally { arc.disable(); }
+});
+
+test('Arc keep-visible off: windows opened together do not minimize each other', () => {
+    const [ws0] = wsm.reset(1); wsm.setActive(ws0);
+    const old = new FakeWindow('appOld'); ws0.adopt(old);
+    const arc = arcWithGroups(makeSettings({ 'arc-keep-visible': false }));
+    try {
+        const n1 = new FakeWindow('appN1'); const n2 = new FakeWindow('appN2');
+        [n1, n2].forEach(w => { w.get_transient_for = () => null; ws0.adopt(w); });
+        arc._onWindowCreated(n1); arc._onWindowCreated(n2);
+        clock.advance(250);
+        assert.ok(!n1.minimized && !n2.minimized, 'the app opened with nothing on screen');
+        assert.ok(old.minimized, 'the older window still steps aside');
+    } finally { arc.disable(); }
+});
+
+test('Arc does not rebuild its cards while hidden, and redraws on the way in', () => {
+    const { arc } = arcOf(3);
+    try {
+        arc._isVisible = false;
+        let redraws = 0;
+        const redraw = arc._redraw.bind(arc);
+        arc._redraw = () => { redraws++; redraw(); };
+        arc._scheduleRefresh();
+        clock.advance(100);
+        assert.equal(redraws, 0, 'rebuilt every card for a carousel nobody can see');
+        arc._showPanel();
+        assert.equal(redraws, 1, 'the reveal must redraw what was skipped');
+    } finally { arc.disable(); }
 });
 
 /* ── report ──────────────────────────────────────────────────────────── */

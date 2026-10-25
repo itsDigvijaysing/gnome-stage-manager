@@ -25,9 +25,11 @@ Group windows into stages: only one group is visible at a time, others appear as
 - **Window Count Badge**: Optional badge showing how many windows are in each group.
 - **Live Previews**: Hover a card to see a larger preview of all windows in the group, tiled vertically.
 - **Icon Fallback**: Minimized windows that can't be cloned show app icon grids instead.
-- **Transparent Sidebar**: No dark bar; each card has its own frosted-glass pill background, and the empty space around the cards passes clicks straight through to the window underneath.
+- **Transparent Sidebar**: No dark bar; each card has its own frosted-glass pill background, and the space beside the card column passes clicks straight through to the window underneath (gaps between cards stay part of the column, so it can scroll). A window that covers the sidebar makes it step aside.
 - **Adaptive Cards**: Thumbnails take their size from the sidebar width and their shape from the window they show, so they fit any display density and any window aspect.
-- **Auto-hide**: Off by default (macOS behavior: always visible). Toggle on for hover-to-reveal.
+- **Auto-hide**: Off by default (macOS behavior). The sidebar stays up, but steps aside while a window covers its area so that window stays fully clickable; move the pointer to the screen edge to bring it back. Toggle auto-hide on for hover-to-reveal only.
+- **Click the Desktop**: In Groups mode, clicking the empty desktop parks the current stage as one card, like clicking the wallpaper on macOS.
+- **Stages Stay Whole**: Restoring a window from the dock or alt-tab brings its whole stage forward instead of pulling that one window out of it.
 - **Fullscreen Aware**: Sidebar hides instantly when any window goes fullscreen.
 - **App Icons**: Each card shows app icons below the thumbnail.
 
@@ -109,7 +111,9 @@ Or click the gear icon in Extension Manager.
 |---------|---------|-------------|
 | When a Window Is Maximized | Do nothing | Do nothing, move it to a new workspace, or give it its own stage (Stack layout + Groups mode) |
 | Sidebar Content | Groups | Groups (Stage Manager), Apps (per-app focus), Workspaces, or All Windows |
-| Auto-hide Sidebar | Off | Off = always visible (macOS default). On = hover to reveal |
+| Auto-hide Sidebar | Off | Off = shown, stepping aside when a window covers it (macOS default). On = hover to reveal |
+| Hide When a Window Covers It | On | The sidebar slides out while a window sits under it, so that window stays clickable (Stack; no effect with Reserve Space on) |
+| Park Stage on Desktop Click | On | Clicking the empty desktop minimizes the current stage into one card (Stack, Groups mode) |
 | Reserve Space for Sidebar | Off | Maximized windows stop at the sidebar instead of being covered (needs auto-hide off) |
 | Show App Icons | On | Display app icons below thumbnails |
 | Show Window Count Badge | On | Show number of windows on group thumbnails |

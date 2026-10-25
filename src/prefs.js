@@ -101,7 +101,7 @@ export default class StageManagerPreferences extends ExtensionPreferences {
         // never reserves struts — both rows are Stack-only.
         const autoHideSwitch = new Adw.SwitchRow({
             title: _('Auto-hide Sidebar'),
-            subtitle: _('Off = always visible (macOS default). On = hover to reveal.'),
+            subtitle: _('Off = shown, stepping aside when a window covers it (macOS default). On = hover to reveal.'),
         });
         settings.bind('sidebar-auto-hide', autoHideSwitch, 'active', Gio.SettingsBindFlags.DEFAULT);
         sideGroup.add(autoHideSwitch);
@@ -185,6 +185,23 @@ export default class StageManagerPreferences extends ExtensionPreferences {
         });
         settings.bind('show-on-empty-workspace', emptyWsSwitch, 'active', Gio.SettingsBindFlags.DEFAULT);
         smartGroup.add(emptyWsSwitch);
+
+        // Both Stack-only: Arc has its own persistent mode and never parks stages.
+        const coveredSwitch = new Adw.SwitchRow({
+            title: _('Hide When a Window Covers It'),
+            subtitle: _('The sidebar slides out while a window sits under it, so that window stays clickable. Reveal it from the screen edge.'),
+        });
+        settings.bind('sidebar-hide-when-covered', coveredSwitch, 'active', Gio.SettingsBindFlags.DEFAULT);
+        smartGroup.add(coveredSwitch);
+        this._bindLayoutSensitivity(coveredSwitch, settings, 'stack');
+
+        const desktopClickSwitch = new Adw.SwitchRow({
+            title: _('Park Stage on Desktop Click'),
+            subtitle: _('Clicking the empty desktop minimizes the current stage into one card (Groups mode)'),
+        });
+        settings.bind('park-on-desktop-click', desktopClickSwitch, 'active', Gio.SettingsBindFlags.DEFAULT);
+        smartGroup.add(desktopClickSwitch);
+        this._bindLayoutSensitivity(desktopClickSwitch, settings, 'stack');
 
         // Shortcuts
         const shortcutGroup = new Adw.PreferencesGroup({
