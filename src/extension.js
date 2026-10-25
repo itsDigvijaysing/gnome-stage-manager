@@ -1290,8 +1290,10 @@ class StageSidebar {
     /** Windows of `group` still on its workspace, most recent first — a window
      *  dragged elsewhere is skipped rather than minimized/cloned from the wrong stage. */
     _groupWindows(group) {
+        // _isNormal() again: DING turns its window into the desktop only once its
+        // title arrives, so it can join a stage first and must not count after.
         return [...group.windows]
-            .filter(w => w.get_workspace() === group.ws)
+            .filter(w => w.get_workspace() === group.ws && _isNormal(w))
             .sort((a, b) => (b.get_user_time() || 0) - (a.get_user_time() || 0));
     }
 

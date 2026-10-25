@@ -2557,6 +2557,29 @@ test('a click on a desktop that already has focus (after an icon drag) still par
     } finally { sidebar.disable(); }
 });
 
+test('a window that becomes the desktop after joining a stage (DING) never shows as a card', () => {
+    const [ws0] = wsm.reset(1); wsm.setActive(ws0);
+    const ding = new FakeWindow('ding', { frame: clearFrame() });   // NORMAL until its title arrives
+    const b = new FakeWindow('appB', { frame: clearFrame() });
+    ws0.adopt(ding); ws0.adopt(b);
+    const sidebar = new StageSidebar(makeSettings({ 'sidebar-auto-hide': false }));
+    sidebar._build(); sidebar._wire(); sidebar._initGroups();
+    try {
+        assert.ok(sidebar._findGroupForWindow(ding), 'precondition: it joined while still normal');
+        ding._type = Meta.WindowType.DESKTOP;       // DING's title parsed: no stacking change
+        sidebar._showDesktop();
+        const [parked] = sidebar._getInactiveGroups();
+        assert.deepEqual(sidebar._groupWindows(parked), [b], 'the desktop rode along in the card');
+        b.unmanage();                               // the last app window closes
+        display.emit('restacked');
+        clock.advance(200);
+        assert.equal(sidebar._getInactiveGroups().length, 0,
+            'with no window open, a card for the desktop window remained');
+        sidebar._showDesktop();
+        assert.equal(sidebar._getInactiveGroups().length, 0, 'parking the bare desktop made a card');
+    } finally { sidebar.disable(); }
+});
+
 test('disable() disconnects the desktop window it watched', () => {
     const { sidebar } = stageOfTwo();
     pressDesktop();

@@ -268,7 +268,7 @@ itself; it happens with this extension disabled too and is harmless.
 
 - [ ] Improve Arc Mode for Better Hover & App Selection
 - [ ] Merge Both Modes and have core Appearance Section
-- [ ] Empty System App Appears if no window is Open
+- [x] Empty System App Appears if no window is Open (the desktop-icons window could get stuck in a stage)
 
 ## Uninstall
 
